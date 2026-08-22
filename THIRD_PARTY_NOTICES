@@ -1,0 +1,18 @@
+THIRD-PARTY SOFTWARE NOTICES
+
+Streamling Blockchain Studio depends on third-party software. Each component remains subject to its own license; this file does not alter those licenses.
+
+Streamling and streamling-plugin
+Copyright their respective contributors.
+Licensed under the Apache License, Version 2.0.
+https://github.com/streamling-dev/streamling
+
+Evidence
+Copyright Evidence contributors.
+Licensed under the MIT License.
+https://github.com/evidence-dev/evidence
+
+Evidence is an optional, separately installed renderer used by the example under evidence/. Evidence source code is not vendored in this repository.
+
+Rust dependencies
+The Rust packages resolved in Cargo.lock remain licensed by their respective authors under the license expressions published with those packages. Source distributions and release bundles must preserve any dependency license or notice files required by those licenses. rusqlite is built with its bundled SQLite feature; SQLite is in the public domain (https://www.sqlite.org/copyright.html).

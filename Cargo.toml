@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/streamling-blockchain-cli", "crates/streamling-blockchain-plugin"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/goldsky-io/streamling-blockchain-studio"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

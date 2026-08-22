@@ -1,0 +1,5 @@
+project:
+  name: "streamling-blockchain-studio-fwa"
+  evidence: "0.9.1"
+
+pages: ./pages
