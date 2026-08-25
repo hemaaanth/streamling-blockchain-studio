@@ -111,9 +111,6 @@ LIMIT 50
   <BigValue data={block_coverage} value="latest_block" title="Latest block" fmt="num0" />
 </Grid>
 
-<Alert status="warning">
-Completeness means decoded logs for the indexed contracts, not every possible Megapot analytic. Time-series buckets use reconstructed block timestamps for this preview; event identities, decoded fields, transaction hashes, log indexes, addresses, and block numbers come from chain logs.
-</Alert>
 
 ## Event mix and quality checks
 

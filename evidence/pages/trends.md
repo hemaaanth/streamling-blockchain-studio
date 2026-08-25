@@ -1,5 +1,5 @@
 ---
-title: Narrative read
+title: Trends
 page_width: full
 cards: true
 table_of_contents: true
@@ -8,7 +8,6 @@ sidebar_position: 3
 icon: book-open
 ---
 
-Compact analyst read for Megapot v2: demand quality, channel mix, participant concentration, referral economics, and LP backer flow.
 
 ```sql headline
 SELECT
@@ -36,30 +35,6 @@ GROUP BY week
 ORDER BY week
 ```
 
-```sql source_share
-WITH ticket_sources AS (
-  SELECT
-    CASE json_extract_string(fields_json, '$.source')
-      WHEN '0x6d656761706f743a776562000000000000000000000000000000000000000000' THEN 'megapot:web'
-      WHEN '0x62616c6b616e6c6f74746f000000000000000000000000000000000000000000' THEN 'balkanlotto'
-      WHEN '0x6c6f74706f740000000000000000000000000000000000000000000000000000' THEN 'lotpot'
-      WHEN '0x6d656761706f743a636c61696d5f77696e5f636f6d706f756e64000000000000' THEN 'megapot:claim_win_compound'
-      WHEN '0x6d656761706f743a636c61696d5f67756172616e746565000000000000000000' THEN 'megapot:claim_guarantee'
-      WHEN '0x6d656761706f743a636c61696d5f77696e000000000000000000000000000000' THEN 'megapot:claim_win'
-      WHEN '0x6665656c2e636173680000000000000000000000000000000000000000000000' THEN 'feel.cash'
-      ELSE 'unknown'
-    END AS source
-  FROM events
-  WHERE is_deleted = 0 AND event_name = 'TicketPurchased'
-)
-SELECT
-  source,
-  count(*) AS tickets,
-  count(*) * 1.0 / sum(count(*)) OVER () AS share
-FROM ticket_sources
-GROUP BY source
-ORDER BY tickets DESC
-```
 
 ```sql concentration
 WITH orders AS (
@@ -124,36 +99,21 @@ ORDER BY amount_usdc DESC
   <BigValue data={headline} value="winnings_usdc" title="Claimed winnings" fmt="usd2" />
 </Grid>
 
-## 1. Demand is real enough to segment
-
-With coverage from deployment through the latest indexed Base block, Megapot has enough purchase and backer history to separate organic web activity, integrations, compound flows, referrals, repeat buyers, whale-like recipients, and LP treasury movement.
+## Weekly demand
 
 <AreaChart data={weekly_tickets} x="week" y="tickets" title="Weekly ticket demand" />
 
-## 2. Channels are product strategy, not metadata
 
-<DataTable data={source_share} rows=10 rowShading=true sortable=true totalRow=true>
-  <Column id="source" title="Source" chip=true />
-  <Column id="tickets" title="Tickets" contentType="bar" fmt="num0" barColor="#2563eb" />
-  <Column id="share" title="Share" contentType="bar" fmt="pct1" barColor="#f59e0b" />
-</DataTable>
-
-The labeled source field is the most actionable surface in the decoded Jackpot logs. It points to where distribution is happening: Megapot web, lottery partners, claim/compound loops, and unclassified traffic that should be decoded further.
-
-## 3. Concentration explains quality of demand
+## Participant concentration
 
 <Grid cols=2>
   <BigValue data={concentration} value="top_10_share" title="Top 10 recipient share" fmt="pct1" />
   <BigValue data={concentration} value="top_50_share" title="Top 50 recipient share" fmt="pct1" />
 </Grid>
 
-A broad recipient base is healthier for a consumer jackpot story; concentration is still useful if it reveals integrators, vaults, syndicates, or high-conviction repeat players.
-
-## 4. Referral economics and backer flow are visible
+## LP earnings and referral fees
 
 <Grid cols=2>
   <AreaChart data={referral_vs_lp} x="drawing" y="lp_earnings_usdc" series="referral_fees_usdc" title="LP earnings and referral fees by drawing" />
   <BarChart data={lp_backer_flow} x="event_name" y="amount_usdc" title="LP manager deposits and withdrawals" />
 </Grid>
-
-Coverage includes the Jackpot and LP manager contracts. That covers demand, referrals, winnings, deposits, and finalized withdrawals. Backer ROI and current pool-value marks require share-accounting state, so they should be calculated separately rather than inferred from event logs.

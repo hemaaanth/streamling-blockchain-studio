@@ -1,5 +1,5 @@
 ---
-title: Live dashboard
+title: Dashboard
 page_width: full
 cards: true
 table_of_contents: true
@@ -9,7 +9,7 @@ icon: chart-column
 ---
 
 
-Megapot v2 activity from the Jackpot contract deployment block (`43197068`) through the latest indexed Base block. Coverage includes Jackpot order, referral, winner, drawing, and LP manager deposit/withdrawal events.
+Megapot v2 activity from contract deployment through the latest indexed Base block.
 
 ```sql overview
 SELECT
@@ -256,11 +256,6 @@ LIMIT 25
   <BigValue data={overview} value="referral_fees_usdc" title="Referral fees" fmt="usd2" description="USDC paid to referrers in decoded orders" />
 </Grid>
 
-<Alert status="info">
-Coverage is complete for decoded logs emitted by the Jackpot and LP manager contracts from deployment through the indexed safe block. Backer return percentages and current pool-value marks require share-balance state beyond event logs, so they are treated as out of scope rather than estimated.
-</Alert>
-
-Megapot demand separates into ticket velocity, source distribution, participant concentration, referral capture, realized winnings, and LP backer flow.
 
 <Grid cols=4>
   <BigValue data={unit_economics} value="lp_earnings_per_ticket" title="LP / ticket" fmt="usd2" description="LP earnings divided by processed tickets" />
@@ -304,7 +299,6 @@ Megapot demand separates into ticket velocity, source distribution, participant 
   />
 </Grid>
 
-The source labels expose where distribution is happening: Megapot web, lottery partners, claim/compound loops, and unclassified traffic that should be decoded further.
 
 <DataTable data={source_mix} rows=10 rowShading=true sortable=true totalRow=true downloadable=true>
   <Column id="source" title="Source" chip=true />
@@ -333,7 +327,6 @@ The source labels expose where distribution is happening: Megapot web, lottery p
   </DataTable>
 </Grid>
 
-Participant concentration shows whether jackpot demand is broadly distributed or driven by a smaller number of high-conviction wallets.
 
 ## Referrals and winnings
 
@@ -351,7 +344,6 @@ Participant concentration shows whether jackpot demand is broadly distributed or
   </DataTable>
 </Grid>
 
-Referrals are already material. The top referrer collected more than half of tracked referral fees, while claimed winnings are spread across a smaller set of addresses. Backer return percentages should be calculated from pool/share state, not inferred from order events.
 
 ## Latest ticket orders
 
