@@ -248,29 +248,20 @@ LIMIT 25
 
 ## Jackpot activity
 
-<Grid cols=5>
-  <BigValue data={overview} value="tickets_sold" title="Tickets sold" fmt="num0" description="Processed orders decoded from the Jackpot contract" />
-  <BigValue data={overview} value="recipients" title="Recipients" fmt="num0" description="Unique ticket recipients across orders and purchased tickets" />
-  <BigValue data={lp_summary} value="lp_backers" title="LP backers" fmt="num0" description="Unique LP manager addresses with deposits or withdrawals" />
-  <BigValue data={overview} value="lp_earnings_usdc" title="LP earnings" fmt="usd2" description="USDC earned by liquidity providers in decoded orders" />
-  <BigValue data={overview} value="referral_fees_usdc" title="Referral fees" fmt="usd2" description="USDC paid to referrers in decoded orders" />
-</Grid>
-
-
 <Grid cols=4>
-  <BigValue data={unit_economics} value="lp_earnings_per_ticket" title="LP / ticket" fmt="usd2" description="LP earnings divided by processed tickets" />
-  <BigValue data={unit_economics} value="referral_fee_per_ticket" title="Referral / ticket" fmt="usd2" description="Referral fees divided by processed tickets" />
-  <BigValue data={unit_economics} value="protocol_take_per_ticket" title="Tracked take / ticket" fmt="usd2" description="LP plus referral economics per ticket" />
-  <BigValue data={overview} value="claimed_winnings_usdc" title="Claimed winnings" fmt="usd2" description="TicketWinningsClaimed amount decoded from events" />
+  <BigValue data={overview} value="tickets_sold" title="Tickets sold" fmt="num0" />
+  <BigValue data={overview} value="recipients" title="Recipients" fmt="num0" />
+  <BigValue data={overview} value="lp_earnings_usdc" title="LP earnings" fmt="usd2" />
+  <BigValue data={overview} value="referral_fees_usdc" title="Referral fees" fmt="usd2" />
 </Grid>
 
 ## LP backer flow
 
 <Grid cols=4>
-  <BigValue data={lp_summary} value="deposits_usdc" title="LP deposits" fmt="usd2" description="Decoded LpDeposited amount from the LP manager" />
-  <BigValue data={lp_summary} value="finalized_withdrawals_usdc" title="Finalized withdrawals" fmt="usd2" description="Decoded LpWithdrawFinalized amount" />
-  <BigValue data={lp_summary} value="initiated_withdrawals_usdc" title="Withdrawal starts" fmt="usd2" description="Decoded LpWithdrawInitiated amount" />
-  <BigValue data={lp_summary} value="net_deposits_usdc" title="Net deposited" fmt="usd2" description="Deposits minus finalized withdrawals" />
+  <BigValue data={lp_summary} value="lp_backers" title="LP backers" fmt="num0" />
+  <BigValue data={lp_summary} value="deposits_usdc" title="Deposits" fmt="usd2" />
+  <BigValue data={lp_summary} value="finalized_withdrawals_usdc" title="Withdrawals" fmt="usd2" />
+  <BigValue data={lp_summary} value="net_deposits_usdc" title="Net deposits" fmt="usd2" />
 </Grid>
 
 <DataTable data={lp_backers} rows=15 rowShading=true sortable=true search=true downloadable=true>
