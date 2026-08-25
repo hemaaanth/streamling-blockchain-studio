@@ -61,15 +61,24 @@ FROM (
 ```
 
 ```sql referral_vs_lp
-SELECT
-  coalesce(try_cast(json_extract_string(fields_json, '$.currentDrawingId') AS BIGINT), 0) AS drawing,
-  sum(coalesce(try_cast(json_extract_string(fields_json, '$.lpEarnings') AS DOUBLE), 0) / 1e6) AS lp_earnings_usdc,
-  sum(coalesce(try_cast(json_extract_string(fields_json, '$.referralFees') AS DOUBLE), 0) / 1e6) AS referral_fees_usdc
-FROM events
-WHERE is_deleted = 0 AND event_name = 'TicketOrderProcessed'
+WITH drawing_flows AS (
+  SELECT
+    coalesce(try_cast(json_extract_string(fields_json, '$.currentDrawingId') AS BIGINT), 0) AS drawing,
+    coalesce(try_cast(json_extract_string(fields_json, '$.lpEarnings') AS DOUBLE), 0) / 1e6 AS lp_earnings_usdc,
+    coalesce(try_cast(json_extract_string(fields_json, '$.referralFees') AS DOUBLE), 0) / 1e6 AS referral_fees_usdc
+  FROM events
+  WHERE is_deleted = 0 AND event_name = 'TicketOrderProcessed'
+)
+SELECT drawing, 'LP earnings' AS flow, round(sum(lp_earnings_usdc), 2) AS amount_usdc
+FROM drawing_flows
+WHERE drawing > 0
 GROUP BY drawing
-HAVING drawing > 0
-ORDER BY drawing
+UNION ALL
+SELECT drawing, 'Referral fees' AS flow, round(sum(referral_fees_usdc), 2) AS amount_usdc
+FROM drawing_flows
+WHERE drawing > 0
+GROUP BY drawing
+ORDER BY drawing, flow
 ```
 
 ```sql lp_backer_flow
@@ -104,16 +113,16 @@ ORDER BY amount_usdc DESC
 <AreaChart data={weekly_tickets} x="week" y="tickets" title="Weekly ticket demand" />
 
 
-## Participant concentration
+## Participants
 
 <Grid cols=2>
   <BigValue data={concentration} value="top_10_share" title="Top 10 recipient share" fmt="pct1" />
   <BigValue data={concentration} value="top_50_share" title="Top 50 recipient share" fmt="pct1" />
 </Grid>
 
-## LP earnings and referral fees
+## LP and referrals
 
 <Grid cols=2>
-  <AreaChart data={referral_vs_lp} x="drawing" y="lp_earnings_usdc" series="referral_fees_usdc" title="LP earnings and referral fees by drawing" />
+  <AreaChart data={referral_vs_lp} x="drawing" y="amount_usdc" series="flow" y_fmt="usd2" title="LP and referral fees by drawing" />
   <BarChart data={lp_backer_flow} x="event_name" y="amount_usdc" title="LP manager deposits and withdrawals" />
 </Grid>

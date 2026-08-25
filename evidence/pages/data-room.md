@@ -105,33 +105,30 @@ LIMIT 50
 ```
 
 <Grid cols=4>
-  <BigValue data={block_coverage} value="decoded_events" title="Decoded events" fmt="num0" />
-  <BigValue data={block_coverage} value="blocks_with_events" title="Blocks with events" fmt="num0" />
+  <BigValue data={block_coverage} value="decoded_events" title="Decoded" fmt="num0" />
+  <BigValue data={block_coverage} value="blocks_with_events" title="Blocks" fmt="num0" />
   <BigValue data={block_coverage} value="first_block" title="First block" fmt="num0" />
   <BigValue data={block_coverage} value="latest_block" title="Latest block" fmt="num0" />
 </Grid>
 
 
-## Event mix and quality checks
+## Event mix
 
 <Grid cols=4>
-  <BigValue data={quality_checks} value="duplicate_event_ids" title="Duplicate event IDs" fmt="num0" />
+  <BigValue data={quality_checks} value="duplicate_event_ids" title="Duplicate IDs" fmt="num0" />
   <BigValue data={quality_checks} value="missing_tx_hashes" title="Missing tx hashes" fmt="num0" />
-  <BigValue data={quality_checks} value="missing_decoded_fields" title="Missing decoded fields" fmt="num0" />
+  <BigValue data={quality_checks} value="missing_decoded_fields" title="Missing fields" fmt="num0" />
   <BigValue data={quality_checks} value="event_types" title="Event types" fmt="num0" />
 </Grid>
 
-<Grid cols=2>
-  <BarChart data={event_mix} x="event_name" y="events" title="Decoded events by type" />
-  <DataTable data={event_mix} rows=20 rowShading=true sortable=true downloadable=true>
-    <Column id="event_name" title="Event" chip=true />
-    <Column id="contract_alias" title="Contract" chip=true />
-    <Column id="events" title="Events" contentType="bar" fmt="num0" barColor="#2563eb" />
-    <Column id="event_share" title="Share" contentType="bar" fmt="pct1" barColor="#f59e0b" />
-    <Column id="first_block" title="First" fmt="num0" />
-    <Column id="latest_block" title="Latest" fmt="num0" />
-  </DataTable>
-</Grid>
+<DataTable data={event_mix} rows=20 rowShading=true sortable=true downloadable=true>
+  <Column id="event_name" title="Event" chip=true />
+  <Column id="contract_alias" title="Contract" chip=true />
+  <Column id="events" title="Events" contentType="bar" fmt="num0" barColor="#2563eb" />
+  <Column id="event_share" title="Share" contentType="bar" fmt="pct1" barColor="#f59e0b" />
+  <Column id="first_block" title="First" fmt="num0" />
+  <Column id="latest_block" title="Latest" fmt="num0" />
+</DataTable>
 
 ## Drawings
 
@@ -142,7 +139,7 @@ LIMIT 50
   <Column id="tickets" title="Tickets" contentType="bar" fmt="num0" barColor="#f59e0b" />
 </DataTable>
 
-## Latest processed orders
+## Orders
 
 <DataTable data={raw_orders} rows=50 rowShading=true sortable=true search=true downloadable=true compact=true>
   <Column id="block_number" title="Block" fmt="num0" />
@@ -156,7 +153,7 @@ LIMIT 50
   <Column id="tx_url" title="Tx" contentType="link" linkLabel="tx" openInNewTab=true />
 </DataTable>
 
-## Latest LP manager events
+## LP events
 
 <DataTable data={raw_lp_events} rows=50 rowShading=true sortable=true search=true downloadable=true compact=true>
   <Column id="block_number" title="Block" fmt="num0" />
