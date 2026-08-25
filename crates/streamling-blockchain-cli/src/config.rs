@@ -15,10 +15,16 @@ pub struct ProjectConfig {
     pub rpc_url_env: Option<String>,
     pub database: PathBuf,
     pub start_block: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_block: Option<u64>,
     #[serde(default = "default_confirmations")]
     pub confirmations: u64,
     #[serde(default = "default_window")]
     pub window: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub index_blocks: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub index_transactions: bool,
     pub contracts: Vec<ContractConfig>,
     #[serde(default)]
     pub discovery_rules: Vec<DiscoveryRule>,
@@ -67,6 +73,9 @@ fn default_window() -> u64 {
 }
 fn default_sqlite_sink() -> bool {
     true
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Default for SinkConfig {
@@ -118,6 +127,11 @@ impl ProjectConfig {
         }
         if self.window == 0 {
             bail!("window must be greater than zero")
+        }
+        if let Some(end_block) = self.end_block {
+            if end_block < self.start_block {
+                bail!("end_block must be greater than or equal to start_block")
+            }
         }
         if !self.sinks.sqlite && self.sinks.clickhouse.is_none() {
             bail!("at least one sink is required")

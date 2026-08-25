@@ -8,7 +8,7 @@ sidebar_position: 5
 icon: database
 ---
 
-Decoded-event view for traceability, QA, and follow-up modeling. Use this page to inspect contract coverage, block coverage, raw order events, and LP manager events.
+Decoded transfer-level view for traceability and follow-up modeling. Every row is one indexed ERC-20 `Transfer` log from a Robinhood Stock Token contract.
 
 ```sql event_mix
 SELECT
@@ -53,64 +53,31 @@ SELECT
 FROM base
 ```
 
-
-```sql raw_orders
+```sql raw_transfers
 SELECT
+  contract_alias AS symbol,
   block_number,
   log_index,
   to_timestamp(block_timestamp) AS event_time,
-  concat(substr(json_extract_string(fields_json, '$.buyer'), 1, 6), '…', substr(json_extract_string(fields_json, '$.buyer'), -4)) AS buyer,
-  concat(substr(json_extract_string(fields_json, '$.recipient'), 1, 6), '…', substr(json_extract_string(fields_json, '$.recipient'), -4)) AS recipient,
-  coalesce(try_cast(json_extract_string(fields_json, '$.currentDrawingId') AS BIGINT), 0) AS drawing,
-  coalesce(try_cast(json_extract_string(fields_json, '$.numberOfTickets') AS BIGINT), 0) AS tickets,
-  round(coalesce(try_cast(json_extract_string(fields_json, '$.lpEarnings') AS DOUBLE), 0) / 1e6, 2) AS lp_earnings_usdc,
-  round(coalesce(try_cast(json_extract_string(fields_json, '$.referralFees') AS DOUBLE), 0) / 1e6, 2) AS referral_fees_usdc,
-  concat('https://basescan.org/tx/', tx_hash) AS tx_url,
+  concat(substr(json_extract_string(fields_json, '$.from'), 1, 6), '…', substr(json_extract_string(fields_json, '$.from'), -4)) AS sender,
+  concat('https://robinhoodchain.blockscout.com/address/', json_extract_string(fields_json, '$.from')) AS sender_url,
+  concat(substr(json_extract_string(fields_json, '$.to'), 1, 6), '…', substr(json_extract_string(fields_json, '$.to'), -4)) AS recipient,
+  concat('https://robinhoodchain.blockscout.com/address/', json_extract_string(fields_json, '$.to')) AS recipient_url,
+  round(coalesce(try_cast(json_extract_string(fields_json, '$.value') AS DOUBLE), 0) / 1e18, 6) AS units,
+  concat('https://robinhoodchain.blockscout.com/tx/', tx_hash) AS tx_url,
   concat(substr(tx_hash, 1, 10), '…', substr(tx_hash, -6)) AS tx
-FROM events
-WHERE is_deleted = 0 AND event_name = 'TicketOrderProcessed'
-ORDER BY block_number DESC, log_index DESC
-LIMIT 100
-```
-
-```sql raw_lp_events
-SELECT
-  block_number,
-  log_index,
-  to_timestamp(block_timestamp) AS event_time,
-  event_name,
-  concat(substr(json_extract_string(fields_json, '$.lpAddress'), 1, 6), '…', substr(json_extract_string(fields_json, '$.lpAddress'), -4)) AS backer,
-  round(coalesce(try_cast(json_extract_string(fields_json, '$.amount') AS DOUBLE), 0) / 1e6, 2) AS amount_usdc,
-  concat('https://basescan.org/tx/', tx_hash) AS tx_url,
-  concat(substr(tx_hash, 1, 10), '…', substr(tx_hash, -6)) AS tx
-FROM events
-WHERE is_deleted = 0 AND contract_alias = 'lp_manager'
-ORDER BY block_number DESC, log_index DESC
-LIMIT 100
-```
-
-
-```sql drawing_distribution
-SELECT
-  coalesce(try_cast(json_extract_string(fields_json, '$.currentDrawingId') AS BIGINT), try_cast(json_extract_string(fields_json, '$.drawingId') AS BIGINT), 0) AS drawing,
-  count(*) AS decoded_events,
-  count(*) FILTER (WHERE event_name = 'TicketOrderProcessed') AS orders,
-  sum(CASE WHEN event_name = 'TicketOrderProcessed' THEN coalesce(try_cast(json_extract_string(fields_json, '$.numberOfTickets') AS BIGINT), 0) ELSE 0 END) AS tickets
 FROM events
 WHERE is_deleted = 0
-GROUP BY drawing
-HAVING drawing > 0
-ORDER BY drawing DESC
-LIMIT 50
+ORDER BY block_number DESC, log_index DESC
+LIMIT 200
 ```
 
 <Grid cols=4>
-  <BigValue data={block_coverage} value="decoded_events" title="Decoded" fmt="num0" />
-  <BigValue data={block_coverage} value="blocks_with_events" title="Blocks" fmt="num0" />
+  <BigValue data={block_coverage} value="decoded_events" title="Transfers" fmt="num0" />
+  <BigValue data={block_coverage} value="blocks_with_events" title="Event blocks" fmt="num0" />
   <BigValue data={block_coverage} value="first_block" title="First block" fmt="num0" />
   <BigValue data={block_coverage} value="latest_block" title="Latest block" fmt="num0" />
 </Grid>
-
 
 ## Event mix
 
@@ -118,48 +85,27 @@ LIMIT 50
   <BigValue data={quality_checks} value="duplicate_event_ids" title="Duplicate IDs" fmt="num0" />
   <BigValue data={quality_checks} value="missing_tx_hashes" title="Missing tx hashes" fmt="num0" />
   <BigValue data={quality_checks} value="missing_decoded_fields" title="Missing fields" fmt="num0" />
-  <BigValue data={quality_checks} value="event_types" title="Event types" fmt="num0" />
+  <BigValue data={quality_checks} value="contracts_indexed" title="Contracts indexed" fmt="num0" />
 </Grid>
 
-<DataTable data={event_mix} rows=20 rowShading=true sortable=true downloadable=true>
+<DataTable data={event_mix} rows=50 rowShading=true sortable=true search=true downloadable=true>
+  <Column id="contract_alias" title="Symbol" chip=true />
   <Column id="event_name" title="Event" chip=true />
-  <Column id="contract_alias" title="Contract" chip=true />
   <Column id="events" title="Events" contentType="bar" fmt="num0" barColor="#2563eb" />
   <Column id="event_share" title="Share" contentType="bar" fmt="pct1" barColor="#f59e0b" />
   <Column id="first_block" title="First" fmt="num0" />
   <Column id="latest_block" title="Latest" fmt="num0" />
 </DataTable>
 
-## Drawings
+## Latest transfers
 
-<DataTable data={drawing_distribution} rows=50 rowShading=true sortable=true downloadable=true>
-  <Column id="drawing" title="Drawing" fmt="num0" />
-  <Column id="decoded_events" title="Events" contentType="bar" fmt="num0" barColor="#64748b" />
-  <Column id="orders" title="Orders" contentType="bar" fmt="num0" barColor="#2563eb" />
-  <Column id="tickets" title="Tickets" contentType="bar" fmt="num0" barColor="#f59e0b" />
-</DataTable>
-
-## Orders
-
-<DataTable data={raw_orders} rows=50 rowShading=true sortable=true search=true downloadable=true compact=true>
+<DataTable data={raw_transfers} rows=100 rowShading=true sortable=true search=true downloadable=true compact=true>
+  <Column id="symbol" title="Symbol" chip=true />
   <Column id="block_number" title="Block" fmt="num0" />
+  <Column id="log_index" title="Log" fmt="num0" />
   <Column id="event_time" title="Time" fmt="date" />
-  <Column id="buyer" title="Buyer" />
-  <Column id="recipient" title="Recipient" />
-  <Column id="drawing" title="Drawing" fmt="num0" />
-  <Column id="tickets" title="Tickets" contentType="bar" fmt="num0" barColor="#2563eb" />
-  <Column id="lp_earnings_usdc" title="LP" fmt="usd2" />
-  <Column id="referral_fees_usdc" title="Referral" fmt="usd2" />
-  <Column id="tx_url" title="Tx" contentType="link" linkLabel="tx" openInNewTab=true />
-</DataTable>
-
-## LP events
-
-<DataTable data={raw_lp_events} rows=50 rowShading=true sortable=true search=true downloadable=true compact=true>
-  <Column id="block_number" title="Block" fmt="num0" />
-  <Column id="event_time" title="Time" fmt="date" />
-  <Column id="event_name" title="Event" chip=true />
-  <Column id="backer" title="Backer" />
-  <Column id="amount_usdc" title="Amount" contentType="bar" fmt="usd2" barColor="#16a34a" />
+  <Column id="sender_url" title="Sender" contentType="link" linkLabel="sender" openInNewTab=true />
+  <Column id="recipient_url" title="Recipient" contentType="link" linkLabel="recipient" openInNewTab=true />
+  <Column id="units" title="Units" contentType="bar" fmt="num2" barColor="#16a34a" />
   <Column id="tx_url" title="Tx" contentType="link" linkLabel="tx" openInNewTab=true />
 </DataTable>

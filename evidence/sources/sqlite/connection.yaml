@@ -1,0 +1,4 @@
+name: sqlite
+type: sqlite
+options:
+  filename: events.db

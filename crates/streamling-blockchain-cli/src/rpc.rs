@@ -2,6 +2,15 @@ use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde_json::{Value, json};
 
+pub const USER_AGENT: &str = "streamling-blockchain/0.1";
+
+pub fn client() -> Result<Client> {
+    Client::builder()
+        .user_agent(USER_AGENT)
+        .build()
+        .context("build HTTP client")
+}
+
 pub const BUILTIN_CHAINS: &[(&str, u64, &str)] = &[
     ("ethereum", 1, "https://ethereum-rpc.publicnode.com"),
     (
@@ -10,6 +19,11 @@ pub const BUILTIN_CHAINS: &[(&str, u64, &str)] = &[
         "https://arbitrum-one-rpc.publicnode.com",
     ),
     ("base", 8453, "https://base-rpc.publicnode.com"),
+    (
+        "robinhood-chain",
+        4663,
+        "https://rpc.mainnet.chain.robinhood.com",
+    ),
 ];
 
 pub async fn rpc(client: &Client, url: &str, method: &str, params: Value) -> Result<Value> {
@@ -86,6 +100,10 @@ pub async fn deployment_block(client: &Client, url: &str, address: &str) -> Resu
 }
 
 pub async fn fetch_abi(client: &Client, chain_id: u64, address: &str) -> Result<Value> {
+    fetch_sourcify_abi(client, chain_id, address).await
+}
+
+pub async fn fetch_sourcify_abi(client: &Client, chain_id: u64, address: &str) -> Result<Value> {
     for match_kind in ["full_match", "partial_match"] {
         let url = format!(
             "https://repo.sourcify.dev/contracts/{match_kind}/{chain_id}/{address}/metadata.json"
@@ -93,15 +111,133 @@ pub async fn fetch_abi(client: &Client, chain_id: u64, address: &str) -> Result<
         let response = client.get(&url).send().await?;
         if response.status().is_success() {
             let metadata: Value = response.json().await?;
-            if let Some(abi) = metadata.pointer("/output/abi") {
-                return Ok(abi.clone());
+            if let Some(abi) = sourcify_abi(&metadata) {
+                return Ok(abi);
             }
         }
     }
     bail!("ABI not found on Sourcify; pass --abi <file>")
 }
 
+pub async fn fetch_etherscan_v2_abi(
+    client: &Client,
+    chain_id: u64,
+    address: &str,
+    api_key: Option<&str>,
+    base_url: Option<&str>,
+) -> Result<Value> {
+    let base = base_url.unwrap_or("https://api.etherscan.io/v2/api");
+    let mut request = client.get(base).query(&[
+        ("chainid", chain_id.to_string()),
+        ("module", "contract".to_owned()),
+        ("action", "getabi".to_owned()),
+        ("address", address.to_owned()),
+    ]);
+    if let Some(key) = api_key {
+        request = request.query(&[("apikey", key)]);
+    }
+    let payload: Value = request.send().await?.json().await?;
+    explorer_abi(&payload).with_context(|| format!("ABI not found through {base}"))
+}
+
+pub async fn fetch_etherscan_compatible_abi(
+    client: &Client,
+    chain_id: u64,
+    address: &str,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+) -> Result<Value> {
+    let base = base_url
+        .map(str::to_owned)
+        .unwrap_or_else(|| default_etherscan_base_url(chain_id).to_owned());
+    let mut request = client.get(&base).query(&[
+        ("module", "contract"),
+        ("action", "getabi"),
+        ("address", address),
+    ]);
+    if let Some(key) = api_key {
+        request = request.query(&[("apikey", key)]);
+    }
+    let payload: Value = request.send().await?.json().await?;
+    explorer_abi(&payload).with_context(|| format!("ABI not found through {base}"))
+}
+
+pub async fn fetch_blockscout_abi(client: &Client, address: &str, base_url: &str) -> Result<Value> {
+    let payload: Value = client
+        .get(base_url)
+        .query(&[
+            ("module", "contract"),
+            ("action", "getabi"),
+            ("address", address),
+        ])
+        .send()
+        .await?
+        .json()
+        .await?;
+    explorer_abi(&payload).with_context(|| format!("ABI not found through {base_url}"))
+}
+
+pub fn default_etherscan_base_url(chain_id: u64) -> &'static str {
+    match chain_id {
+        1 => "https://api.etherscan.io/api",
+        8453 => "https://api.basescan.org/api",
+        42161 => "https://api.arbiscan.io/api",
+        _ => "https://api.etherscan.io/api",
+    }
+}
+
+pub fn sourcify_abi(metadata: &Value) -> Option<Value> {
+    metadata.pointer("/output/abi").cloned()
+}
+
+pub fn explorer_abi(payload: &Value) -> Option<Value> {
+    let result = payload.get("result")?;
+    if let Some(text) = result.as_str() {
+        return serde_json::from_str(text).ok();
+    }
+    result.as_array().map(|_| result.clone())
+}
+
 pub fn hex_u64(value: &Value) -> Result<u64> {
     let text = value.as_str().context("expected hexadecimal JSON string")?;
     u64::from_str_radix(text.trim_start_matches("0x"), 16).context("invalid hexadecimal integer")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_sourcify_abi() {
+        let metadata = json!({"output": {"abi": [{"type": "event", "name": "Transfer"}]}});
+        assert_eq!(
+            sourcify_abi(&metadata).unwrap(),
+            json!([{"type": "event", "name": "Transfer"}])
+        );
+        assert!(sourcify_abi(&json!({})).is_none());
+    }
+
+    #[test]
+    fn extracts_explorer_abi_string_or_array() {
+        assert_eq!(
+            explorer_abi(
+                &json!({"status": "1", "result": "[{\"type\":\"event\",\"name\":\"Transfer\"}]"})
+            )
+            .unwrap(),
+            json!([{"type": "event", "name": "Transfer"}])
+        );
+        assert_eq!(
+            explorer_abi(&json!({"result": [{"type": "event", "name": "Approval"}]})).unwrap(),
+            json!([{"type": "event", "name": "Approval"}])
+        );
+        assert!(explorer_abi(&json!({"result": "Contract source code not verified"})).is_none());
+    }
+
+    #[test]
+    fn keeps_etherscan_v1_defaults_for_compat_mode() {
+        assert_eq!(
+            default_etherscan_base_url(8453),
+            "https://api.basescan.org/api"
+        );
+    }
 }

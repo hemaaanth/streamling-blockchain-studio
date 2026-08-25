@@ -1,4 +1,10 @@
 .evidence/
-connection.yaml
+/connection.yaml
 node_modules/
 build/
+sources/sqlite/*.db
+sources/sqlite/*.sqlite
+sources/sqlite/*.sqlite3
+sources/sqlite/*.db-*
+sources/sqlite/*.sqlite-*
+sources/sqlite/*.sqlite3-*

@@ -3,6 +3,7 @@
   "scripts": {
     "dev": "evidence dev",
     "sources": "evidence sources",
+    "sources:sqlite": "test -n \"$STREAMLING_BLOCKCHAIN_DB\" && ln -sf \"$(realpath \"$STREAMLING_BLOCKCHAIN_DB\")\" sources/sqlite/events.db && evidence sources",
     "build": "evidence build",
     "preview": "evidence preview"
   },
@@ -10,6 +11,7 @@
     "@evidence-dev/component-utilities": "^4.0.13",
     "@evidence-dev/core-components": "^5.4.2",
     "@evidence-dev/evidence": "^40.1.8",
+    "@evidence-dev/sqlite": "^2.0.9",
     "@evidence-dev/tailwind": "^3.1.4",
     "@sveltejs/vite-plugin-svelte": "^3.1.2",
     "autoprefixer": "^10.5.4",

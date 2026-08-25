@@ -8,178 +8,104 @@ sidebar_position: 4
 icon: users
 ---
 
-
-```sql buyer_leaders
-WITH orders AS (
-  SELECT
-    json_extract_string(fields_json, '$.buyer') AS buyer,
-    json_extract_string(fields_json, '$.recipient') AS recipient,
-    coalesce(try_cast(json_extract_string(fields_json, '$.numberOfTickets') AS BIGINT), 0) AS tickets,
-    coalesce(try_cast(json_extract_string(fields_json, '$.lpEarnings') AS DOUBLE), 0) / 1e6 AS lp_earnings_usdc,
-    coalesce(try_cast(json_extract_string(fields_json, '$.referralFees') AS DOUBLE), 0) / 1e6 AS referral_fees_usdc
-  FROM events
-  WHERE is_deleted = 0 AND event_name = 'TicketOrderProcessed'
-)
-SELECT
-  concat(substr(buyer, 1, 6), '…', substr(buyer, -4)) AS buyer,
-  concat('https://basescan.org/address/', buyer) AS buyer_url,
-  sum(tickets) AS tickets,
-  count(*) AS orders,
-  count(DISTINCT recipient) AS recipients,
-  sum(lp_earnings_usdc) AS lp_earnings_usdc,
-  sum(referral_fees_usdc) AS referral_fees_usdc
-FROM orders
-GROUP BY buyer
-ORDER BY tickets DESC
-LIMIT 25
-```
-
-```sql recipient_leaders
-WITH orders AS (
-  SELECT
-    json_extract_string(fields_json, '$.recipient') AS recipient,
-    json_extract_string(fields_json, '$.buyer') AS buyer,
-    coalesce(try_cast(json_extract_string(fields_json, '$.numberOfTickets') AS BIGINT), 0) AS tickets
-  FROM events
-  WHERE is_deleted = 0 AND event_name = 'TicketOrderProcessed'
-)
-SELECT
-  concat(substr(recipient, 1, 6), '…', substr(recipient, -4)) AS recipient,
-  concat('https://basescan.org/address/', recipient) AS recipient_url,
-  sum(tickets) AS tickets,
-  sum(tickets) * 1.0 / sum(sum(tickets)) OVER () AS ticket_share,
-  count(*) AS orders,
-  count(DISTINCT buyer) AS buyers
-FROM orders
-GROUP BY recipient
-ORDER BY tickets DESC
-LIMIT 25
-```
-
-```sql referrers
-SELECT
-  concat(substr(json_extract_string(fields_json, '$.referrer'), 1, 6), '…', substr(json_extract_string(fields_json, '$.referrer'), -4)) AS referrer,
-  concat('https://basescan.org/address/', json_extract_string(fields_json, '$.referrer')) AS referrer_url,
-  sum(coalesce(try_cast(json_extract_string(fields_json, '$.amount') AS DOUBLE), 0) / 1e6) AS fees_usdc,
-  count(*) AS fee_events
-FROM events
-WHERE is_deleted = 0 AND event_name = 'ReferralFeeCollected'
-GROUP BY referrer_url, referrer
-ORDER BY fees_usdc DESC
-LIMIT 25
-```
-
-```sql winners
-SELECT
-  concat(substr(json_extract_string(fields_json, '$.userAddress'), 1, 6), '…', substr(json_extract_string(fields_json, '$.userAddress'), -4)) AS claimant,
-  concat('https://basescan.org/address/', json_extract_string(fields_json, '$.userAddress')) AS claimant_url,
-  sum(coalesce(try_cast(json_extract_string(fields_json, '$.winningsAmount') AS DOUBLE), 0) / 1e6) AS winnings_usdc,
-  count(*) AS claims,
-  max(coalesce(try_cast(json_extract_string(fields_json, '$.matchedNormals') AS BIGINT), 0)) AS best_match
-FROM events
-WHERE is_deleted = 0 AND event_name = 'TicketWinningsClaimed'
-GROUP BY claimant_url, claimant
-ORDER BY winnings_usdc DESC
-LIMIT 25
-```
-
-```sql lp_backers
-WITH lp_events AS (
-  SELECT
-    json_extract_string(fields_json, '$.lpAddress') AS lp_address,
-    event_name,
-    coalesce(try_cast(json_extract_string(fields_json, '$.amount') AS DOUBLE), 0) / 1e6 AS amount_usdc
-  FROM events
-  WHERE is_deleted = 0 AND contract_alias = 'lp_manager'
-    AND event_name IN ('LpDeposited', 'LpWithdrawInitiated', 'LpWithdrawFinalized')
-), backers AS (
-  SELECT
-    lp_address,
-    sum(CASE WHEN event_name = 'LpDeposited' THEN amount_usdc ELSE 0 END) AS deposits_usdc,
-    sum(CASE WHEN event_name = 'LpWithdrawFinalized' THEN amount_usdc ELSE 0 END) AS withdrawals_usdc,
-    count(*) FILTER (WHERE event_name = 'LpDeposited') AS deposit_events,
-    count(*) FILTER (WHERE event_name IN ('LpWithdrawInitiated', 'LpWithdrawFinalized')) AS withdrawal_events
-  FROM lp_events
-  GROUP BY lp_address
-)
-SELECT
-  concat(substr(lp_address, 1, 6), '…', substr(lp_address, -4)) AS backer,
-  concat('https://basescan.org/address/', lp_address) AS backer_url,
-  round(deposits_usdc, 2) AS deposits_usdc,
-  round(withdrawals_usdc, 2) AS withdrawals_usdc,
-  round(deposits_usdc - withdrawals_usdc, 2) AS net_usdc,
-  deposit_events,
-  withdrawal_events
-FROM backers
-ORDER BY net_usdc DESC
-LIMIT 25
-```
-
+Wallet-level sender and recipient views across indexed Robinhood Stock Token transfers.
 
 ```sql participant_totals
 SELECT
-  count(DISTINCT CASE WHEN event_name = 'TicketOrderProcessed' THEN json_extract_string(fields_json, '$.buyer') END) AS buyers,
-  count(DISTINCT CASE WHEN event_name IN ('TicketOrderProcessed', 'TicketPurchased') THEN json_extract_string(fields_json, '$.recipient') END) AS recipients,
-  count(DISTINCT CASE WHEN event_name = 'ReferralFeeCollected' THEN json_extract_string(fields_json, '$.referrer') END) AS referrers,
-  count(DISTINCT CASE WHEN event_name = 'TicketWinningsClaimed' THEN json_extract_string(fields_json, '$.userAddress') END) AS claimants,
-  count(DISTINCT CASE WHEN contract_alias = 'lp_manager' AND event_name IN ('LpDeposited', 'LpWithdrawInitiated', 'LpWithdrawFinalized') THEN json_extract_string(fields_json, '$.lpAddress') END) AS lp_backers
+  count(DISTINCT json_extract_string(fields_json, '$.from')) AS senders,
+  count(DISTINCT json_extract_string(fields_json, '$.to')) AS recipients,
+  count(DISTINCT tx_hash) AS transactions,
+  count(*) AS transfers,
+  count(DISTINCT contract_alias) AS symbols
 FROM events
 WHERE is_deleted = 0
 ```
 
+```sql sender_leaders
+SELECT
+  concat(substr(json_extract_string(fields_json, '$.from'), 1, 6), '…', substr(json_extract_string(fields_json, '$.from'), -4)) AS sender,
+  concat('https://robinhoodchain.blockscout.com/address/', json_extract_string(fields_json, '$.from')) AS sender_url,
+  count(*) AS transfers,
+  count(DISTINCT contract_alias) AS symbols,
+  count(DISTINCT tx_hash) AS transactions,
+  round(sum(coalesce(try_cast(json_extract_string(fields_json, '$.value') AS DOUBLE), 0)) / 1e18, 2) AS units_sent
+FROM events
+WHERE is_deleted = 0
+  AND json_extract_string(fields_json, '$.from') != '0x0000000000000000000000000000000000000000'
+GROUP BY sender_url, sender
+ORDER BY transfers DESC
+LIMIT 25
+```
+
+```sql recipient_leaders
+SELECT
+  concat(substr(json_extract_string(fields_json, '$.to'), 1, 6), '…', substr(json_extract_string(fields_json, '$.to'), -4)) AS recipient,
+  concat('https://robinhoodchain.blockscout.com/address/', json_extract_string(fields_json, '$.to')) AS recipient_url,
+  count(*) AS transfers,
+  count(DISTINCT contract_alias) AS symbols,
+  count(DISTINCT tx_hash) AS transactions,
+  round(sum(coalesce(try_cast(json_extract_string(fields_json, '$.value') AS DOUBLE), 0)) / 1e18, 2) AS units_received
+FROM events
+WHERE is_deleted = 0
+  AND json_extract_string(fields_json, '$.to') != '0x0000000000000000000000000000000000000000'
+GROUP BY recipient_url, recipient
+ORDER BY transfers DESC
+LIMIT 25
+```
+
+```sql wallet_symbol_mix
+WITH parties AS (
+  SELECT json_extract_string(fields_json, '$.from') AS wallet, contract_alias
+  FROM events
+  WHERE is_deleted = 0 AND json_extract_string(fields_json, '$.from') != '0x0000000000000000000000000000000000000000'
+  UNION ALL
+  SELECT json_extract_string(fields_json, '$.to') AS wallet, contract_alias
+  FROM events
+  WHERE is_deleted = 0 AND json_extract_string(fields_json, '$.to') != '0x0000000000000000000000000000000000000000'
+)
+SELECT
+  concat(substr(wallet, 1, 6), '…', substr(wallet, -4)) AS wallet,
+  concat('https://robinhoodchain.blockscout.com/address/', wallet) AS wallet_url,
+  count(*) AS touches,
+  count(DISTINCT contract_alias) AS symbols
+FROM parties
+GROUP BY wallet_url, wallet
+ORDER BY symbols DESC, touches DESC
+LIMIT 25
+```
+
 <Grid cols=5>
-  <BigValue data={participant_totals} value="buyers" title="Buyers" fmt="num0" />
+  <BigValue data={participant_totals} value="senders" title="Senders" fmt="num0" />
   <BigValue data={participant_totals} value="recipients" title="Recipients" fmt="num0" />
-  <BigValue data={participant_totals} value="referrers" title="Referrers" fmt="num0" />
-  <BigValue data={participant_totals} value="claimants" title="Claimants" fmt="num0" />
-  <BigValue data={participant_totals} value="lp_backers" title="LP backers" fmt="num0" />
+  <BigValue data={participant_totals} value="transactions" title="Transactions" fmt="num0" />
+  <BigValue data={participant_totals} value="transfers" title="Transfers" fmt="num0" />
+  <BigValue data={participant_totals} value="symbols" title="Symbols" fmt="num0" />
 </Grid>
 
-## Buyers
+## Senders
 
-<DataTable data={buyer_leaders} rows=25 rowShading=true sortable=true search=true downloadable=true>
-  <Column id="buyer_url" title="Buyer" contentType="link" linkLabel="buyer" openInNewTab=true />
-  <Column id="tickets" title="Tickets" contentType="bar" fmt="num0" barColor="#2563eb" />
-  <Column id="orders" title="Orders" fmt="num0" align="right" />
-  <Column id="recipients" title="Recipients" fmt="num0" align="right" />
-  <Column id="lp_earnings_usdc" title="LP" fmt="usd2" />
-  <Column id="referral_fees_usdc" title="Referral" fmt="usd2" />
+<DataTable data={sender_leaders} rows=25 rowShading=true sortable=true search=true downloadable=true>
+  <Column id="sender_url" title="Sender" contentType="link" linkLabel="sender" openInNewTab=true />
+  <Column id="transfers" title="Transfers" contentType="bar" fmt="num0" barColor="#2563eb" />
+  <Column id="symbols" title="Symbols" fmt="num0" />
+  <Column id="transactions" title="Txs" fmt="num0" />
+  <Column id="units_sent" title="Units sent" fmt="num2" />
 </DataTable>
 
 ## Recipients
 
 <DataTable data={recipient_leaders} rows=25 rowShading=true sortable=true search=true downloadable=true>
   <Column id="recipient_url" title="Recipient" contentType="link" linkLabel="recipient" openInNewTab=true />
-  <Column id="tickets" title="Tickets" contentType="bar" fmt="num0" barColor="#2563eb" />
-  <Column id="ticket_share" title="Share" contentType="bar" fmt="pct1" barColor="#f59e0b" />
-  <Column id="orders" title="Orders" fmt="num0" align="right" />
-  <Column id="buyers" title="Buyers" fmt="num0" align="right" />
+  <Column id="transfers" title="Transfers" contentType="bar" fmt="num0" barColor="#16a34a" />
+  <Column id="symbols" title="Symbols" fmt="num0" />
+  <Column id="transactions" title="Txs" fmt="num0" />
+  <Column id="units_received" title="Units received" fmt="num2" />
 </DataTable>
 
-## LP backers
+## Cross-symbol wallets
 
-<DataTable data={lp_backers} rows=25 rowShading=true sortable=true search=true downloadable=true>
-  <Column id="backer_url" title="Backer" contentType="link" linkLabel="backer" openInNewTab=true />
-  <Column id="deposits_usdc" title="Deposits" contentType="bar" fmt="usd2" barColor="#2563eb" />
-  <Column id="withdrawals_usdc" title="Withdrawals" fmt="usd2" />
-  <Column id="net_usdc" title="Net" contentType="bar" fmt="usd2" barColor="#16a34a" />
-  <Column id="deposit_events" title="Deposit events" fmt="num0" align="right" />
-  <Column id="withdrawal_events" title="Withdrawal events" fmt="num0" align="right" />
+<DataTable data={wallet_symbol_mix} rows=25 rowShading=true sortable=true search=true downloadable=true>
+  <Column id="wallet_url" title="Wallet" contentType="link" linkLabel="wallet" openInNewTab=true />
+  <Column id="symbols" title="Symbols" contentType="bar" fmt="num0" barColor="#f59e0b" />
+  <Column id="touches" title="Touches" fmt="num0" />
 </DataTable>
-
-
-## Referrers and winners
-
-<Grid cols=2>
-  <DataTable data={referrers} rows=15 rowShading=true sortable=true search=true>
-    <Column id="referrer_url" title="Referrer" contentType="link" linkLabel="referrer" openInNewTab=true />
-    <Column id="fees_usdc" title="Fees" contentType="bar" fmt="usd2" barColor="#16a34a" />
-    <Column id="fee_events" title="Events" fmt="num0" align="right" />
-  </DataTable>
-  <DataTable data={winners} rows=15 rowShading=true sortable=true search=true>
-    <Column id="claimant_url" title="Claimant" contentType="link" linkLabel="claimant" openInNewTab=true />
-    <Column id="winnings_usdc" title="Winnings" contentType="bar" fmt="usd2" barColor="#16a34a" />
-    <Column id="claims" title="Claims" fmt="num0" align="right" />
-    <Column id="best_match" title="Best match" fmt="num0" align="right" />
-  </DataTable>
-</Grid>

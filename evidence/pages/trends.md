@@ -8,121 +8,92 @@ sidebar_position: 3
 icon: book-open
 ---
 
+Transfer velocity, symbol breadth, and wallet concentration for indexed Robinhood Stock Token activity.
 
 ```sql headline
 SELECT
-  sum(CASE WHEN event_name = 'TicketOrderProcessed' THEN coalesce(try_cast(json_extract_string(fields_json, '$.numberOfTickets') AS BIGINT), 0) ELSE 0 END) AS tickets_sold,
-  count(DISTINCT CASE WHEN event_name = 'TicketOrderProcessed' THEN json_extract_string(fields_json, '$.buyer') END) AS buyers,
-  count(DISTINCT CASE WHEN event_name IN ('TicketOrderProcessed', 'TicketPurchased') THEN json_extract_string(fields_json, '$.recipient') END) AS recipients,
-  sum(CASE WHEN event_name = 'TicketOrderProcessed' THEN coalesce(try_cast(json_extract_string(fields_json, '$.lpEarnings') AS DOUBLE), 0) / 1e6 ELSE 0 END) AS lp_earnings_usdc,
-  sum(CASE WHEN event_name = 'TicketOrderProcessed' THEN coalesce(try_cast(json_extract_string(fields_json, '$.referralFees') AS DOUBLE), 0) / 1e6 ELSE 0 END) AS referral_fees_usdc,
-  sum(CASE WHEN event_name = 'TicketWinningsClaimed' THEN coalesce(try_cast(json_extract_string(fields_json, '$.winningsAmount') AS DOUBLE), 0) / 1e6 ELSE 0 END) AS winnings_usdc,
-  count(DISTINCT CASE WHEN contract_alias = 'lp_manager' AND event_name IN ('LpDeposited', 'LpWithdrawInitiated', 'LpWithdrawFinalized') THEN json_extract_string(fields_json, '$.lpAddress') END) AS lp_backers,
-  sum(CASE WHEN event_name = 'LpDeposited' THEN coalesce(try_cast(json_extract_string(fields_json, '$.amount') AS DOUBLE), 0) / 1e6 ELSE 0 END) AS lp_deposits_usdc
+  count(*) AS transfers,
+  count(DISTINCT contract_alias) AS symbols,
+  count(DISTINCT tx_hash) AS transactions,
+  count(DISTINCT json_extract_string(fields_json, '$.from')) AS senders,
+  count(DISTINCT json_extract_string(fields_json, '$.to')) AS recipients,
+  round(sum(coalesce(try_cast(json_extract_string(fields_json, '$.value') AS DOUBLE), 0)) / 1e18, 2) AS units_moved
 FROM events
 WHERE is_deleted = 0
 ```
 
-```sql weekly_tickets
+```sql daily_transfers
 SELECT
-  epoch_ms(CAST(floor(block_timestamp / 604800) * 604800000 AS BIGINT)) AS week,
-  sum(coalesce(try_cast(json_extract_string(fields_json, '$.numberOfTickets') AS BIGINT), 0)) AS tickets,
-  count(*) AS orders,
-  count(DISTINCT json_extract_string(fields_json, '$.buyer')) AS buyers
+  epoch_ms(CAST(floor(block_timestamp / 86400) * 86400000 AS BIGINT)) AS day,
+  count(*) AS transfers,
+  count(DISTINCT contract_alias) AS symbols,
+  count(DISTINCT tx_hash) AS transactions,
+  round(sum(coalesce(try_cast(json_extract_string(fields_json, '$.value') AS DOUBLE), 0)) / 1e18, 2) AS units_moved
 FROM events
-WHERE is_deleted = 0 AND event_name = 'TicketOrderProcessed'
-GROUP BY week
-ORDER BY week
+WHERE is_deleted = 0
+GROUP BY day
+ORDER BY day
 ```
 
-
-```sql concentration
-WITH orders AS (
+```sql symbol_concentration
+WITH ranked AS (
   SELECT
-    json_extract_string(fields_json, '$.recipient') AS recipient,
-    coalesce(try_cast(json_extract_string(fields_json, '$.numberOfTickets') AS BIGINT), 0) AS tickets
+    contract_alias,
+    count(*) AS transfers,
+    row_number() OVER (ORDER BY count(*) DESC) AS rank
   FROM events
-  WHERE is_deleted = 0 AND event_name = 'TicketOrderProcessed'
-), ranked AS (
-  SELECT recipient, sum(tickets) AS tickets
-  FROM orders
-  GROUP BY recipient
+  WHERE is_deleted = 0
+  GROUP BY contract_alias
 )
 SELECT
-  sum(tickets) AS all_tickets,
-  sum(tickets) FILTER (WHERE rank <= 10) AS top_10_tickets,
-  sum(tickets) FILTER (WHERE rank <= 50) AS top_50_tickets,
-  sum(tickets) FILTER (WHERE rank <= 10) * 1.0 / sum(tickets) AS top_10_share,
-  sum(tickets) FILTER (WHERE rank <= 50) * 1.0 / sum(tickets) AS top_50_share
-FROM (
-  SELECT recipient, tickets, row_number() OVER (ORDER BY tickets DESC) AS rank
-  FROM ranked
-)
+  sum(transfers) AS all_transfers,
+  sum(transfers) FILTER (WHERE rank <= 5) AS top_5_transfers,
+  sum(transfers) FILTER (WHERE rank <= 20) AS top_20_transfers,
+  sum(transfers) FILTER (WHERE rank <= 5) * 1.0 / sum(transfers) AS top_5_share,
+  sum(transfers) FILTER (WHERE rank <= 20) * 1.0 / sum(transfers) AS top_20_share
+FROM ranked
 ```
 
-```sql referral_vs_lp
-WITH drawing_flows AS (
-  SELECT
-    coalesce(try_cast(json_extract_string(fields_json, '$.currentDrawingId') AS BIGINT), 0) AS drawing,
-    coalesce(try_cast(json_extract_string(fields_json, '$.lpEarnings') AS DOUBLE), 0) / 1e6 AS lp_earnings_usdc,
-    coalesce(try_cast(json_extract_string(fields_json, '$.referralFees') AS DOUBLE), 0) / 1e6 AS referral_fees_usdc
-  FROM events
-  WHERE is_deleted = 0 AND event_name = 'TicketOrderProcessed'
-)
-SELECT drawing, 'LP earnings' AS flow, round(sum(lp_earnings_usdc), 2) AS amount_usdc
-FROM drawing_flows
-WHERE drawing > 0
-GROUP BY drawing
-UNION ALL
-SELECT drawing, 'Referral fees' AS flow, round(sum(referral_fees_usdc), 2) AS amount_usdc
-FROM drawing_flows
-WHERE drawing > 0
-GROUP BY drawing
-ORDER BY drawing, flow
-```
-
-```sql lp_backer_flow
-WITH lp_events AS (
-  SELECT
-    event_name,
-    coalesce(try_cast(json_extract_string(fields_json, '$.amount') AS DOUBLE), 0) / 1e6 AS amount_usdc
-  FROM events
-  WHERE is_deleted = 0 AND contract_alias = 'lp_manager'
-)
+```sql mint_burn_flow
 SELECT
-  event_name,
-  count(*) AS events,
-  round(sum(amount_usdc), 2) AS amount_usdc
-FROM lp_events
-WHERE event_name IN ('LpDeposited', 'LpWithdrawInitiated', 'LpWithdrawFinalized')
-GROUP BY event_name
-ORDER BY amount_usdc DESC
+  contract_alias AS symbol,
+  count(*) FILTER (WHERE json_extract_string(fields_json, '$.from') = '0x0000000000000000000000000000000000000000') AS mints,
+  count(*) FILTER (WHERE json_extract_string(fields_json, '$.to') = '0x0000000000000000000000000000000000000000') AS burns,
+  count(*) FILTER (WHERE json_extract_string(fields_json, '$.from') != '0x0000000000000000000000000000000000000000' AND json_extract_string(fields_json, '$.to') != '0x0000000000000000000000000000000000000000') AS transfers
+FROM events
+WHERE is_deleted = 0
+GROUP BY contract_alias
+ORDER BY transfers DESC
+LIMIT 20
 ```
-
 
 <Grid cols=5>
-  <BigValue data={headline} value="tickets_sold" title="Tickets sold" fmt="num0" />
-  <BigValue data={headline} value="lp_earnings_usdc" title="LP earnings" fmt="usd2" />
-  <BigValue data={headline} value="lp_backers" title="LP backers" fmt="num0" />
-  <BigValue data={headline} value="lp_deposits_usdc" title="LP deposits" fmt="usd2" />
-  <BigValue data={headline} value="winnings_usdc" title="Claimed winnings" fmt="usd2" />
+  <BigValue data={headline} value="transfers" title="Transfers" fmt="num0" />
+  <BigValue data={headline} value="symbols" title="Symbols" fmt="num0" />
+  <BigValue data={headline} value="transactions" title="Transactions" fmt="num0" />
+  <BigValue data={headline} value="senders" title="Senders" fmt="num0" />
+  <BigValue data={headline} value="recipients" title="Recipients" fmt="num0" />
 </Grid>
 
-## Weekly demand
-
-<AreaChart data={weekly_tickets} x="week" y="tickets" title="Weekly ticket demand" />
-
-
-## Participants
+## Daily activity
 
 <Grid cols=2>
-  <BigValue data={concentration} value="top_10_share" title="Top 10 recipient share" fmt="pct1" />
-  <BigValue data={concentration} value="top_50_share" title="Top 50 recipient share" fmt="pct1" />
+  <AreaChart data={daily_transfers} x="day" y="transfers" title="Daily transfers" />
+  <AreaChart data={daily_transfers} x="day" y="symbols" title="Active symbols by day" />
 </Grid>
 
-## LP and referrals
+## Concentration
 
 <Grid cols=2>
-  <AreaChart data={referral_vs_lp} x="drawing" y="amount_usdc" series="flow" y_fmt="usd2" title="LP and referral fees by drawing" />
-  <BarChart data={lp_backer_flow} x="event_name" y="amount_usdc" title="LP manager deposits and withdrawals" />
+  <BigValue data={symbol_concentration} value="top_5_share" title="Top 5 symbol share" fmt="pct1" />
+  <BigValue data={symbol_concentration} value="top_20_share" title="Top 20 symbol share" fmt="pct1" />
 </Grid>
+
+<BarChart data={mint_burn_flow} x="symbol" y="transfers" title="Symbol transfer volume" />
+
+<DataTable data={mint_burn_flow} rows=20 rowShading=true sortable=true downloadable=true>
+  <Column id="symbol" title="Symbol" chip=true />
+  <Column id="transfers" title="Transfers" contentType="bar" fmt="num0" barColor="#2563eb" />
+  <Column id="mints" title="Mints" fmt="num0" />
+  <Column id="burns" title="Burns" fmt="num0" />
+</DataTable>

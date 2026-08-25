@@ -1,5 +1,5 @@
 project:
-  name: "megapot-v2-live"
+  name: "robinhood-stock-token-analytics"
   evidence: "0.9.1"
 
 pages: ./pages
@@ -8,4 +8,5 @@ plugins:
   components:
     "@evidence-dev/core-components": {}
   datasources:
+    "@evidence-dev/sqlite": {}
     evidence-connector-clickhouse: {}
