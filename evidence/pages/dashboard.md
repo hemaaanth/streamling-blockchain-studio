@@ -140,7 +140,7 @@ FROM totals
 
 ```sql ticket_flow
 SELECT
-  epoch_ms(CAST(floor(block_timestamp / 86400) * 86400000 AS BIGINT)) AS bucket,
+  epoch_ms(CAST(floor(block_timestamp / 604800) * 604800000 AS BIGINT)) AS bucket,
   sum(coalesce(try_cast(json_extract_string(fields_json, '$.numberOfTickets') AS BIGINT), 0)) AS tickets,
   count(*) AS orders,
   count(DISTINCT json_extract_string(fields_json, '$.buyer')) AS buyers,
@@ -280,7 +280,7 @@ LIMIT 25
     data={ticket_flow}
     x="bucket"
     y="tickets"
-    title="Daily tickets"
+    title="Weekly tickets"
   />
   <BarChart
     data={source_mix}
