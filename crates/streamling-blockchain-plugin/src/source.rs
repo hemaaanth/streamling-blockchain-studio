@@ -20,6 +20,54 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
+const USER_AGENT: &str = "streamling-blockchain/0.1";
+
+fn rpc_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .build()
+        .expect("static user agent builds")
+}
+async fn rpc_request(
+    rt: &PluginAsyncRuntimeObj,
+    client: &reqwest::Client,
+    rpc_url: &str,
+    method: &str,
+    params: Value,
+) -> Result<Value, PluginError> {
+    for attempt in 0..6 {
+        let body: Value = client
+            .post(rpc_url)
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+            .send()
+            .await
+            .map_err(|e| PluginError::Execution(format!("{method}: {e}")))?
+            .json()
+            .await
+            .map_err(|e| PluginError::Execution(format!("{method} response: {e}")))?;
+        if let Some(error) = body.get("error") {
+            if is_rate_limited(error) && attempt < 5 {
+                rt.sleep(RDuration::from_millis(1_000 << attempt)).await;
+                continue;
+            }
+            return Err(PluginError::Execution(format!("{method}: {error}")));
+        }
+        return body
+            .get("result")
+            .cloned()
+            .ok_or_else(|| PluginError::Execution(format!("{method}: missing result")));
+    }
+    unreachable!("bounded retry loop returns on final attempt")
+}
+
+fn is_rate_limited(error: &Value) -> bool {
+    error.get("code").and_then(Value::as_i64) == Some(429)
+        || error
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("Too Many Requests"))
+}
+
 use streamling_plugin::api::{
     PluginStateBackend, PluginStateBackendFactory, STREAMLING_COLUMN_NAME_OP,
     SupportsGracefulShutdown,
@@ -59,10 +107,12 @@ pub struct EvmEventSource {
     metrics: PluginMetricsRecorder,
     client: reqwest::Client,
     rpc_url: String,
+    chain_id: u64,
     confirmations: u64,
     window: AtomicU64,
     next_block: AtomicU64,
     progress_path: Option<PathBuf>,
+    end_block: Option<u64>,
     state: Arc<PluginStateBackend<SourceState>>,
     schema: SchemaRef,
     events: HashMap<H256, Vec<EventDescriptor>>,
@@ -100,6 +150,8 @@ impl EvmEventSource {
         let start_block = parse_option(&options, "start_block", 0)?;
         let confirmations = parse_option(&options, "confirmations", 12)?;
         let window = parse_option(&options, "window", 2_000)?;
+        let chain_id = parse_option(&options, "chain_id", 0)?;
+        let end_block = parse_optional(&options, "end_block")?;
         if window == 0 {
             return Err(PluginInitializationError::Configuration(
                 "window must be greater than zero".into(),
@@ -125,6 +177,7 @@ impl EvmEventSource {
         topics.sort();
         let schema = Arc::new(Schema::new(vec![
             Field::new("event_id", DataType::Utf8, false),
+            Field::new("chain_id", DataType::UInt64, false),
             Field::new("contract_alias", DataType::Utf8, false),
             Field::new("event_name", DataType::Utf8, false),
             Field::new("address", DataType::Utf8, false),
@@ -142,10 +195,12 @@ impl EvmEventSource {
         Ok(Self {
             rt,
             metrics,
-            client: reqwest::Client::new(),
+            client: rpc_client(),
             rpc_url,
+            chain_id,
             confirmations,
             window: AtomicU64::new(window),
+            end_block,
             next_block: AtomicU64::new(start_block),
             progress_path: options.get("progress_path").map(PathBuf::from),
             state: state_factory.create(),
@@ -192,22 +247,7 @@ impl EvmEventSource {
     }
 
     async fn rpc(&self, method: &str, params: Value) -> Result<Value, PluginError> {
-        let body: Value = self
-            .client
-            .post(&self.rpc_url)
-            .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
-            .send()
-            .await
-            .map_err(|e| PluginError::Execution(format!("{method}: {e}")))?
-            .json()
-            .await
-            .map_err(|e| PluginError::Execution(format!("{method} response: {e}")))?;
-        if let Some(error) = body.get("error") {
-            return Err(PluginError::Execution(format!("{method}: {error}")));
-        }
-        body.get("result")
-            .cloned()
-            .ok_or_else(|| PluginError::Execution(format!("{method}: missing result")))
+        rpc_request(&self.rt, &self.client, &self.rpc_url, method, params).await
     }
 
     async fn block_timestamp(&self, block: u64) -> Result<u64, PluginError> {
@@ -223,6 +263,431 @@ impl EvmEventSource {
                 .and_then(Value::as_str)
                 .unwrap_or("0x0"),
         )
+    }
+}
+
+pub struct EvmBlockSource {
+    rt: PluginAsyncRuntimeObj,
+    metrics: PluginMetricsRecorder,
+    client: reqwest::Client,
+    rpc_url: String,
+    confirmations: u64,
+    window: u64,
+    next_block: AtomicU64,
+    progress_path: Option<PathBuf>,
+    end_block: Option<u64>,
+    chain_id: u64,
+    state: Arc<PluginStateBackend<BlockSourceState>>,
+    schema: SchemaRef,
+    running: AtomicBool,
+}
+
+impl EvmBlockSource {
+    pub fn new(
+        rt: PluginAsyncRuntimeObj,
+        state_factory: PluginStateBackendFactory,
+        metrics: PluginMetricsRecorder,
+        options: HashMap<String, String>,
+    ) -> Result<Self, PluginInitializationError> {
+        let rpc_url = if let Some(url) = options.get("rpc_url") {
+            url.clone()
+        } else if let Some(name) = options.get("rpc_url_env") {
+            std::env::var(name).map_err(|_| {
+                PluginInitializationError::Configuration(format!("read ${name}").into())
+            })?
+        } else {
+            return Err(PluginInitializationError::Configuration(
+                "missing option rpc_url or rpc_url_env".into(),
+            ));
+        };
+        let window = parse_option(&options, "window", 2_000)?;
+        let chain_id = parse_option(&options, "chain_id", 0)?;
+        let end_block = parse_optional(&options, "end_block")?;
+        if window == 0 {
+            return Err(PluginInitializationError::Configuration(
+                "window must be greater than zero".into(),
+            ));
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("block_id", DataType::Utf8, false),
+            Field::new("chain_id", DataType::UInt64, false),
+            Field::new("block_number", DataType::UInt64, false),
+            Field::new("block_hash", DataType::Utf8, false),
+            Field::new("parent_hash", DataType::Utf8, false),
+            Field::new("block_timestamp", DataType::UInt64, false),
+            Field::new("miner", DataType::Utf8, true),
+            Field::new("gas_limit", DataType::UInt64, false),
+            Field::new("gas_used", DataType::UInt64, false),
+            Field::new("base_fee_per_gas", DataType::Utf8, true),
+            Field::new("transaction_count", DataType::UInt64, false),
+            Field::new(STREAMLING_COLUMN_NAME_OP, DataType::Utf8, false),
+        ]));
+        Ok(Self {
+            rt,
+            metrics,
+            client: rpc_client(),
+            rpc_url,
+            chain_id,
+            confirmations: parse_option(&options, "confirmations", 12)?,
+            window,
+            next_block: AtomicU64::new(parse_option(&options, "start_block", 0)?),
+            progress_path: options.get("progress_path").map(PathBuf::from),
+            end_block,
+            state: state_factory.create(),
+            schema,
+            running: AtomicBool::new(true),
+        })
+    }
+
+    async fn rpc(&self, method: &str, params: Value) -> Result<Value, PluginError> {
+        rpc_request(&self.rt, &self.client, &self.rpc_url, method, params).await
+    }
+
+    fn write_progress(
+        &self,
+        indexed_through: u64,
+        observed_head: u64,
+        safe_head: u64,
+    ) -> Result<(), PluginError> {
+        let Some(path) = &self.progress_path else {
+            return Ok(());
+        };
+        let progress = BackfillProgress {
+            indexed_through,
+            observed_head,
+            safe_head,
+            confirmations: self.confirmations,
+            caught_up: indexed_through >= safe_head,
+            updated_at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(progress_error)?;
+        let temporary = path.with_extension("json.tmp");
+        fs::write(
+            &temporary,
+            serde_json::to_vec(&progress).map_err(progress_error)?,
+        )
+        .map_err(progress_error)?;
+        fs::rename(&temporary, path).map_err(progress_error)
+    }
+}
+
+#[async_trait]
+impl SupportsGracefulShutdown for EvmBlockSource {
+    fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+    async fn terminate(&self) -> Result<(), PluginError> {
+        self.running.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SourcePlugin for EvmBlockSource {
+    async fn initialize(&self) -> Result<(), PluginError> {
+        if let Some(saved) = self.state.get().await.map_err(PluginError::State)? {
+            self.next_block.store(saved.next_block, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+    fn output_schema(&self) -> Result<SchemaRef, PluginError> {
+        Ok(self.schema.clone())
+    }
+    async fn generate_batch(&self) -> Result<RecordBatch, PluginError> {
+        let head = parse_hex(
+            self.rpc("eth_blockNumber", json!([]))
+                .await?
+                .as_str()
+                .unwrap_or("0x0"),
+        )?;
+        let safe_head = capped_safe_head(head, self.confirmations, self.end_block);
+        let from = self.next_block.load(Ordering::Relaxed);
+        self.write_progress(from.saturating_sub(1), head, safe_head)?;
+        if from > safe_head {
+            self.rt.sleep(RDuration::from_millis(1_000)).await;
+            return Ok(RecordBatch::new_empty(self.schema.clone()));
+        }
+        let to = safe_head.min(from.saturating_add(self.window - 1));
+        let mut rows = Vec::new();
+        for block in from..=to {
+            let value = self
+                .rpc(
+                    "eth_getBlockByNumber",
+                    json!([format!("0x{block:x}"), false]),
+                )
+                .await?;
+            if !value.is_null() {
+                rows.push(block_row(self.chain_id, &value)?);
+            }
+        }
+        let next_block = to.saturating_add(1);
+        self.next_block.store(next_block, Ordering::Relaxed);
+        self.write_progress(next_block.saturating_sub(1), head, safe_head)?;
+        self.metrics
+            .record_count("streamling_blockchain_blocks", rows.len() as u64);
+        block_rows_to_batch(self.schema.clone(), rows)
+    }
+    async fn process_checkpoint_marker(&self, _epoch: CheckpointEpoch) -> Result<(), PluginError> {
+        Ok(())
+    }
+    async fn process_checkpoint_finalizer(
+        &self,
+        _epoch: CheckpointEpoch,
+    ) -> Result<(), PluginError> {
+        self.state
+            .put(BlockSourceState {
+                next_block: self.next_block.load(Ordering::Relaxed),
+            })
+            .await
+            .map_err(PluginError::State)
+    }
+}
+
+pub struct EvmTransactionSource {
+    rt: PluginAsyncRuntimeObj,
+    metrics: PluginMetricsRecorder,
+    client: reqwest::Client,
+    rpc_url: String,
+    confirmations: u64,
+    window: u64,
+    next_block: AtomicU64,
+    progress_path: Option<PathBuf>,
+    end_block: Option<u64>,
+    chain_id: u64,
+    state: Arc<PluginStateBackend<BlockSourceState>>,
+    schema: SchemaRef,
+    running: AtomicBool,
+}
+
+impl EvmTransactionSource {
+    pub fn new(
+        rt: PluginAsyncRuntimeObj,
+        state_factory: PluginStateBackendFactory,
+        metrics: PluginMetricsRecorder,
+        options: HashMap<String, String>,
+    ) -> Result<Self, PluginInitializationError> {
+        let rpc_url = if let Some(url) = options.get("rpc_url") {
+            url.clone()
+        } else if let Some(name) = options.get("rpc_url_env") {
+            std::env::var(name).map_err(|_| {
+                PluginInitializationError::Configuration(format!("read ${name}").into())
+            })?
+        } else {
+            return Err(PluginInitializationError::Configuration(
+                "missing option rpc_url or rpc_url_env".into(),
+            ));
+        };
+        let window = parse_option(&options, "window", 2_000)?;
+        let end_block = parse_optional(&options, "end_block")?;
+        if window == 0 {
+            return Err(PluginInitializationError::Configuration(
+                "window must be greater than zero".into(),
+            ));
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("transaction_id", DataType::Utf8, false),
+            Field::new("chain_id", DataType::UInt64, false),
+            Field::new("tx_hash", DataType::Utf8, false),
+            Field::new("block_number", DataType::UInt64, false),
+            Field::new("block_hash", DataType::Utf8, false),
+            Field::new("block_timestamp", DataType::UInt64, false),
+            Field::new("transaction_index", DataType::UInt64, false),
+            Field::new("from_address", DataType::Utf8, false),
+            Field::new("to_address", DataType::Utf8, true),
+            Field::new("value", DataType::Utf8, false),
+            Field::new("gas", DataType::UInt64, false),
+            Field::new("gas_price", DataType::Utf8, true),
+            Field::new("max_fee_per_gas", DataType::Utf8, true),
+            Field::new("max_priority_fee_per_gas", DataType::Utf8, true),
+            Field::new("input", DataType::Utf8, false),
+            Field::new("method_id", DataType::Utf8, true),
+            Field::new("nonce", DataType::UInt64, false),
+            Field::new("receipt_status", DataType::UInt64, true),
+            Field::new("receipt_gas_used", DataType::UInt64, true),
+            Field::new("receipt_effective_gas_price", DataType::Utf8, true),
+            Field::new("contract_address", DataType::Utf8, true),
+            Field::new("logs_count", DataType::UInt64, true),
+            Field::new(STREAMLING_COLUMN_NAME_OP, DataType::Utf8, false),
+        ]));
+        Ok(Self {
+            rt,
+            metrics,
+            client: rpc_client(),
+            rpc_url,
+            confirmations: parse_option(&options, "confirmations", 12)?,
+            window,
+            next_block: AtomicU64::new(parse_option(&options, "start_block", 0)?),
+            progress_path: options.get("progress_path").map(PathBuf::from),
+            end_block,
+            chain_id: parse_option(&options, "chain_id", 0)?,
+            state: state_factory.create(),
+            schema,
+            running: AtomicBool::new(true),
+        })
+    }
+
+    async fn rpc(&self, method: &str, params: Value) -> Result<Value, PluginError> {
+        rpc_request(&self.rt, &self.client, &self.rpc_url, method, params).await
+    }
+
+    async fn receipts_by_tx(
+        &self,
+        block_number: u64,
+        txs: &[Value],
+    ) -> Result<HashMap<String, Value>, PluginError> {
+        if let Ok(receipts) = self
+            .rpc(
+                "eth_getBlockReceipts",
+                json!([format!("0x{block_number:x}")]),
+            )
+            .await
+        {
+            if let Some(items) = receipts.as_array() {
+                return Ok(items
+                    .iter()
+                    .filter_map(|receipt| {
+                        receipt
+                            .get("transactionHash")
+                            .and_then(Value::as_str)
+                            .map(|hash| (hash.to_owned(), receipt.clone()))
+                    })
+                    .collect());
+            }
+        }
+        let mut receipts = HashMap::new();
+        for tx in txs {
+            let Some(hash) = tx.get("hash").and_then(Value::as_str) else {
+                continue;
+            };
+            let receipt = self.rpc("eth_getTransactionReceipt", json!([hash])).await?;
+            if !receipt.is_null() {
+                receipts.insert(hash.to_owned(), receipt);
+            }
+        }
+        Ok(receipts)
+    }
+
+    fn write_progress(
+        &self,
+        indexed_through: u64,
+        observed_head: u64,
+        safe_head: u64,
+    ) -> Result<(), PluginError> {
+        let Some(path) = &self.progress_path else {
+            return Ok(());
+        };
+        let progress = BackfillProgress {
+            indexed_through,
+            observed_head,
+            safe_head,
+            confirmations: self.confirmations,
+            caught_up: indexed_through >= safe_head,
+            updated_at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(progress_error)?;
+        let temporary = path.with_extension("json.tmp");
+        fs::write(
+            &temporary,
+            serde_json::to_vec(&progress).map_err(progress_error)?,
+        )
+        .map_err(progress_error)?;
+        fs::rename(&temporary, path).map_err(progress_error)
+    }
+}
+
+#[async_trait]
+impl SupportsGracefulShutdown for EvmTransactionSource {
+    fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+    async fn terminate(&self) -> Result<(), PluginError> {
+        self.running.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SourcePlugin for EvmTransactionSource {
+    async fn initialize(&self) -> Result<(), PluginError> {
+        if let Some(saved) = self.state.get().await.map_err(PluginError::State)? {
+            self.next_block.store(saved.next_block, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+    fn output_schema(&self) -> Result<SchemaRef, PluginError> {
+        Ok(self.schema.clone())
+    }
+    async fn generate_batch(&self) -> Result<RecordBatch, PluginError> {
+        let head = parse_hex(
+            self.rpc("eth_blockNumber", json!([]))
+                .await?
+                .as_str()
+                .unwrap_or("0x0"),
+        )?;
+        let safe_head = capped_safe_head(head, self.confirmations, self.end_block);
+        let from = self.next_block.load(Ordering::Relaxed);
+        self.write_progress(from.saturating_sub(1), head, safe_head)?;
+        if from > safe_head {
+            self.rt.sleep(RDuration::from_millis(1_000)).await;
+            return Ok(RecordBatch::new_empty(self.schema.clone()));
+        }
+        let to = safe_head.min(from.saturating_add(self.window - 1));
+        let mut rows = Vec::new();
+        for block_number in from..=to {
+            let block = self
+                .rpc(
+                    "eth_getBlockByNumber",
+                    json!([format!("0x{block_number:x}"), true]),
+                )
+                .await?;
+            let txs = block
+                .get("transactions")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let receipts = self.receipts_by_tx(block_number, &txs).await?;
+            for (index, tx) in txs.iter().enumerate() {
+                let receipt = tx
+                    .get("hash")
+                    .and_then(Value::as_str)
+                    .and_then(|hash| receipts.get(hash));
+                rows.push(transaction_row(
+                    self.chain_id,
+                    &block,
+                    tx,
+                    receipt,
+                    index as u64,
+                )?);
+            }
+        }
+        let next_block = to.saturating_add(1);
+        self.next_block.store(next_block, Ordering::Relaxed);
+        self.write_progress(next_block.saturating_sub(1), head, safe_head)?;
+        self.metrics
+            .record_count("streamling_blockchain_transactions", rows.len() as u64);
+        transaction_rows_to_batch(self.schema.clone(), rows)
+    }
+    async fn process_checkpoint_marker(&self, _epoch: CheckpointEpoch) -> Result<(), PluginError> {
+        Ok(())
+    }
+    async fn process_checkpoint_finalizer(
+        &self,
+        _epoch: CheckpointEpoch,
+    ) -> Result<(), PluginError> {
+        self.state
+            .put(BlockSourceState {
+                next_block: self.next_block.load(Ordering::Relaxed),
+            })
+            .await
+            .map_err(PluginError::State)
     }
 }
 
@@ -276,7 +741,7 @@ impl SourcePlugin for EvmEventSource {
                 .as_str()
                 .unwrap_or("0x0"),
         )?;
-        let safe_head = head.saturating_sub(self.confirmations);
+        let safe_head = capped_safe_head(head, self.confirmations, self.end_block);
         let from = self.next_block.load(Ordering::Relaxed);
         self.write_progress(from.saturating_sub(1), head, safe_head)?;
         if from > safe_head {
@@ -313,6 +778,7 @@ impl SourcePlugin for EvmEventSource {
         let mut decoded = Vec::new();
         for log in logs {
             if let Some(row) = decode_row(
+                self.chain_id,
                 &log,
                 &self.events,
                 &self.direct_addresses,
@@ -389,6 +855,312 @@ struct SourceState {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct BlockSourceState {
+    next_block: u64,
+}
+
+#[derive(Clone, Debug)]
+struct BlockRow {
+    block_id: String,
+    chain_id: u64,
+    block_number: u64,
+    block_hash: String,
+    parent_hash: String,
+    block_timestamp: u64,
+    miner: Option<String>,
+    gas_limit: u64,
+    gas_used: u64,
+    base_fee_per_gas: Option<String>,
+    transaction_count: u64,
+}
+
+fn block_row(chain_id: u64, block: &Value) -> Result<BlockRow, PluginError> {
+    let block_number = parse_hex(block.get("number").and_then(Value::as_str).unwrap_or("0x0"))?;
+    Ok(BlockRow {
+        block_id: format!("{chain_id}:{block_number}"),
+        chain_id,
+        block_number,
+        block_hash: block
+            .get("hash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        parent_hash: block
+            .get("parentHash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        block_timestamp: parse_hex(
+            block
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .unwrap_or("0x0"),
+        )?,
+        miner: block
+            .get("miner")
+            .or_else(|| block.get("author"))
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase),
+        gas_limit: parse_hex(
+            block
+                .get("gasLimit")
+                .and_then(Value::as_str)
+                .unwrap_or("0x0"),
+        )?,
+        gas_used: parse_hex(
+            block
+                .get("gasUsed")
+                .and_then(Value::as_str)
+                .unwrap_or("0x0"),
+        )?,
+        base_fee_per_gas: block
+            .get("baseFeePerGas")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        transaction_count: block
+            .get("transactions")
+            .and_then(Value::as_array)
+            .map_or(0, |items| items.len() as u64),
+    })
+}
+
+fn block_rows_to_batch(schema: SchemaRef, rows: Vec<BlockRow>) -> Result<RecordBatch, PluginError> {
+    let mut block_numbers = UInt64Builder::new();
+    let mut block_ids = StringBuilder::new();
+    let mut chain_ids = UInt64Builder::new();
+    let mut block_hashes = StringBuilder::new();
+    let mut parent_hashes = StringBuilder::new();
+    let mut timestamps = UInt64Builder::new();
+    let mut miners = StringBuilder::new();
+    let mut gas_limits = UInt64Builder::new();
+    let mut gas_used = UInt64Builder::new();
+    let mut base_fees = StringBuilder::new();
+    let mut transaction_counts = UInt64Builder::new();
+    let mut ops = StringBuilder::new();
+    for row in rows {
+        block_ids.append_value(row.block_id);
+        chain_ids.append_value(row.chain_id);
+        block_numbers.append_value(row.block_number);
+        block_hashes.append_value(row.block_hash);
+        parent_hashes.append_value(row.parent_hash);
+        timestamps.append_value(row.block_timestamp);
+        miners.append_option(row.miner);
+        gas_limits.append_value(row.gas_limit);
+        gas_used.append_value(row.gas_used);
+        base_fees.append_option(row.base_fee_per_gas);
+        transaction_counts.append_value(row.transaction_count);
+        ops.append_value("i");
+    }
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(block_ids.finish()),
+            Arc::new(chain_ids.finish()),
+            Arc::new(block_numbers.finish()),
+            Arc::new(block_hashes.finish()),
+            Arc::new(parent_hashes.finish()),
+            Arc::new(timestamps.finish()),
+            Arc::new(miners.finish()),
+            Arc::new(gas_limits.finish()),
+            Arc::new(gas_used.finish()),
+            Arc::new(base_fees.finish()),
+            Arc::new(transaction_counts.finish()),
+            Arc::new(ops.finish()),
+        ],
+    )
+    .map_err(PluginError::ArrowError)
+}
+
+#[derive(Clone, Debug)]
+struct TransactionRow {
+    transaction_id: String,
+    chain_id: u64,
+    tx_hash: String,
+    block_number: u64,
+    block_hash: String,
+    block_timestamp: u64,
+    transaction_index: u64,
+    from_address: String,
+    to_address: Option<String>,
+    value: String,
+    gas: u64,
+    gas_price: Option<String>,
+    max_fee_per_gas: Option<String>,
+    max_priority_fee_per_gas: Option<String>,
+    input: String,
+    method_id: Option<String>,
+    nonce: u64,
+    receipt_status: Option<u64>,
+    receipt_gas_used: Option<u64>,
+    receipt_effective_gas_price: Option<String>,
+    contract_address: Option<String>,
+    logs_count: Option<u64>,
+}
+
+fn transaction_row(
+    chain_id: u64,
+    block: &Value,
+    tx: &Value,
+    receipt: Option<&Value>,
+    fallback_index: u64,
+) -> Result<TransactionRow, PluginError> {
+    let tx_hash = tx.get("hash").and_then(Value::as_str).unwrap_or_default();
+    let input = tx
+        .get("input")
+        .or_else(|| tx.get("data"))
+        .and_then(Value::as_str)
+        .unwrap_or("0x")
+        .to_owned();
+    let method_id = (input.len() >= 10).then(|| input[..10].to_owned());
+    Ok(TransactionRow {
+        transaction_id: format!("{chain_id}:{tx_hash}"),
+        chain_id,
+        tx_hash: tx_hash.to_owned(),
+        block_number: parse_hex(block.get("number").and_then(Value::as_str).unwrap_or("0x0"))?,
+        block_hash: block
+            .get("hash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        block_timestamp: parse_hex(
+            block
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .unwrap_or("0x0"),
+        )?,
+        transaction_index: tx
+            .get("transactionIndex")
+            .and_then(Value::as_str)
+            .map(parse_hex)
+            .transpose()?
+            .unwrap_or(fallback_index),
+        from_address: tx
+            .get("from")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+        to_address: tx
+            .get("to")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase),
+        value: tx
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or("0x0")
+            .to_owned(),
+        gas: parse_hex(tx.get("gas").and_then(Value::as_str).unwrap_or("0x0"))?,
+        gas_price: tx
+            .get("gasPrice")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        max_fee_per_gas: tx
+            .get("maxFeePerGas")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        max_priority_fee_per_gas: tx
+            .get("maxPriorityFeePerGas")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        input,
+        method_id,
+        nonce: parse_hex(tx.get("nonce").and_then(Value::as_str).unwrap_or("0x0"))?,
+        receipt_status: receipt
+            .and_then(|value| value.get("status"))
+            .and_then(Value::as_str)
+            .map(parse_hex)
+            .transpose()?,
+        receipt_gas_used: receipt
+            .and_then(|value| value.get("gasUsed"))
+            .and_then(Value::as_str)
+            .map(parse_hex)
+            .transpose()?,
+        receipt_effective_gas_price: receipt
+            .and_then(|value| value.get("effectiveGasPrice"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        contract_address: receipt
+            .and_then(|value| value.get("contractAddress"))
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase),
+        logs_count: receipt
+            .and_then(|value| value.get("logs"))
+            .and_then(Value::as_array)
+            .map(|items| items.len() as u64),
+    })
+}
+
+fn transaction_rows_to_batch(
+    schema: SchemaRef,
+    rows: Vec<TransactionRow>,
+) -> Result<RecordBatch, PluginError> {
+    let mut strings = (0..13).map(|_| StringBuilder::new()).collect::<Vec<_>>();
+    let mut chain_ids = UInt64Builder::new();
+    let mut block_numbers = UInt64Builder::new();
+    let mut timestamps = UInt64Builder::new();
+    let mut indexes = UInt64Builder::new();
+    let mut gas = UInt64Builder::new();
+    let mut nonces = UInt64Builder::new();
+    let mut receipt_statuses = UInt64Builder::new();
+    let mut receipt_gas_used = UInt64Builder::new();
+    let mut logs_counts = UInt64Builder::new();
+    let mut ops = StringBuilder::new();
+    for row in rows {
+        strings[0].append_value(row.transaction_id);
+        chain_ids.append_value(row.chain_id);
+        strings[1].append_value(row.tx_hash);
+        block_numbers.append_value(row.block_number);
+        strings[2].append_value(row.block_hash);
+        timestamps.append_value(row.block_timestamp);
+        indexes.append_value(row.transaction_index);
+        strings[3].append_value(row.from_address);
+        strings[4].append_option(row.to_address);
+        strings[5].append_value(row.value);
+        gas.append_value(row.gas);
+        strings[6].append_option(row.gas_price);
+        strings[7].append_option(row.max_fee_per_gas);
+        strings[8].append_option(row.max_priority_fee_per_gas);
+        strings[9].append_value(row.input);
+        strings[10].append_option(row.method_id);
+        nonces.append_value(row.nonce);
+        receipt_statuses.append_option(row.receipt_status);
+        receipt_gas_used.append_option(row.receipt_gas_used);
+        strings[11].append_option(row.receipt_effective_gas_price);
+        strings[12].append_option(row.contract_address);
+        logs_counts.append_option(row.logs_count);
+        ops.append_value("i");
+    }
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(strings.remove(0).finish()),
+            Arc::new(chain_ids.finish()),
+            Arc::new(strings.remove(0).finish()),
+            Arc::new(block_numbers.finish()),
+            Arc::new(strings.remove(0).finish()),
+            Arc::new(timestamps.finish()),
+            Arc::new(indexes.finish()),
+            Arc::new(strings.remove(0).finish()),
+            Arc::new(strings.remove(0).finish()),
+            Arc::new(strings.remove(0).finish()),
+            Arc::new(gas.finish()),
+            Arc::new(strings.remove(0).finish()),
+            Arc::new(strings.remove(0).finish()),
+            Arc::new(strings.remove(0).finish()),
+            Arc::new(strings.remove(0).finish()),
+            Arc::new(strings.remove(0).finish()),
+            Arc::new(nonces.finish()),
+            Arc::new(receipt_statuses.finish()),
+            Arc::new(receipt_gas_used.finish()),
+            Arc::new(strings.remove(0).finish()),
+            Arc::new(strings.remove(0).finish()),
+            Arc::new(logs_counts.finish()),
+            Arc::new(ops.finish()),
+        ],
+    )
+    .map_err(PluginError::ArrowError)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedRow {
     row: DecodedRow,
     timestamp: u64,
@@ -396,6 +1168,7 @@ struct PersistedRow {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DecodedRow {
+    chain_id: u64,
     event_id: String,
     owner: String,
     event: String,
@@ -411,6 +1184,7 @@ struct DecodedRow {
 }
 
 fn decode_row(
+    chain_id: u64,
     log: &Value,
     events: &HashMap<H256, Vec<EventDescriptor>>,
     direct: &HashMap<String, String>,
@@ -505,7 +1279,8 @@ fn decode_row(
         .unwrap_or_default()
         .to_owned();
     Ok(Some(DecodedRow {
-        event_id: format!("{block_hash}:{log_index}"),
+        event_id: format!("{chain_id}:{block_hash}:{log_index}"),
+        chain_id,
         owner: descriptor.owner.clone(),
         event: descriptor.event.name.clone(),
         address,
@@ -525,11 +1300,13 @@ fn rows_to_batch(
     rows: Vec<(DecodedRow, u64)>,
 ) -> Result<RecordBatch, PluginError> {
     let mut strings = (0..11).map(|_| StringBuilder::new()).collect::<Vec<_>>();
+    let mut chain_ids = UInt64Builder::new();
     let mut block_numbers = UInt64Builder::new();
     let mut timestamps = UInt64Builder::new();
     let mut indexes = UInt64Builder::new();
     for (row, timestamp) in rows {
         strings[0].append_value(row.event_id);
+        chain_ids.append_value(row.chain_id);
         strings[1].append_value(row.owner);
         strings[2].append_value(row.event);
         strings[3].append_value(row.address);
@@ -548,6 +1325,7 @@ fn rows_to_batch(
         schema,
         vec![
             Arc::new(strings.remove(0).finish()),
+            Arc::new(chain_ids.finish()),
             Arc::new(strings.remove(0).finish()),
             Arc::new(strings.remove(0).finish()),
             Arc::new(strings.remove(0).finish()),
@@ -649,6 +1427,23 @@ fn parse_option(
         })
         .unwrap_or(Ok(default))
 }
+fn parse_optional(
+    options: &HashMap<String, String>,
+    key: &str,
+) -> Result<Option<u64>, PluginInitializationError> {
+    options
+        .get(key)
+        .map(|v| {
+            v.parse().map(Some).map_err(|_| {
+                PluginInitializationError::Configuration(format!("invalid {key}").into())
+            })
+        })
+        .unwrap_or(Ok(None))
+}
+fn capped_safe_head(head: u64, confirmations: u64, end_block: Option<u64>) -> u64 {
+    let safe_head = head.saturating_sub(confirmations);
+    end_block.map_or(safe_head, |end| safe_head.min(end))
+}
 fn config_error(error: impl std::fmt::Display) -> PluginInitializationError {
     PluginInitializationError::Configuration(error.to_string().into())
 }
@@ -685,5 +1480,126 @@ fn token_json(token: &Token) -> Value {
         Token::Array(v) | Token::FixedArray(v) | Token::Tuple(v) => {
             Value::Array(v.iter().map(token_json).collect())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::UInt64Array;
+
+    #[test]
+    fn block_rows_include_chain_scoped_id() {
+        let row = block_row(
+            8453,
+            &json!({
+                "number": "0x7b",
+                "hash": "0xabc",
+                "parentHash": "0xdef",
+                "timestamp": "0x65",
+                "miner": "0x1111111111111111111111111111111111111111",
+                "gasLimit": "0x10",
+                "gasUsed": "0x08",
+                "baseFeePerGas": "0x01",
+                "transactions": ["0xaaa", "0xbbb"]
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(row.block_id, "8453:123");
+        assert_eq!(row.chain_id, 8453);
+        assert_eq!(row.transaction_count, 2);
+    }
+
+    #[test]
+    fn event_batches_include_chain_id() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_id", DataType::Utf8, false),
+            Field::new("chain_id", DataType::UInt64, false),
+            Field::new("contract_alias", DataType::Utf8, false),
+            Field::new("event_name", DataType::Utf8, false),
+            Field::new("address", DataType::Utf8, false),
+            Field::new("block_number", DataType::UInt64, false),
+            Field::new("block_hash", DataType::Utf8, false),
+            Field::new("block_timestamp", DataType::UInt64, false),
+            Field::new("tx_hash", DataType::Utf8, false),
+            Field::new("log_index", DataType::UInt64, false),
+            Field::new("topic0", DataType::Utf8, false),
+            Field::new("fields_json", DataType::Utf8, false),
+            Field::new("discovered_address", DataType::Utf8, true),
+            Field::new("discovery_rule", DataType::Utf8, true),
+            Field::new(STREAMLING_COLUMN_NAME_OP, DataType::Utf8, false),
+        ]));
+        let batch = rows_to_batch(
+            schema,
+            vec![(
+                DecodedRow {
+                    event_id: "8453:0xabc:0".into(),
+                    chain_id: 8453,
+                    owner: "token".into(),
+                    event: "Transfer".into(),
+                    address: "0x1111111111111111111111111111111111111111".into(),
+                    block_number: 123,
+                    block_hash: "0xabc".into(),
+                    tx_hash: "0xtx".into(),
+                    log_index: 0,
+                    topic0: "0xtopic".into(),
+                    fields: "{}".into(),
+                    discovered_address: None,
+                    discovery_rule: None,
+                },
+                101,
+            )],
+        )
+        .unwrap();
+        let chain_id = batch
+            .column_by_name("chain_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+
+        assert_eq!(chain_id.value(0), 8453);
+    }
+
+    #[test]
+    fn transaction_rows_include_receipt_fields() {
+        let row = transaction_row(
+            8453,
+            &json!({
+                "number": "0x7b",
+                "hash": "0xblock",
+                "timestamp": "0x65"
+            }),
+            &json!({
+                "hash": "0xtx",
+                "transactionIndex": "0x2",
+                "from": "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "to": null,
+                "value": "0x10",
+                "gas": "0x5208",
+                "gasPrice": "0x3b9aca00",
+                "input": "0xa9059cbb00000000",
+                "nonce": "0x1"
+            }),
+            Some(&json!({
+                "status": "0x1",
+                "gasUsed": "0x5208",
+                "effectiveGasPrice": "0x3b9aca00",
+                "contractAddress": "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                "logs": [{}, {}]
+            })),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(row.transaction_id, "8453:0xtx");
+        assert_eq!(row.method_id.as_deref(), Some("0xa9059cbb"));
+        assert_eq!(row.receipt_status, Some(1));
+        assert_eq!(row.logs_count, Some(2));
+        assert_eq!(
+            row.contract_address.as_deref(),
+            Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
     }
 }

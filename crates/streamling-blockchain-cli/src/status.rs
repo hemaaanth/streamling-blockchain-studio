@@ -1,6 +1,5 @@
 use crate::{config::ProjectConfig, rpc};
 use anyhow::{Context, Result};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
@@ -35,8 +34,8 @@ pub async fn live(root: &Path) -> Result<Value> {
     let database = config.absolute_database(root);
     let progress = read_progress(root)?;
     let rpc_url = config.rpc_url_value()?;
-    let head =
-        rpc::hex_u64(&rpc::rpc(&Client::new(), &rpc_url, "eth_blockNumber", json!([])).await?)?;
+    let client = rpc::client()?;
+    let head = rpc::hex_u64(&rpc::rpc(&client, &rpc_url, "eth_blockNumber", json!([])).await?)?;
     Ok(payload(
         &config,
         &database,
@@ -75,7 +74,10 @@ fn payload(
     live_head: Option<u64>,
 ) -> Value {
     let observed_head = live_head.or_else(|| progress.map(|item| item.observed_head));
-    let safe_head = observed_head.map(|head| head.saturating_sub(config.confirmations));
+    let safe_head = observed_head.map(|head| {
+        let safe = head.saturating_sub(config.confirmations);
+        config.end_block.map_or(safe, |end| safe.min(end))
+    });
     let indexed_through = progress.map(|item| item.indexed_through);
     let caught_up = indexed_through
         .zip(safe_head)
@@ -134,8 +136,11 @@ mod tests {
             rpc_url_env: None,
             database: PathBuf::from("events.db"),
             start_block: 100,
+            end_block: None,
             confirmations: 10,
             window: 100,
+            index_blocks: false,
+            index_transactions: false,
             contracts: vec![ContractConfig {
                 alias: "token".into(),
                 address: "0x1111111111111111111111111111111111111111".into(),
@@ -166,5 +171,29 @@ mod tests {
         assert_eq!(value["backfill"]["safe_head"], 995);
         assert_eq!(value["backfill"]["remaining_blocks"], 5);
         assert_eq!(value["backfill"]["caught_up"], false);
+    }
+
+    #[test]
+    fn caps_completion_against_end_block() {
+        let mut config = config();
+        config.end_block = Some(250);
+        let progress = BackfillProgress {
+            indexed_through: 250,
+            observed_head: 1_000,
+            safe_head: 250,
+            confirmations: 10,
+            caught_up: true,
+            updated_at_unix: 1,
+        };
+        let value = payload(
+            &config,
+            Path::new("events.db"),
+            true,
+            Some(&progress),
+            Some(1_005),
+        );
+        assert_eq!(value["backfill"]["safe_head"], 250);
+        assert_eq!(value["backfill"]["remaining_blocks"], 0);
+        assert_eq!(value["backfill"]["caught_up"], true);
     }
 }

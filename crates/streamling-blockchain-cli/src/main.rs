@@ -1,8 +1,10 @@
 mod config;
 mod database;
+mod doctor;
 mod goldsky;
 mod mcp;
 mod project;
+mod replay;
 mod rpc;
 mod status;
 mod web;
@@ -13,7 +15,7 @@ use config::{
     ClickHouseSinkConfig, ContractConfig, DiscoveryRule, ProjectConfig, SinkConfig,
     validate_address, validate_alias,
 };
-use reqwest::Client;
+
 use serde_json::Value;
 use std::{
     path::{Path, PathBuf},
@@ -54,10 +56,46 @@ enum Commands {
         abi: Option<PathBuf>,
         #[arg(long)]
         start_block: Option<u64>,
+        #[arg(long)]
+        end_block: Option<u64>,
         #[arg(long, default_value_t = 12)]
         confirmations: u64,
         #[arg(long, default_value_t = 2_000)]
         window: u64,
+        #[arg(long)]
+        index_blocks: bool,
+        #[arg(long)]
+        index_transactions: bool,
+        #[arg(long, value_enum, default_value_t = SinkMode::Sqlite)]
+        sink: SinkMode,
+        #[arg(long, default_value = "events")]
+        clickhouse_table: String,
+        #[arg(long)]
+        clickhouse_database: Option<String>,
+        #[arg(long)]
+        clickhouse_compression: Option<String>,
+    },
+    InitRobinhood {
+        #[arg(long, default_value = "https://api.robinhood.com/rhj/assets")]
+        assets_url: String,
+        #[arg(
+            long,
+            default_value = "https://rpc.mainnet.chain.robinhood.com",
+            conflicts_with = "rpc_env"
+        )]
+        rpc: String,
+        #[arg(long, conflicts_with = "rpc")]
+        rpc_env: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        start_block: u64,
+        #[arg(long, default_value_t = 12)]
+        confirmations: u64,
+        #[arg(long, default_value_t = 2_000)]
+        window: u64,
+        #[arg(long)]
+        index_blocks: bool,
+        #[arg(long)]
+        index_transactions: bool,
         #[arg(long, value_enum, default_value_t = SinkMode::Sqlite)]
         sink: SinkMode,
         #[arg(long, default_value = "events")]
@@ -93,6 +131,10 @@ enum Commands {
         plugin: Option<PathBuf>,
         #[arg(long)]
         no_build: bool,
+        #[arg(long)]
+        exit_when_caught_up: bool,
+        #[arg(long, default_value_t = 5)]
+        exit_poll_seconds: u64,
     },
     Sql {
         query: String,
@@ -100,6 +142,8 @@ enum Commands {
         json: bool,
         #[arg(long, default_value_t = 500)]
         max_rows: usize,
+        #[arg(long = "attach", value_name = "ALIAS=DB")]
+        attach: Vec<String>,
     },
     Schema,
     Status {
@@ -121,6 +165,34 @@ enum Commands {
         #[arg(long)]
         plugin: Option<PathBuf>,
     },
+    Replay {
+        #[arg(long)]
+        from: u64,
+        #[arg(long)]
+        to: u64,
+    },
+    Audit {
+        #[arg(long, default_value_t = 1_000)]
+        window_blocks: u64,
+        #[arg(long, default_value_t = 300)]
+        interval_seconds: u64,
+        #[arg(long)]
+        once: bool,
+    },
+    Semantics {
+        #[command(subcommand)]
+        command: SemanticsCommand,
+    },
+    Abi {
+        #[command(subcommand)]
+        command: AbiCommand,
+    },
+    RpcDoctor {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -130,6 +202,42 @@ enum SinkMode {
     Both,
 }
 
+#[derive(Subcommand)]
+enum SemanticsCommand {
+    Generate,
+    Check,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AbiSource {
+    Sourcify,
+    Etherscan,
+    #[value(name = "etherscan-v1")]
+    EtherscanV1,
+    Blockscout,
+}
+
+#[derive(Subcommand)]
+enum AbiCommand {
+    Fetch {
+        address: String,
+        #[arg(long)]
+        chain_id: u64,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, value_enum, default_value_t = AbiSource::Sourcify)]
+        source: AbiSource,
+        #[arg(long)]
+        etherscan_base_url: Option<String>,
+        #[arg(long)]
+        etherscan_api_key_env: Option<String>,
+        #[arg(long)]
+        etherscan_v2_base_url: Option<String>,
+        #[arg(long)]
+        blockscout_base_url: Option<String>,
+    },
+}
+
 struct InitRequest {
     address: String,
     alias: String,
@@ -137,12 +245,20 @@ struct InitRequest {
     rpc_url_env: Option<String>,
     abi: Option<PathBuf>,
     start_block: Option<u64>,
+    end_block: Option<u64>,
     confirmations: u64,
     window: u64,
+    index_blocks: bool,
+    index_transactions: bool,
     sink: SinkMode,
     clickhouse_table: String,
     clickhouse_database: Option<String>,
     clickhouse_compression: Option<String>,
+}
+
+struct AttachedDatabase {
+    alias: String,
+    path: PathBuf,
 }
 
 #[tokio::main]
@@ -160,8 +276,11 @@ async fn main() -> Result<()> {
             goldsky_cli,
             abi,
             start_block,
+            end_block,
             confirmations,
             window,
+            index_blocks,
+            index_transactions,
             sink,
             clickhouse_table,
             clickhouse_compression,
@@ -194,13 +313,47 @@ async fn main() -> Result<()> {
                     rpc_url_env,
                     abi,
                     start_block,
+                    end_block,
                     confirmations,
                     window,
+                    index_blocks,
+                    index_transactions,
                     sink,
                     clickhouse_table,
                     clickhouse_compression,
                     clickhouse_database,
                 },
+            )
+            .await
+        }
+        Commands::InitRobinhood {
+            assets_url,
+            rpc,
+            rpc_env,
+            start_block,
+            confirmations,
+            window,
+            index_blocks,
+            index_transactions,
+            sink,
+            clickhouse_table,
+            clickhouse_database,
+            clickhouse_compression,
+        } => {
+            init_robinhood(
+                &root,
+                assets_url,
+                rpc,
+                rpc_env,
+                start_block,
+                confirmations,
+                window,
+                index_blocks,
+                index_transactions,
+                sink,
+                clickhouse_table,
+                clickhouse_database,
+                clickhouse_compression,
             )
             .await
         }
@@ -258,14 +411,29 @@ async fn main() -> Result<()> {
             streamling,
             plugin,
             no_build,
-        } => run_streamling(&root, &streamling, plugin, no_build, false).await,
+            exit_when_caught_up,
+            exit_poll_seconds,
+        } => {
+            run_streamling(
+                &root,
+                &streamling,
+                plugin,
+                no_build,
+                false,
+                exit_when_caught_up,
+                std::time::Duration::from_secs(exit_poll_seconds.max(1)),
+            )
+            .await
+        }
         Commands::Sql {
             query,
             json: as_json,
             max_rows,
+            attach,
         } => {
             let config = ProjectConfig::load(&root)?;
             let conn = database::open(&config.absolute_database(&root))?;
+            attach_databases(&conn, attach)?;
             let value = database::query(&conn, &query, max_rows.min(10_000))?;
             if as_json {
                 println!("{}", serde_json::to_string(&value)?);
@@ -328,8 +496,123 @@ async fn main() -> Result<()> {
         }
         Commands::Mcp => mcp::run_stdio(root),
         Commands::Serve { bind } => web::serve(root, bind).await,
+        Commands::Replay { from, to } => {
+            let value = replay::diff(&root, from, to).await?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            Ok(())
+        }
+        Commands::Audit {
+            window_blocks,
+            interval_seconds,
+            once,
+        } => {
+            if once {
+                let value = replay::audit_once(&root, window_blocks).await?;
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                Ok(())
+            } else {
+                replay::audit_continuous(
+                    &root,
+                    std::time::Duration::from_secs(interval_seconds.max(1)),
+                    window_blocks,
+                )
+                .await
+            }
+        }
+        Commands::Semantics { command } => {
+            let config = ProjectConfig::load(&root)?;
+            project::write_semantics(&root, &config)?;
+            match command {
+                SemanticsCommand::Generate => {
+                    println!("✓ semantic.toml generated");
+                    Ok(())
+                }
+                SemanticsCommand::Check => {
+                    println!("✓ semantic.toml is valid for configured ABIs");
+                    Ok(())
+                }
+            }
+        }
+        Commands::Abi { command } => match command {
+            AbiCommand::Fetch {
+                address,
+                chain_id,
+                out,
+                source,
+                etherscan_base_url,
+                etherscan_api_key_env,
+                etherscan_v2_base_url,
+                blockscout_base_url,
+            } => {
+                validate_address(&address)?;
+                let client = rpc::client()?;
+                let api_key = etherscan_api_key_env
+                    .as_deref()
+                    .map(std::env::var)
+                    .transpose()
+                    .context("read Etherscan API key env")?;
+                let abi = match source {
+                    AbiSource::Sourcify => {
+                        rpc::fetch_sourcify_abi(&client, chain_id, &address).await?
+                    }
+                    AbiSource::Etherscan => {
+                        rpc::fetch_etherscan_v2_abi(
+                            &client,
+                            chain_id,
+                            &address,
+                            api_key.as_deref(),
+                            etherscan_v2_base_url.as_deref(),
+                        )
+                        .await?
+                    }
+                    AbiSource::EtherscanV1 => {
+                        rpc::fetch_etherscan_compatible_abi(
+                            &client,
+                            chain_id,
+                            &address,
+                            etherscan_base_url.as_deref(),
+                            api_key.as_deref(),
+                        )
+                        .await?
+                    }
+                    AbiSource::Blockscout => {
+                        let base = blockscout_base_url.as_deref().context(
+                            "--blockscout-base-url is required with --source blockscout",
+                        )?;
+                        rpc::fetch_blockscout_abi(&client, &address, base).await?
+                    }
+                };
+                if let Some(parent) = out.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&out, serde_json::to_vec_pretty(&abi)?)?;
+                println!("✓ ABI written: {}", out.display());
+                Ok(())
+            }
+        },
+        Commands::RpcDoctor {
+            json: as_json,
+            apply,
+        } => {
+            let report = doctor::rpc_doctor(&root, apply).await?;
+            if as_json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            Ok(())
+        }
         Commands::Doctor { streamling, plugin } => {
-            run_streamling(&root, &streamling, plugin, false, true).await
+            run_streamling(
+                &root,
+                &streamling,
+                plugin,
+                false,
+                true,
+                false,
+                std::time::Duration::from_secs(5),
+            )
+            .await
         }
     }
 }
@@ -342,8 +625,11 @@ async fn init(root: &Path, request: InitRequest) -> Result<()> {
         rpc_url_env,
         abi: abi_path,
         start_block,
+        end_block,
         confirmations,
         window,
+        index_blocks,
+        index_transactions,
         sink,
         clickhouse_table,
         clickhouse_database,
@@ -359,9 +645,7 @@ async fn init(root: &Path, request: InitRequest) -> Result<()> {
     }
     std::fs::create_dir_all(root.join("abis"))?;
     std::fs::create_dir_all(root.join(".streamling-blockchain"))?;
-    let client = Client::builder()
-        .user_agent("streamling-blockchain/0.1")
-        .build()?;
+    let client = rpc::client()?;
     let (chain, chain_id, rpc_url) = rpc::detect_chain(
         &client,
         &address,
@@ -419,8 +703,11 @@ async fn init(root: &Path, request: InitRequest) -> Result<()> {
         rpc_url_env,
         database: PathBuf::from(".streamling-blockchain/events.db"),
         start_block: from,
+        end_block,
         confirmations,
         window,
+        index_blocks,
+        index_transactions,
         contracts: vec![ContractConfig {
             alias: alias.clone(),
             address,
@@ -440,12 +727,163 @@ async fn init(root: &Path, request: InitRequest) -> Result<()> {
     Ok(())
 }
 
+fn parse_attach(value: &str) -> Result<AttachedDatabase> {
+    let (alias, path) = value
+        .split_once('=')
+        .context("--attach must use ALIAS=DB")?;
+    validate_alias(alias)?;
+    Ok(AttachedDatabase {
+        alias: alias.to_owned(),
+        path: PathBuf::from(path),
+    })
+}
+
+fn attach_databases(conn: &rusqlite::Connection, values: Vec<String>) -> Result<()> {
+    for value in values {
+        let database = parse_attach(&value)?;
+        conn.execute(
+            &format!(
+                "ATTACH DATABASE ?1 AS {}",
+                quote_identifier(&database.alias)
+            ),
+            [database.path.to_string_lossy().as_ref()],
+        )
+        .with_context(|| format!("attach {}", database.path.display()))?;
+    }
+    Ok(())
+}
+
+fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+async fn init_robinhood(
+    root: &Path,
+    assets_url: String,
+    rpc_url: String,
+    rpc_url_env: Option<String>,
+    start_block: u64,
+    confirmations: u64,
+    window: u64,
+    index_blocks: bool,
+    index_transactions: bool,
+    sink: SinkMode,
+    clickhouse_table: String,
+    clickhouse_database: Option<String>,
+    clickhouse_compression: Option<String>,
+) -> Result<()> {
+    if root.join("streamling-blockchain.toml").exists() {
+        bail!("project already exists at {}", root.display())
+    }
+    let client = rpc::client()?;
+    let actual_rpc = if let Some(name) = &rpc_url_env {
+        std::env::var(name).with_context(|| format!("read ${name}"))?
+    } else {
+        rpc_url.clone()
+    };
+    let chain_id =
+        rpc::hex_u64(&rpc::rpc(&client, &actual_rpc, "eth_chainId", serde_json::json!([])).await?)?;
+    if chain_id != 4663 {
+        bail!("Robinhood Stock Tokens expected chain 4663, got {chain_id}")
+    }
+    let payload: Value = client
+        .get(&assets_url)
+        .send()
+        .await
+        .with_context(|| format!("fetch {assets_url}"))?
+        .json()
+        .await
+        .with_context(|| format!("decode {assets_url}"))?;
+    let mut contracts = Vec::new();
+    if let Some(assets) = payload.get("assets").and_then(Value::as_array) {
+        for asset in assets {
+            if asset.get("status").and_then(Value::as_str) != Some("ASSET_STATUS_ACTIVE") {
+                continue;
+            }
+            let Some(symbol) = asset.get("tokenSymbol").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(deployments) = asset.get("deployments").and_then(Value::as_array) else {
+                continue;
+            };
+            for deployment in deployments {
+                if deployment.get("chainId").and_then(Value::as_u64) != Some(4663) {
+                    continue;
+                }
+                let Some(address) = deployment.get("contractAddress").and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                validate_address(address)?;
+                let alias = symbol.to_ascii_lowercase().replace(['.', '-'], "_");
+                validate_alias(&alias)?;
+                contracts.push(ContractConfig {
+                    alias,
+                    address: address.to_owned(),
+                    abi: PathBuf::from("abis/erc20.json"),
+                });
+            }
+        }
+    }
+    if contracts.is_empty() {
+        bail!("Robinhood assets response did not include active chain 4663 deployments")
+    }
+    std::fs::create_dir_all(root.join("abis"))?;
+    std::fs::create_dir_all(root.join(".streamling-blockchain"))?;
+    std::fs::write(root.join("abis/erc20.json"), ERC20_TRANSFER_ABI)?;
+    let sinks = SinkConfig {
+        sqlite: matches!(sink, SinkMode::Sqlite | SinkMode::Both),
+        clickhouse: matches!(sink, SinkMode::Clickhouse | SinkMode::Both).then_some(
+            ClickHouseSinkConfig {
+                table: clickhouse_table,
+                database: clickhouse_database,
+                compression: clickhouse_compression,
+            },
+        ),
+    };
+    let config = ProjectConfig {
+        chain: "robinhood-chain".into(),
+        chain_id,
+        rpc_url: if rpc_url_env.is_some() {
+            String::new()
+        } else {
+            rpc_url
+        },
+        rpc_url_env,
+        database: PathBuf::from(".streamling-blockchain/events.db"),
+        start_block,
+        end_block: None,
+        confirmations,
+        window,
+        index_blocks,
+        index_transactions,
+        contracts,
+        discovery_rules: vec![],
+        sinks,
+    };
+    config.save(root)?;
+    project::write_generated_files(root, &config)?;
+    println!(
+        "✓ {} Robinhood Stock Token contracts · unbounded project scaffolded",
+        config.contracts.len()
+    );
+    println!("✓ start block: {start_block}; end block: none");
+    println!(
+        "next: cargo build --release && streamling-blockchain --project {} dev",
+        root.display()
+    );
+    Ok(())
+}
+
+const ERC20_TRANSFER_ABI: &str = r#"[{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"from","type":"address"},{"indexed":true,"internalType":"address","name":"to","type":"address"},{"indexed":false,"internalType":"uint256","name":"value","type":"uint256"}],"name":"Transfer","type":"event"}]"#;
+
 async fn run_streamling(
     root: &Path,
     streamling: &Path,
     plugin: Option<PathBuf>,
     no_build: bool,
     validate: bool,
+    exit_when_caught_up: bool,
+    exit_poll: std::time::Duration,
 ) -> Result<()> {
     let plugin = match plugin {
         Some(path) => absolute_from(root, &path),
@@ -481,14 +919,43 @@ async fn run_streamling(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    let status = command
-        .status()
-        .await
+    let mut child = command
+        .spawn()
         .with_context(|| format!("run {}", streamling.display()))?;
-    if !status.success() {
-        bail!("Streamling exited with {status}")
+    if !exit_when_caught_up {
+        let status = child
+            .wait()
+            .await
+            .with_context(|| format!("wait for {}", streamling.display()))?;
+        if !status.success() {
+            bail!("Streamling exited with {status}")
+        }
+        return Ok(());
     }
-    Ok(())
+    if config.end_block.is_none() {
+        bail!("--exit-when-caught-up requires a bounded project with end_block")
+    }
+    loop {
+        tokio::select! {
+            status = child.wait() => {
+                let status = status.with_context(|| format!("wait for {}", streamling.display()))?;
+                if !status.success() {
+                    bail!("Streamling exited with {status}")
+                }
+                return Ok(());
+            }
+            _ = tokio::time::sleep(exit_poll) => {
+                if status::live(root).await?["backfill"]["caught_up"].as_bool() == Some(true) {
+                    tokio::time::sleep(exit_poll).await;
+                    if status::live(root).await?["backfill"]["caught_up"].as_bool() == Some(true) {
+                        child.kill().await.with_context(|| format!("stop {}", streamling.display()))?;
+                        let _ = child.wait().await;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn default_plugin_path() -> Result<PathBuf> {

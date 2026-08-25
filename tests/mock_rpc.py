@@ -21,6 +21,25 @@ LOGS = [
     {"address": DISCOVERED, "topics": [TRANSFER, word_address("0x" + "0" * 40), word_address(RECIPIENT)], "data": word_int(2), "blockNumber": "0x64", "blockHash": BLOCK_HASH, "transactionHash": TX2, "logIndex": "0x1"},
 ]
 
+BLOCK = {
+    "number": "0x64",
+    "hash": BLOCK_HASH,
+    "parentHash": "0x" + "cd" * 32,
+    "timestamp": "0x66",
+    "miner": "0x4444444444444444444444444444444444444444",
+    "gasLimit": "0x1c9c380",
+    "gasUsed": "0x5208",
+    "baseFeePerGas": "0x3b9aca00",
+    "transactions": [
+        {"hash": TX1, "blockNumber": "0x64", "blockHash": BLOCK_HASH, "transactionIndex": "0x0", "from": "0x5555555555555555555555555555555555555555", "to": PARENT, "value": "0x0", "gas": "0x5208", "gasPrice": "0x3b9aca00", "input": "0x", "nonce": "0x1"},
+        {"hash": TX2, "blockNumber": "0x64", "blockHash": BLOCK_HASH, "transactionIndex": "0x1", "from": "0x6666666666666666666666666666666666666666", "to": DISCOVERED, "value": "0x0", "gas": "0x5208", "gasPrice": "0x3b9aca00", "input": "0x", "nonce": "0x2"},
+    ],
+}
+RECEIPTS = {
+    TX1: {"transactionHash": TX1, "status": "0x1", "gasUsed": "0x5208", "effectiveGasPrice": "0x3b9aca00", "contractAddress": None, "logs": [LOGS[0]]},
+    TX2: {"transactionHash": TX2, "status": "0x1", "gasUsed": "0x5208", "effectiveGasPrice": "0x3b9aca00", "contractAddress": None, "logs": [LOGS[1]]},
+}
+
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("content-length", "0"))
@@ -29,7 +48,13 @@ class Handler(BaseHTTPRequestHandler):
         if method == "eth_chainId": result = "0x1"
         elif method == "eth_getCode": result = "0x6000"
         elif method == "eth_blockNumber": result = "0x65"
-        elif method == "eth_getBlockByNumber": result = {"timestamp": "0x66"}
+        elif method == "eth_getBlockByNumber":
+            full = bool(request["params"][1])
+            result = dict(BLOCK)
+            if not full:
+                result["transactions"] = [TX1, TX2]
+        elif method == "eth_getBlockReceipts": result = list(RECEIPTS.values())
+        elif method == "eth_getTransactionReceipt": result = RECEIPTS.get(request["params"][0])
         elif method == "eth_getLogs":
             query = request["params"][0]
             start = int(query["fromBlock"], 16)

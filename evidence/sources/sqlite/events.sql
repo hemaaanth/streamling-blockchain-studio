@@ -1,5 +1,6 @@
 SELECT
   event_id,
+  chain_id,
   contract_alias,
   event_name,
   address,
@@ -9,10 +10,9 @@ SELECT
   tx_hash,
   log_index,
   topic0,
-  fields_json,
-  discovered_address,
-  discovery_rule,
-  insert_time,
-  is_deleted
-FROM fwa_analytics.events FINAL
-WHERE is_deleted = 0
+  data AS fields_json,
+  '' AS discovered_address,
+  '' AS discovery_rule,
+  '' AS insert_time,
+  0 AS is_deleted
+FROM events
