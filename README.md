@@ -47,7 +47,31 @@ streamling-blockchain --project ./my-project init \
   --start-block 12345678
 ```
 
+For an analytics warehouse or Evidence dashboard, generate a ClickHouse sink in the same Streamling pipeline:
+
+```sh
+streamling-blockchain --project ./my-project init \
+  0x1111111111111111111111111111111111111111 \
+  --alias protocol \
+  --rpc https://example-rpc.invalid \
+  --abi ./protocol.json \
+  --start-block 12345678 \
+  --sink both \
+  --clickhouse-table events
+```
+
+`--sink sqlite` is the default local mode. `--sink clickhouse` writes only through Streamling's built-in ClickHouse sink; `--sink both` keeps the local SQLite database and adds a ClickHouse sidecar sink. Configure the ClickHouse connection with Streamling's environment variables, including `STREAMLING__CLICKHOUSE_SINK__URL`, `STREAMLING__CLICKHOUSE_SINK__USER`, `STREAMLING__CLICKHOUSE_SINK__PASSWORD`, and `STREAMLING__CLICKHOUSE_SINK__DATABASE`. The CLI also writes `clickhouse/<table>.sql` as a readable schema for manual setup or review.
+
 Goldsky setup checks the installed CLI contract, reuses a named Edge endpoint when present, creates it otherwise, reveals its API key through the authenticated CLI, and validates chain bytecode before creating the project.
+
+Add more fixed contracts to the same pipeline:
+
+```sh
+streamling-blockchain --project ./my-project add-contract \
+  0x2222222222222222222222222222222222222222 \
+  --alias helper \
+  --abi ./helper.json
+```
 
 Add contracts discovered from an indexed parent event:
 
@@ -83,9 +107,10 @@ Each initialized project contains:
 - `semantic.toml`: generated descriptions for agent-safe query construction
 - `backfill-progress.json`: observed, safe, and indexed block heights
 - `abis/`: copied contract ABIs
-- `.streamling-blockchain/events.db`: decoded events
+- `.streamling-blockchain/events.db`: decoded events when the SQLite sink is enabled
+- `clickhouse/<table>.sql`: generated ClickHouse schema when the ClickHouse sink is enabled
 - `state.db`: Streamling's committed source cursor and discovered-contract registry
-- `web/index.html`, `llms.txt`, and `skills/`: generated query surfaces
+- `web/index.html`, `llms.txt`, and `skills/`: generated query surfaces for the local SQLite database
 
 Keep the entire project directory on persistent storage. Restarting `dev` with the same directory resumes from Streamling's last committed checkpoint. Copying only the SQLite event database is insufficient: it omits the source cursor and can cause a replay from the configured start block.
 

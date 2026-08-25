@@ -8,8 +8,11 @@ mod status;
 mod web;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
-use config::{ContractConfig, DiscoveryRule, ProjectConfig, validate_address, validate_alias};
+use clap::{Parser, Subcommand, ValueEnum};
+use config::{
+    ClickHouseSinkConfig, ContractConfig, DiscoveryRule, ProjectConfig, SinkConfig,
+    validate_address, validate_alias,
+};
 use reqwest::Client;
 use serde_json::Value;
 use std::{
@@ -39,7 +42,9 @@ enum Commands {
         alias: String,
         #[arg(long, conflicts_with = "goldsky_chain_id")]
         rpc: Option<String>,
-        #[arg(long, conflicts_with = "rpc")]
+        #[arg(long, conflicts_with_all = ["rpc", "goldsky_chain_id"])]
+        rpc_env: Option<String>,
+        #[arg(long, conflicts_with = "rpc_env")]
         goldsky_chain_id: Option<u64>,
         #[arg(long)]
         goldsky_endpoint: Option<String>,
@@ -53,6 +58,21 @@ enum Commands {
         confirmations: u64,
         #[arg(long, default_value_t = 2_000)]
         window: u64,
+        #[arg(long, value_enum, default_value_t = SinkMode::Sqlite)]
+        sink: SinkMode,
+        #[arg(long, default_value = "events")]
+        clickhouse_table: String,
+        #[arg(long)]
+        clickhouse_database: Option<String>,
+        #[arg(long)]
+        clickhouse_compression: Option<String>,
+    },
+    AddContract {
+        address: String,
+        #[arg(long)]
+        alias: String,
+        #[arg(long)]
+        abi: PathBuf,
     },
     AddDiscovery {
         #[arg(long)]
@@ -103,14 +123,26 @@ enum Commands {
     },
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SinkMode {
+    Sqlite,
+    Clickhouse,
+    Both,
+}
+
 struct InitRequest {
     address: String,
     alias: String,
-    rpc_url: Option<String>,
+    rpc_url: String,
+    rpc_url_env: Option<String>,
     abi: Option<PathBuf>,
     start_block: Option<u64>,
     confirmations: u64,
     window: u64,
+    sink: SinkMode,
+    clickhouse_table: String,
+    clickhouse_database: Option<String>,
+    clickhouse_compression: Option<String>,
 }
 
 #[tokio::main]
@@ -121,7 +153,8 @@ async fn main() -> Result<()> {
         Commands::Init {
             address,
             alias,
-            rpc: rpc_url,
+            rpc: explicit_rpc,
+            rpc_env,
             goldsky_chain_id,
             goldsky_endpoint,
             goldsky_cli,
@@ -129,19 +162,28 @@ async fn main() -> Result<()> {
             start_block,
             confirmations,
             window,
+            sink,
+            clickhouse_table,
+            clickhouse_compression,
+            clickhouse_database,
         } => {
-            let rpc_url = if let Some(chain_id) = goldsky_chain_id {
+            let (rpc_url, rpc_url_env) = if let Some(chain_id) = goldsky_chain_id {
                 let endpoint = goldsky_endpoint
                     .as_deref()
                     .unwrap_or("streamling-blockchain");
                 let url = goldsky::ensure_rpc(&goldsky_cli, endpoint, chain_id).await?;
                 println!("✓ Goldsky Edge endpoint ready: {endpoint} · chain {chain_id}");
-                Some(url)
+                (url, None)
             } else {
                 if goldsky_endpoint.is_some() {
                     bail!("--goldsky-endpoint requires --goldsky-chain-id")
                 }
-                rpc_url
+                let url = if let Some(name) = &rpc_env {
+                    std::env::var(name).with_context(|| format!("read ${name}"))?
+                } else {
+                    explicit_rpc.unwrap_or_default()
+                };
+                (url, rpc_env)
             };
             init(
                 &root,
@@ -149,13 +191,41 @@ async fn main() -> Result<()> {
                     address,
                     alias,
                     rpc_url,
+                    rpc_url_env,
                     abi,
                     start_block,
                     confirmations,
                     window,
+                    sink,
+                    clickhouse_table,
+                    clickhouse_compression,
+                    clickhouse_database,
                 },
             )
             .await
+        }
+        Commands::AddContract {
+            address,
+            alias,
+            abi,
+        } => {
+            validate_address(&address)?;
+            validate_alias(&alias)?;
+            let config = ProjectConfig::load(&root)?;
+            let target = root.join("abis").join(format!("{alias}.json"));
+            std::fs::create_dir_all(target.parent().unwrap())?;
+            std::fs::copy(&abi, &target).with_context(|| format!("copy {}", abi.display()))?;
+            project::add_contract(
+                &root,
+                config,
+                ContractConfig {
+                    alias: alias.clone(),
+                    address,
+                    abi: PathBuf::from(format!("abis/{alias}.json")),
+                },
+            )?;
+            println!("✓ contract added · alias {alias}");
+            Ok(())
         }
         Commands::AddDiscovery {
             parent_contract,
@@ -269,13 +339,21 @@ async fn init(root: &Path, request: InitRequest) -> Result<()> {
         address,
         alias,
         rpc_url: explicit_rpc,
+        rpc_url_env,
         abi: abi_path,
         start_block,
         confirmations,
         window,
+        sink,
+        clickhouse_table,
+        clickhouse_database,
+        clickhouse_compression,
     } = request;
     validate_address(&address)?;
     validate_alias(&alias)?;
+    if matches!(sink, SinkMode::Clickhouse | SinkMode::Both) {
+        validate_alias(&clickhouse_table).context("ClickHouse table")?;
+    }
     if root.join("streamling-blockchain.toml").exists() {
         bail!("project already exists at {}", root.display())
     }
@@ -284,8 +362,12 @@ async fn init(root: &Path, request: InitRequest) -> Result<()> {
     let client = Client::builder()
         .user_agent("streamling-blockchain/0.1")
         .build()?;
-    let (chain, chain_id, rpc_url) =
-        rpc::detect_chain(&client, &address, explicit_rpc.as_deref()).await?;
+    let (chain, chain_id, rpc_url) = rpc::detect_chain(
+        &client,
+        &address,
+        (!explicit_rpc.is_empty()).then_some(explicit_rpc.as_str()),
+    )
+    .await?;
     println!("✓ chain detected: {chain}");
     let abi: Value = if let Some(path) = abi_path {
         serde_json::from_slice(
@@ -316,10 +398,25 @@ async fn init(root: &Path, request: InitRequest) -> Result<()> {
     if event_count == 0 {
         bail!("ABI declares no events")
     }
+    let sinks = SinkConfig {
+        sqlite: matches!(sink, SinkMode::Sqlite | SinkMode::Both),
+        clickhouse: matches!(sink, SinkMode::Clickhouse | SinkMode::Both).then_some(
+            ClickHouseSinkConfig {
+                table: clickhouse_table,
+                database: clickhouse_database,
+                compression: clickhouse_compression,
+            },
+        ),
+    };
     let config = ProjectConfig {
         chain,
         chain_id,
-        rpc_url,
+        rpc_url: if rpc_url_env.is_some() {
+            String::new()
+        } else {
+            rpc_url
+        },
+        rpc_url_env,
         database: PathBuf::from(".streamling-blockchain/events.db"),
         start_block: from,
         confirmations,
@@ -330,6 +427,7 @@ async fn init(root: &Path, request: InitRequest) -> Result<()> {
             abi: PathBuf::from(format!("abis/{alias}.json")),
         }],
         discovery_rules: vec![],
+        sinks,
     };
     config.save(root)?;
     project::write_generated_files(root, &config)?;
@@ -365,11 +463,17 @@ async fn run_streamling(
     if !plugin.exists() {
         bail!("plugin library not found: {}", plugin.display())
     }
+    let config = ProjectConfig::load(root)?;
     let mut command = Command::new(streamling);
     command
         .current_dir(root)
         .env("STREAMLING__PLUGIN__PATH", &plugin)
         .arg(root.join("pipeline.yaml"));
+    if let Some(clickhouse) = &config.sinks.clickhouse
+        && let Some(database) = &clickhouse.database
+    {
+        command.env("STREAMLING__CLICKHOUSE_SINK__DATABASE", database);
+    }
     if validate {
         command.arg("--validate");
     }

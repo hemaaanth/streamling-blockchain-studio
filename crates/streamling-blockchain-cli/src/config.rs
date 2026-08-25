@@ -1,12 +1,18 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub chain: String,
     pub chain_id: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub rpc_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_url_env: Option<String>,
     pub database: PathBuf,
     pub start_block: u64,
     #[serde(default = "default_confirmations")]
@@ -16,6 +22,8 @@ pub struct ProjectConfig {
     pub contracts: Vec<ContractConfig>,
     #[serde(default)]
     pub discovery_rules: Vec<DiscoveryRule>,
+    #[serde(default)]
+    pub sinks: SinkConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,11 +42,40 @@ pub struct DiscoveryRule {
     pub child_abi: PathBuf,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SinkConfig {
+    #[serde(default = "default_sqlite_sink")]
+    pub sqlite: bool,
+    #[serde(default)]
+    pub clickhouse: Option<ClickHouseSinkConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClickHouseSinkConfig {
+    pub table: String,
+    #[serde(default)]
+    pub compression: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+}
+
 fn default_confirmations() -> u64 {
     12
 }
 fn default_window() -> u64 {
     2_000
+}
+fn default_sqlite_sink() -> bool {
+    true
+}
+
+impl Default for SinkConfig {
+    fn default() -> Self {
+        Self {
+            sqlite: true,
+            clickhouse: None,
+        }
+    }
 }
 
 impl ProjectConfig {
@@ -65,16 +102,49 @@ impl ProjectConfig {
         Ok(())
     }
 
+    pub fn rpc_url_value(&self) -> Result<String> {
+        if let Some(name) = &self.rpc_url_env {
+            return std::env::var(name).with_context(|| format!("read ${name}"));
+        }
+        Ok(self.rpc_url.clone())
+    }
+
     pub fn validate(&self) -> Result<()> {
+        if self.rpc_url.is_empty() == self.rpc_url_env.is_none() {
+            bail!("exactly one of rpc_url or rpc_url_env is required")
+        }
         if self.contracts.is_empty() {
             bail!("at least one contract is required")
         }
         if self.window == 0 {
             bail!("window must be greater than zero")
         }
+        if !self.sinks.sqlite && self.sinks.clickhouse.is_none() {
+            bail!("at least one sink is required")
+        }
+        if let Some(clickhouse) = &self.sinks.clickhouse {
+            validate_alias(&clickhouse.table).context("ClickHouse table")?;
+            if let Some(database) = &clickhouse.database {
+                validate_alias(database).context("ClickHouse database")?;
+            }
+            if let Some(compression) = &clickhouse.compression {
+                match compression.as_str() {
+                    "none" | "gzip" | "zstd" | "lz4" => {}
+                    _ => bail!("ClickHouse compression must be one of none, gzip, zstd, lz4"),
+                }
+            }
+        }
+        let mut aliases = HashSet::new();
+        let mut addresses = HashSet::new();
         for contract in &self.contracts {
             validate_alias(&contract.alias)?;
             validate_address(&contract.address)?;
+            if !aliases.insert(contract.alias.clone()) {
+                bail!("duplicate contract alias '{}'", contract.alias);
+            }
+            if !addresses.insert(contract.address.to_ascii_lowercase()) {
+                bail!("duplicate contract address '{}'", contract.address);
+            }
         }
         for rule in &self.discovery_rules {
             if !self
