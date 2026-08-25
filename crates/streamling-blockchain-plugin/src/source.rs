@@ -60,7 +60,7 @@ pub struct EvmEventSource {
     client: reqwest::Client,
     rpc_url: String,
     confirmations: u64,
-    window: u64,
+    window: AtomicU64,
     next_block: AtomicU64,
     progress_path: Option<PathBuf>,
     state: Arc<PluginStateBackend<SourceState>>,
@@ -86,7 +86,17 @@ impl EvmEventSource {
                 PluginInitializationError::Configuration(format!("missing option {name}").into())
             })
         };
-        let rpc_url = required("rpc_url")?;
+        let rpc_url = if let Some(url) = options.get("rpc_url") {
+            url.clone()
+        } else if let Some(name) = options.get("rpc_url_env") {
+            std::env::var(name).map_err(|_| {
+                PluginInitializationError::Configuration(format!("read ${name}").into())
+            })?
+        } else {
+            return Err(PluginInitializationError::Configuration(
+                "missing option rpc_url or rpc_url_env".into(),
+            ));
+        };
         let start_block = parse_option(&options, "start_block", 0)?;
         let confirmations = parse_option(&options, "confirmations", 12)?;
         let window = parse_option(&options, "window", 2_000)?;
@@ -135,7 +145,7 @@ impl EvmEventSource {
             client: reqwest::Client::new(),
             rpc_url,
             confirmations,
-            window,
+            window: AtomicU64::new(window),
             next_block: AtomicU64::new(start_block),
             progress_path: options.get("progress_path").map(PathBuf::from),
             state: state_factory.create(),
@@ -273,23 +283,32 @@ impl SourcePlugin for EvmEventSource {
             self.rt.sleep(RDuration::from_millis(1_000)).await;
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
-        let to = safe_head.min(from.saturating_add(self.window - 1));
-        let mut filter = json!({"fromBlock": format!("0x{from:x}"), "toBlock": format!("0x{to:x}"), "topics": [self.topics]});
-        if self.discovery_rules.is_empty() {
-            filter["address"] = Value::Array(
-                self.direct_addresses
-                    .keys()
-                    .cloned()
-                    .map(Value::String)
-                    .collect(),
-            );
-        }
-        let logs = self
-            .rpc("eth_getLogs", json!([filter]))
-            .await?
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let mut current_window = self.window.load(Ordering::Relaxed).max(1);
+        let (to, logs) = loop {
+            let to = safe_head.min(from.saturating_add(current_window - 1));
+            let mut filter = json!({"fromBlock": format!("0x{from:x}"), "toBlock": format!("0x{to:x}"), "topics": [self.topics]});
+            if self.discovery_rules.is_empty() {
+                filter["address"] = Value::Array(
+                    self.direct_addresses
+                        .keys()
+                        .cloned()
+                        .map(Value::String)
+                        .collect(),
+                );
+            }
+            match self.rpc("eth_getLogs", json!([filter])).await {
+                Ok(value) => {
+                    self.window.store(current_window, Ordering::Relaxed);
+                    break (to, value.as_array().cloned().unwrap_or_default());
+                }
+                Err(error) if current_window > 1 && is_get_logs_range_error(&error) => {
+                    current_window = (current_window / 2).max(1);
+                    self.window.store(current_window, Ordering::Relaxed);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let mut timestamps = HashMap::new();
         let mut decoded = Vec::new();
         for log in logs {
@@ -638,6 +657,13 @@ fn internal(error: impl std::fmt::Display) -> PluginError {
 }
 fn progress_error(error: impl std::fmt::Display) -> PluginError {
     PluginError::Execution(format!("persist backfill progress: {error}"))
+}
+fn is_get_logs_range_error(error: &PluginError) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("eth_getlogs")
+        && (text.contains("exceeded max allowed range")
+            || text.contains("block range")
+            || text.contains("range too large"))
 }
 fn parse_hex(text: &str) -> Result<u64, PluginError> {
     u64::from_str_radix(text.trim_start_matches("0x"), 16).map_err(internal)

@@ -1,4 +1,4 @@
-use crate::config::{DiscoveryRule, ProjectConfig};
+use crate::config::{ContractConfig, DiscoveryRule, ProjectConfig};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{collections::HashSet, path::Path};
@@ -86,24 +86,50 @@ fn write_pipeline(root: &Path, config: &ProjectConfig) -> Result<()> {
         );
         "indexed_events".to_owned()
     };
+    let mut sinks = serde_yaml::Mapping::new();
+    if config.sinks.sqlite {
+        sinks.insert(
+            "local_sql".into(),
+            json_to_yaml(json!({
+                "type": "streamling_blockchain.sqlite_sink",
+                "from": output_name,
+                "options": {"db_path": db.to_string_lossy()}
+            }))?,
+        );
+    }
+    if let Some(clickhouse) = &config.sinks.clickhouse {
+        let mut sink = json!({
+            "type": "clickhouse",
+            "from": output_name,
+            "table": clickhouse.table,
+            "primary_key": "event_id"
+        });
+        if let Some(compression) = &clickhouse.compression {
+            sink["compression"] = compression.clone().into();
+        }
+        sinks.insert("clickhouse_events".into(), json_to_yaml(sink)?);
+        write_clickhouse_schema(root, clickhouse.database.as_deref(), &clickhouse.table)?;
+    }
+    let mut source_options = json!({
+        "start_block": config.start_block.to_string(),
+        "confirmations": config.confirmations.to_string(),
+        "window": config.window.to_string(),
+        "progress_path": root.join("backfill-progress.json").to_string_lossy(),
+        "spec": plugin_options
+    });
+    if let Some(name) = &config.rpc_url_env {
+        source_options["rpc_url_env"] = name.clone().into();
+    } else {
+        source_options["rpc_url"] = config.rpc_url.clone().into();
+    }
     let pipeline = json!({
         "sources": {"raw_events": {
             "type": "streamling_blockchain.evm_events",
             "primary_key": "event_id",
-            "options": {
-                "rpc_url": config.rpc_url,
-                "start_block": config.start_block.to_string(),
-                "confirmations": config.confirmations.to_string(),
-                "window": config.window.to_string(),
-                "progress_path": root.join("backfill-progress.json").to_string_lossy(),
-                "spec": plugin_options
-            }
+            "options": source_options
         }},
         "transforms": transforms,
-        "sinks": {"local_sql": {
-            "type": "streamling_blockchain.sqlite_sink", "from": output_name,
-            "options": {"db_path": db.to_string_lossy()}
-        }}
+        "sinks": sinks
     });
     let pipeline_path = root.join("pipeline.yaml");
     std::fs::write(&pipeline_path, serde_yaml::to_string(&pipeline)?)?;
@@ -117,6 +143,22 @@ fn write_pipeline(root: &Path, config: &ProjectConfig) -> Result<()> {
 
 fn json_to_yaml(value: Value) -> Result<serde_yaml::Value> {
     Ok(serde_yaml::to_value(value)?)
+}
+
+fn write_clickhouse_schema(root: &Path, database: Option<&str>, table: &str) -> Result<()> {
+    let schema_dir = root.join("clickhouse");
+    std::fs::create_dir_all(&schema_dir)?;
+    let qualified_table = database.map_or_else(|| table.to_owned(), |db| format!("{db}.{table}"));
+    let create_database = database.map_or_else(String::new, |db| {
+        format!("CREATE DATABASE IF NOT EXISTS {db};\n\n")
+    });
+    std::fs::write(
+        schema_dir.join(format!("{table}.sql")),
+        format!(
+            "{create_database}CREATE TABLE IF NOT EXISTS {qualified_table} (\n  event_id String,\n  contract_alias String,\n  event_name String,\n  address String,\n  block_number UInt64,\n  block_hash String,\n  block_timestamp UInt64,\n  tx_hash String,\n  log_index UInt64,\n  topic0 String,\n  fields_json String,\n  discovered_address Nullable(String),\n  discovery_rule Nullable(String),\n  insert_time DateTime64(3),\n  is_deleted UInt8\n)\nENGINE = ReplacingMergeTree(insert_time, is_deleted)\nORDER BY event_id;\n"
+        ),
+    )?;
+    Ok(())
 }
 
 fn write_semantics(root: &Path, config: &ProjectConfig) -> Result<()> {
@@ -223,6 +265,17 @@ fn write_agent_files(root: &Path, config: &ProjectConfig) -> Result<()> {
     Ok(())
 }
 
+pub fn add_contract(
+    root: &Path,
+    mut config: ProjectConfig,
+    contract: ContractConfig,
+) -> Result<ProjectConfig> {
+    config.contracts.push(contract);
+    config.save(root)?;
+    write_generated_files(root, &config)?;
+    Ok(config)
+}
+
 pub fn add_discovery_rule(
     root: &Path,
     mut config: ProjectConfig,
@@ -232,4 +285,71 @@ pub fn add_discovery_rule(
     config.save(root)?;
     write_generated_files(root, &config)?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ClickHouseSinkConfig, ContractConfig, SinkConfig};
+    use std::path::PathBuf;
+
+    #[test]
+    fn generated_pipeline_can_write_sqlite_and_clickhouse_sinks() {
+        let root = std::env::temp_dir().join(format!(
+            "streamling-blockchain-project-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("abis")).unwrap();
+        std::fs::write(
+            root.join("abis/token.json"),
+            r#"[{"type":"event","name":"Transfer","inputs":[]}]"#,
+        )
+        .unwrap();
+        let config = ProjectConfig {
+            chain: "base".into(),
+            chain_id: 8453,
+            rpc_url: "http://localhost:8545".into(),
+            rpc_url_env: None,
+            database: PathBuf::from(".streamling-blockchain/events.db"),
+            start_block: 1,
+            confirmations: 12,
+            window: 2_000,
+            contracts: vec![ContractConfig {
+                alias: "token".into(),
+                address: "0x1111111111111111111111111111111111111111".into(),
+                abi: PathBuf::from("abis/token.json"),
+            }],
+            discovery_rules: vec![],
+            sinks: SinkConfig {
+                sqlite: true,
+                clickhouse: Some(ClickHouseSinkConfig {
+                    table: "events".into(),
+                    database: Some("fwa_analytics".into()),
+                    compression: Some("gzip".into()),
+                }),
+            },
+        };
+
+        write_generated_files(&root, &config).unwrap();
+
+        let pipeline: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(root.join("pipeline.yaml")).unwrap())
+                .unwrap();
+        assert_eq!(
+            pipeline["sinks"]["local_sql"]["type"],
+            "streamling_blockchain.sqlite_sink"
+        );
+        assert_eq!(pipeline["sinks"]["clickhouse_events"]["type"], "clickhouse");
+        assert_eq!(
+            pipeline["sinks"]["clickhouse_events"]["primary_key"],
+            "event_id"
+        );
+        assert!(
+            std::fs::read_to_string(root.join("clickhouse/events.sql"))
+                .unwrap()
+                .contains("ReplacingMergeTree")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

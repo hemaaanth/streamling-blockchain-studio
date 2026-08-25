@@ -1,5 +1,11 @@
 project:
-  name: "streamling-blockchain-studio-fwa"
+  name: "megapot-v2-live"
   evidence: "0.9.1"
 
 pages: ./pages
+
+plugins:
+  components:
+    "@evidence-dev/core-components": {}
+  datasources:
+    evidence-connector-clickhouse: {}

@@ -34,15 +34,9 @@ pub async fn live(root: &Path) -> Result<Value> {
     let config = ProjectConfig::load(root)?;
     let database = config.absolute_database(root);
     let progress = read_progress(root)?;
-    let head = rpc::hex_u64(
-        &rpc::rpc(
-            &Client::new(),
-            &config.rpc_url,
-            "eth_blockNumber",
-            json!([]),
-        )
-        .await?,
-    )?;
+    let rpc_url = config.rpc_url_value()?;
+    let head =
+        rpc::hex_u64(&rpc::rpc(&Client::new(), &rpc_url, "eth_blockNumber", json!([])).await?)?;
     Ok(payload(
         &config,
         &database,
@@ -129,7 +123,7 @@ fn payload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ContractConfig;
+    use crate::config::{ContractConfig, SinkConfig};
     use std::path::PathBuf;
 
     fn config() -> ProjectConfig {
@@ -137,6 +131,7 @@ mod tests {
             chain: "ethereum".into(),
             chain_id: 1,
             rpc_url: "http://localhost".into(),
+            rpc_url_env: None,
             database: PathBuf::from("events.db"),
             start_block: 100,
             confirmations: 10,
@@ -147,6 +142,7 @@ mod tests {
                 abi: PathBuf::from("abi.json"),
             }],
             discovery_rules: vec![],
+            sinks: SinkConfig::default(),
         }
     }
 
