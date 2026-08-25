@@ -8,7 +8,6 @@ sidebar_position: 4
 icon: users
 ---
 
-Wallet-centric explorer for buyers, recipients, referrers, and winners. This is the dashboard-style page for answering “who is driving this?”
 
 ```sql buyer_leaders
 WITH orders AS (

@@ -96,9 +96,6 @@ LIMIT 8
   <BigValue data={overview} value="latest_block" title="Latest indexed block" fmt="num0" />
 </Grid>
 
-<Alert status="info">
-Start with **Live dashboard** for the operating view, **Narrative read** for a compact analyst memo, **Participants** for wallet-level detail, and **Data room** for raw decoded events and quality checks.
-</Alert>
 
 <Grid cols=2>
   <AreaChart data={flow} x="hour" y="tickets" title="Ticket velocity by hour" />
@@ -116,7 +113,7 @@ Start with **Live dashboard** for the operating view, **Narrative read** for a c
 
 ## Explore
 
-- [Live dashboard](/megapot-v2/) — compact monitoring view.
-- [Narrative read](/narrative/) — analyst-style interpretation.
+- [Dashboard](/dashboard/) — compact monitoring view.
+- [Trends](/trends/) — demand and participant charts.
 - [Participants](/participants/) — wallet and channel explorer.
 - [Data room](/data-room/) — raw events and QA tables.
