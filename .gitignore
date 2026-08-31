@@ -9,6 +9,7 @@
 /access/
 /preprocessed_configs/
 /demos/*/connection.yaml
+/demos/*/sources/*/connection.yaml
 /streamling-blockchain.toml
 /pipeline.yaml
 /semantic.toml
