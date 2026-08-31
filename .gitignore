@@ -8,7 +8,7 @@
 !.env.example
 /access/
 /preprocessed_configs/
-/evidence/connection.yaml
+/demos/*/connection.yaml
 /streamling-blockchain.toml
 /pipeline.yaml
 /semantic.toml
@@ -19,4 +19,5 @@
 /abis/
 /skills/
 /llms.txt
+/.local/
 .DS_Store

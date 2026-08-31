@@ -11,7 +11,7 @@ This is an independent Goldsky project built on the general-purpose [Streamling]
 - An EVM RPC URL, or the Goldsky CLI 13.9.0 or newer for automatic Edge endpoint creation
 - A contract address and ABI; the CLI can fetch verified ABI metadata when the RPC supports it
 
-Evidence is optional. The example under `evidence/` reads the local SQLite event database through Evidence's official `@evidence-dev/sqlite` connector. The Evidence project also keeps `evidence-connector-clickhouse` installed and registered so warehouse-backed pages can be added without changing project plumbing.
+The included dashboard is a specific Robinhood Stock Tokens Evidence demo under `demos/robinhood-stock-tokens/`. It reads a Streamling-managed SQLite event database through Evidence's official `@evidence-dev/sqlite` connector. The demo also keeps `evidence-connector-clickhouse` installed and registered so warehouse-backed pages can be added without changing project plumbing.
 
 ## Build
 
@@ -20,6 +20,89 @@ cargo build --release --workspace
 ```
 
 The CLI is `target/release/streamling-blockchain`. The native plugin is built beside it as `libstreamling_blockchain_plugin` with the platform library extension.
+
+## Included demo
+
+This repository includes one demo dashboard:
+
+- `demos/robinhood-stock-tokens/`: Robinhood Stock Token transfer analytics on Robinhood Chain.
+
+The demo source is committed. Its data is not. Recreate the data by running a generated Streamling project, then point the demo at that generated project's `.streamling-blockchain/events.db`.
+
+### Recreate the Robinhood Stock Tokens demo
+
+1. Install the separate Streamling runtime if `streamling` is not on your `PATH`:
+
+```sh
+curl -fsSL https://streamling.dev/install.sh | bash
+```
+
+2. Build this repository's CLI and native plugin:
+
+```sh
+cargo build --release --workspace
+```
+
+3. Provide an archive-capable Robinhood Chain RPC endpoint. Public RPCs can pass setup checks but usually cannot backfill the full historical range.
+
+```sh
+export ROBINHOOD_RPC_URL='https://your-archive-rpc.example'
+```
+
+4. Initialize the generated Streamling project outside the committed demo source:
+
+```sh
+target/release/streamling-blockchain \
+  --project .local/demos/robinhood-stock-tokens \
+  init-robinhood \
+  --rpc-env ROBINHOOD_RPC_URL \
+  --start-block 0 \
+  --index-blocks
+```
+
+5. Run the backfill. Keep this project directory intact; it contains Streamling checkpoint state as well as the SQLite event database.
+
+```sh
+target/release/streamling-blockchain \
+  --project .local/demos/robinhood-stock-tokens \
+  dev \
+  --streamling streamling
+```
+
+6. Inspect progress and query the Streamling-managed data:
+
+```sh
+target/release/streamling-blockchain \
+  --project .local/demos/robinhood-stock-tokens \
+  status --json
+
+target/release/streamling-blockchain \
+  --project .local/demos/robinhood-stock-tokens \
+  sql --json 'SELECT event_name, count(*) AS events FROM events GROUP BY event_name LIMIT 20'
+```
+
+7. Create the audit source table used by the Quality page:
+
+```sh
+target/release/streamling-blockchain \
+  --project .local/demos/robinhood-stock-tokens \
+  audit --once --window-blocks 1000
+```
+
+8. Refresh and build the Evidence demo from the generated database:
+
+```sh
+STREAMLING_BLOCKCHAIN_DB=.local/demos/robinhood-stock-tokens/.streamling-blockchain/events.db \
+  npm --prefix demos/robinhood-stock-tokens run sources:sqlite
+
+npm --prefix demos/robinhood-stock-tokens run build
+```
+
+9. Preview it locally:
+
+```sh
+npm --prefix demos/robinhood-stock-tokens run preview
+```
 
 ## Create and run a project
 
@@ -157,12 +240,12 @@ streamling-blockchain --project ./my-project rpc-doctor --json --apply
 streamling-blockchain --project ./my-project mcp
 ```
 
-To refresh the included Evidence dashboard from a generated SQLite project database:
+To refresh a demo dashboard from a generated SQLite project database:
 
 ```sh
 STREAMLING_BLOCKCHAIN_DB=./my-project/.streamling-blockchain/events.db \
-  npm --prefix evidence run sources:sqlite
-npm --prefix evidence run build
+  npm --prefix demos/robinhood-stock-tokens run sources:sqlite
+npm --prefix demos/robinhood-stock-tokens run build
 ```
 
 `sources:sqlite` symlinks Evidence's local `events.db` source file to the generated project database, then lets Evidence's SQLite connector build its normal Parquet extracts. Evidence reads SQLite directly; no SQLite-to-ClickHouse sync path is involved.
@@ -201,7 +284,7 @@ For a behavioral smoke test, initialize against a known RPC fixture, run `dev`, 
 
 - `crates/streamling-blockchain-cli/`: CLI, Goldsky provisioning, SQL, and MCP surfaces
 - `crates/streamling-blockchain-plugin/`: native Streamling EVM source and SQLite sink
-- `evidence/`: optional FWA dashboard example
+- `demos/`: specific Evidence dashboard demos backed by Streamling-generated project databases
 - `tests/`: deterministic EVM RPC and ABI fixtures
 
 ## License and provenance

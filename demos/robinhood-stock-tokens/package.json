@@ -1,4 +1,5 @@
 {
+  "name": "robinhood-stock-tokens-demo",
   "type": "module",
   "scripts": {
     "dev": "evidence dev",
