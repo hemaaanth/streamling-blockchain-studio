@@ -154,7 +154,6 @@ streamling-blockchain --project ./my-project sql --json \
 streamling-blockchain --project ./my-project replay --from 1000000 --to 1000100
 streamling-blockchain --project ./my-project semantics check
 streamling-blockchain --project ./my-project rpc-doctor --json --apply
-streamling-blockchain --project ./my-project serve
 streamling-blockchain --project ./my-project mcp
 ```
 
@@ -168,7 +167,7 @@ npm --prefix evidence run build
 
 `sources:sqlite` symlinks Evidence's local `events.db` source file to the generated project database, then lets Evidence's SQLite connector build its normal Parquet extracts. Evidence reads SQLite directly; no SQLite-to-ClickHouse sync path is involved.
 
-`serve` exposes the Studio SQL page and JSON endpoints on `127.0.0.1:8787` by default. MCP is available over stdio with the tools `streamling_blockchain_schema`, `streamling_blockchain_query`, and `streamling_blockchain_status`. `replay` refetches a closed block range and reports missing, extra, or changed local events without mutating the database. `audit` continuously replays the latest closed window and one older sampled window, then stores summaries in `quality_replay_checks`. `rpc-doctor --apply` writes a lower working `window` when the configured `eth_getLogs` range is too wide for the RPC provider.
+MCP is available over stdio with the tools `streamling_blockchain_schema`, `streamling_blockchain_query`, and `streamling_blockchain_status`. `replay` refetches a closed block range and reports missing, extra, or changed local events without mutating the database. `audit` continuously replays the latest closed window and one older sampled window, then stores summaries in `quality_replay_checks`. `rpc-doctor --apply` writes a lower working `window` when the configured `eth_getLogs` range is too wide for the RPC provider.
 
 
 Each initialized project contains:
@@ -181,7 +180,7 @@ Each initialized project contains:
 - `.streamling-blockchain/events.db`: decoded events, optional `evm_blocks`, optional `evm_transactions`, and quality views/tables such as `quality_reorgs`, `quality_event_counts_by_block`, and `quality_replay_checks` when the SQLite sink is enabled
 - `clickhouse/<table>.sql`, `clickhouse/<table>_blocks.sql`, and `clickhouse/<table>_transactions.sql`: generated ClickHouse schemas for enabled ClickHouse sinks
 - `state.db`: Streamling's committed source cursor and discovered-contract registry
-- `web/index.html`, `llms.txt`, and `skills/`: generated query surfaces for the local SQLite database
+- `llms.txt` and `skills/`: generated agent query guidance for the local SQLite database
 
 Keep the entire project directory on persistent storage. Restarting `dev` with the same directory resumes from Streamling's last committed checkpoint. Copying only the SQLite event database is insufficient: it omits the source cursor and can cause a replay from the configured start block.
 
@@ -200,9 +199,8 @@ For a behavioral smoke test, initialize against a known RPC fixture, run `dev`, 
 
 ## Repository layout
 
-- `crates/streamling-blockchain-cli/`: CLI, Goldsky provisioning, SQL/MCP/HTTP surfaces
+- `crates/streamling-blockchain-cli/`: CLI, Goldsky provisioning, SQL, and MCP surfaces
 - `crates/streamling-blockchain-plugin/`: native Streamling EVM source and SQLite sink
-- `web/`: Studio SQL page copied into generated projects
 - `evidence/`: optional FWA dashboard example
 - `tests/`: deterministic EVM RPC and ABI fixtures
 
