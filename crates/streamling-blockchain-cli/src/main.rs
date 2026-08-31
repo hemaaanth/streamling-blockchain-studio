@@ -7,7 +7,6 @@ mod project;
 mod replay;
 mod rpc;
 mod status;
-mod web;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -155,10 +154,6 @@ enum Commands {
         poll_seconds: u64,
     },
     Mcp,
-    Serve {
-        #[arg(long, default_value = "127.0.0.1:8787")]
-        bind: String,
-    },
     Doctor {
         #[arg(long, default_value = "streamling")]
         streamling: PathBuf,
@@ -495,7 +490,6 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Mcp => mcp::run_stdio(root),
-        Commands::Serve { bind } => web::serve(root, bind).await,
         Commands::Replay { from, to } => {
             let value = replay::diff(&root, from, to).await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
