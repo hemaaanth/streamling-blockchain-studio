@@ -1,0 +1,198 @@
+[
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "buyer",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "name": "quoteIn",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "tokensOut",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "fee",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "tax",
+        "type": "uint256"
+      }
+    ],
+    "name": "CurveBuy",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "buyer",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "name": "refund",
+        "type": "uint256"
+      }
+    ],
+    "name": "CurveBuyRefunded",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "seller",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "name": "tokensIn",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "quoteOut",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "fee",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "tax",
+        "type": "uint256"
+      }
+    ],
+    "name": "CurveSell",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": false,
+        "name": "protocolAmount",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "buybackAmount",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "creatorAmount",
+        "type": "uint256"
+      }
+    ],
+    "name": "FeesSwept",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "protocolRecipient",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "creatorRecipient",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "name": "protocolAmount",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "creatorAmount",
+        "type": "uint256"
+      }
+    ],
+    "name": "FeesRescued",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": false,
+        "name": "quoteSpent",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "tokensLocked",
+        "type": "uint256"
+      }
+    ],
+    "name": "BuybackLocked",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": false,
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "name": "quoteOut",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "tokenOut",
+        "type": "uint256"
+      }
+    ],
+    "name": "CurveCompleted",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "name": "gasRemaining",
+        "type": "uint256"
+      }
+    ],
+    "name": "AutoGraduationFailed",
+    "type": "event"
+  }
+]

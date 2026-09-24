@@ -1,0 +1,3 @@
+# Public dashboard. Keep authentication disabled for the shipped demo.
+access:
+  default: public

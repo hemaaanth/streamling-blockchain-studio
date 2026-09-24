@@ -1,0 +1,188 @@
+[
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "curve",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "deployer",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "name": "pairToken",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "name": "launchConfigId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "graduationThreshold",
+        "type": "uint256"
+      }
+    ],
+    "name": "TokenLaunched",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "name": "quoteOut",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "tokenOut",
+        "type": "uint256"
+      }
+    ],
+    "name": "LaunchSwept",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "token",
+        "type": "address"
+      }
+    ],
+    "name": "LaunchForceSwept",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "previousRecipient",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "newRecipient",
+        "type": "address"
+      }
+    ],
+    "name": "CreatorFeeRecipientUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "name": "positionId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "tokenAmount",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "pairTokenAmount",
+        "type": "uint256"
+      }
+    ],
+    "name": "PoolGraduated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "name": "enabled",
+        "type": "bool"
+      },
+      {
+        "indexed": true,
+        "name": "controller",
+        "type": "address"
+      }
+    ],
+    "name": "BuybackEnabledUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "name": "amount",
+        "type": "uint256"
+      }
+    ],
+    "name": "GraduationTokensPermanentlyLocked",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "name": "quoteAmount",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "name": "tokenAmount",
+        "type": "uint256"
+      }
+    ],
+    "name": "LaunchGraduationRescued",
+    "type": "event"
+  }
+]

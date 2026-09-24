@@ -1,0 +1,21 @@
+{
+  "chain": {
+    "name": "robinhood-chain",
+    "id": 4663,
+    "rpc": "https://rpc.mainnet.chain.robinhood.com",
+    "startBlock": 26841846,
+    "confirmations": 12,
+    "window": 2000
+  },
+  "factory": {
+    "alias": "pons_factory",
+    "address": "0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e",
+    "abi": "abis/pons_factory.json"
+  },
+  "discovery": {
+    "event": "TokenLaunched",
+    "addressField": "curve",
+    "childAlias": "pons_curve",
+    "childAbi": "abis/pons_curve.json"
+  }
+}

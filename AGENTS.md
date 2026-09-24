@@ -15,6 +15,6 @@ Do not hand-create SQLite databases for demos. Manual SQLite fixtures belong onl
 
 ## Demos
 
-`demos/megapot/` is the shipped Megapot v2 public dashboard backed by ClickHouse. `demos/robinhood-stock-tokens/` is a Robinhood Stock Tokens dashboard source backed by a Streamling-managed SQLite project. Add new demos as separate directories under `demos/`; do not overwrite another demo in place.
+`demos/megapot/` is the shipped Megapot v2 public dashboard backed by ClickHouse. `demos/robinhood-stock-tokens/` is a Robinhood Stock Tokens dashboard source backed by a Streamling-managed SQLite project. `demos/pons-family/` is a Pons Family V2 dashboard backed by a Streamling-managed SQLite project with factory discovery. Add new demos as separate directories under `demos/`; do not overwrite another demo in place.
 
 Before changing a demo, read its local `AGENTS.md` and README if present.

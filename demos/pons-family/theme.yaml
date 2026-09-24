@@ -1,0 +1,45 @@
+colors:
+  base:
+    light: "#fcfbff"
+    dark: "#0d0a12"
+  card:
+    light: "#ffffff"
+    dark: "#15101d"
+  cardLayoutBackground:
+    light: "#f5f1fa"
+    dark: "#100c17"
+  positive:
+    light: "#138a60"
+    dark: "#36c996"
+  negative:
+    light: "#d53f68"
+    dark: "#ff6f91"
+
+colorPalettes:
+  default:
+    light: ["#7c3aed", "#ec4899", "#f59e0b", "#14b8a6", "#2563eb", "#8b5cf6", "#f97316", "#06b6d4"]
+    dark: ["#a78bfa", "#f472b6", "#fbbf24", "#2dd4bf", "#60a5fa", "#c4b5fd", "#fb923c", "#22d3ee"]
+
+colorScales:
+  default:
+    light: ["#f3e8ff", "#7c3aed"]
+    dark: ["#25143c", "#c4b5fd"]
+
+radius: 0.75
+depth: subtle
+density: comfortable
+chart:
+  gridlines: true
+  smooth: true
+  areaGradient: true
+  animateIntro: true
+  animateUpdates: true
+table:
+  rowLines: true
+  rowShading: true
+  barColor:
+    light: "#8b5cf6"
+    dark: "#a78bfa"
+  linkColor:
+    light: "#6d28d9"
+    dark: "#c4b5fd"
