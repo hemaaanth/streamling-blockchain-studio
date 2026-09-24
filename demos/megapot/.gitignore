@@ -1,5 +1,9 @@
 .evidence/
 connection.yaml
 sources/*/connection.yaml
+sources/megapot/
 node_modules/
 build/
+.vercel
+.env*
+!.env.example

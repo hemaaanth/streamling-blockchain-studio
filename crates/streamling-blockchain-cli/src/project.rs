@@ -519,7 +519,7 @@ mod tests {
                 sqlite: true,
                 clickhouse: Some(ClickHouseSinkConfig {
                     table: "events".into(),
-                    database: Some("fwa_analytics".into()),
+                    database: Some("analytics".into()),
                     compression: Some("gzip".into()),
                 }),
             },

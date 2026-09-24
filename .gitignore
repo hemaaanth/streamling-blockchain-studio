@@ -22,3 +22,4 @@
 /llms.txt
 /.local/
 .DS_Store
+__pycache__/

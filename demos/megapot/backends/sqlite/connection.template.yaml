@@ -1,0 +1,4 @@
+name: megapot
+type: sqlite
+options:
+  filename: events.db

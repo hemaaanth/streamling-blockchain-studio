@@ -3,7 +3,6 @@ title: Data room
 page_width: full
 cards: true
 table_of_contents: true
-auto_refresh: 60000
 sidebar_position: 5
 icon: database
 ---
@@ -122,8 +121,8 @@ LIMIT 50
 </Grid>
 
 <Grid cols=2>
-  <BarChart data={event_mix} x="event_name" y="events" title="Decoded events by type" />
-  <DataTable data={event_mix} rows=20 rowShading=true sortable=true downloadable=true>
+  <BarChart data={event_mix} x="event_name" y="events" title="Decoded events by type" emptySet=pass />
+  <DataTable data={event_mix} rows=20 rowShading=true sortable=true downloadable=true emptySet=pass>
     <Column id="event_name" title="Event" chip=true />
     <Column id="contract_alias" title="Contract" chip=true />
     <Column id="events" title="Events" contentType="bar" fmt="num0" barColor="#2563eb" />
@@ -135,7 +134,7 @@ LIMIT 50
 
 ## Drawings
 
-<DataTable data={drawing_distribution} rows=50 rowShading=true sortable=true downloadable=true>
+<DataTable data={drawing_distribution} rows=50 rowShading=true sortable=true downloadable=true emptySet=pass>
   <Column id="drawing" title="Drawing" fmt="num0" />
   <Column id="decoded_events" title="Events" contentType="bar" fmt="num0" barColor="#64748b" />
   <Column id="orders" title="Orders" contentType="bar" fmt="num0" barColor="#2563eb" />
@@ -144,9 +143,9 @@ LIMIT 50
 
 ## Latest processed orders
 
-<DataTable data={raw_orders} rows=50 rowShading=true sortable=true search=true downloadable=true compact=true>
+<DataTable data={raw_orders} rows=50 rowShading=true sortable=true search=true downloadable=true compact=true emptySet=pass>
   <Column id="block_number" title="Block" fmt="num0" />
-  <Column id="event_time" title="Time" fmt="date" />
+  <Column id="event_time" title="Time" fmt="longdate" />
   <Column id="buyer" title="Buyer" />
   <Column id="recipient" title="Recipient" />
   <Column id="drawing" title="Drawing" fmt="num0" />
@@ -158,9 +157,9 @@ LIMIT 50
 
 ## Latest LP manager events
 
-<DataTable data={raw_lp_events} rows=50 rowShading=true sortable=true search=true downloadable=true compact=true>
+<DataTable data={raw_lp_events} rows=50 rowShading=true sortable=true search=true downloadable=true compact=true emptySet=pass>
   <Column id="block_number" title="Block" fmt="num0" />
-  <Column id="event_time" title="Time" fmt="date" />
+  <Column id="event_time" title="Time" fmt="longdate" />
   <Column id="event_name" title="Event" chip=true />
   <Column id="backer" title="Backer" />
   <Column id="amount_usdc" title="Amount" contentType="bar" fmt="usd2" barColor="#16a34a" />

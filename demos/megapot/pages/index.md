@@ -4,7 +4,6 @@ hide_title: true
 page_width: full
 cards: true
 table_of_contents: false
-auto_refresh: 60000
 sidebar_position: 1
 icon: layout-dashboard
 ---
@@ -98,11 +97,11 @@ LIMIT 8
 
 
 <Grid cols=2>
-  <AreaChart data={flow} x="hour" y="tickets" title="Ticket velocity by hour" />
-  <BarChart data={source_mix} x="source" y="tickets" title="Channel mix" />
+  <AreaChart data={flow} x="hour" y="tickets" title="Ticket velocity by hour" emptySet=pass />
+  <BarChart data={source_mix} x="source" y="tickets" title="Channel mix" emptySet=pass />
 </Grid>
 
-<DataTable data={latest_drawings} rows=8 rowShading=true sortable=true>
+<DataTable data={latest_drawings} rows=8 rowShading=true sortable=true emptySet=pass>
   <Column id="drawing" title="Drawing" fmt="num0" />
   <Column id="tickets" title="Tickets" contentType="bar" fmt="num0" barColor="#2563eb" />
   <Column id="buyers" title="Buyers" fmt="num0" align="right" />
