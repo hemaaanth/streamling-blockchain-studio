@@ -29,6 +29,7 @@ Current demos:
 
 - `demos/megapot/`: shipped Megapot v2 dashboard for Base activity, backed by the ClickHouse table used for the public demo.
 - `demos/robinhood-stock-tokens/`: Robinhood Stock Tokens dashboard source for a Streamling-managed SQLite project. Full historical indexing needs an archive-capable Robinhood Chain RPC.
+- `demos/pons-family/`: Pons Family V2 launch and bonding-curve analytics on Robinhood Chain, backed by a Streamling-managed SQLite project that discovers each curve from the factory.
 
 The demo source is committed. Generated data, local Evidence extracts, builds, and credential-bearing connector files are not. To recreate a demo, follow that demo's README and keep the generated Streamling project outside the committed demo directory.
 

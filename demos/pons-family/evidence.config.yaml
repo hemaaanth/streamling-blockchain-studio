@@ -1,0 +1,11 @@
+project:
+  name: "pons-family-analytics"
+  evidence: "0.9.1"
+
+pages: ./pages
+
+plugins:
+  components:
+    "@evidence-dev/core-components": {}
+  datasources:
+    "@evidence-dev/sqlite": {}

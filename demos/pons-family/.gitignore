@@ -1,0 +1,8 @@
+node_modules/
+build/
+.evidence/
+.vercel/
+.env
+.env.*
+!.env.example
+sources/sqlite/events.db
