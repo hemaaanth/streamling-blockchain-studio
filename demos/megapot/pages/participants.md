@@ -3,7 +3,6 @@ title: Participants
 page_width: full
 cards: true
 table_of_contents: true
-auto_refresh: 60000
 sidebar_position: 4
 icon: users
 ---
@@ -137,7 +136,7 @@ WHERE is_deleted = 0
 
 ## Buyers
 
-<DataTable data={buyer_leaders} rows=25 rowShading=true sortable=true search=true downloadable=true>
+<DataTable data={buyer_leaders} rows=25 rowShading=true sortable=true search=true downloadable=true emptySet=pass>
   <Column id="buyer_url" title="Buyer" contentType="link" linkLabel="buyer" openInNewTab=true />
   <Column id="tickets" title="Tickets" contentType="bar" fmt="num0" barColor="#2563eb" />
   <Column id="orders" title="Orders" fmt="num0" align="right" />
@@ -148,7 +147,7 @@ WHERE is_deleted = 0
 
 ## Recipients
 
-<DataTable data={recipient_leaders} rows=25 rowShading=true sortable=true search=true downloadable=true>
+<DataTable data={recipient_leaders} rows=25 rowShading=true sortable=true search=true downloadable=true emptySet=pass>
   <Column id="recipient_url" title="Recipient" contentType="link" linkLabel="recipient" openInNewTab=true />
   <Column id="tickets" title="Tickets" contentType="bar" fmt="num0" barColor="#2563eb" />
   <Column id="ticket_share" title="Share" contentType="bar" fmt="pct1" barColor="#f59e0b" />
@@ -158,7 +157,7 @@ WHERE is_deleted = 0
 
 ## LP backers
 
-<DataTable data={lp_backers} rows=25 rowShading=true sortable=true search=true downloadable=true>
+<DataTable data={lp_backers} rows=25 rowShading=true sortable=true search=true downloadable=true emptySet=pass>
   <Column id="backer_url" title="Backer" contentType="link" linkLabel="backer" openInNewTab=true />
   <Column id="deposits_usdc" title="Deposits" contentType="bar" fmt="usd2" barColor="#2563eb" />
   <Column id="withdrawals_usdc" title="Withdrawals" fmt="usd2" />
@@ -171,12 +170,12 @@ WHERE is_deleted = 0
 ## Referrers and winners
 
 <Grid cols=2>
-  <DataTable data={referrers} rows=15 rowShading=true sortable=true search=true>
+  <DataTable data={referrers} rows=15 rowShading=true sortable=true search=true emptySet=pass>
     <Column id="referrer_url" title="Referrer" contentType="link" linkLabel="referrer" openInNewTab=true />
     <Column id="fees_usdc" title="Fees" contentType="bar" fmt="usd2" barColor="#16a34a" />
     <Column id="fee_events" title="Events" fmt="num0" align="right" />
   </DataTable>
-  <DataTable data={winners} rows=15 rowShading=true sortable=true search=true>
+  <DataTable data={winners} rows=15 rowShading=true sortable=true search=true emptySet=pass>
     <Column id="claimant_url" title="Claimant" contentType="link" linkLabel="claimant" openInNewTab=true />
     <Column id="winnings_usdc" title="Winnings" contentType="bar" fmt="usd2" barColor="#16a34a" />
     <Column id="claims" title="Claims" fmt="num0" align="right" />

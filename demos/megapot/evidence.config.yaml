@@ -9,3 +9,4 @@ plugins:
     "@evidence-dev/core-components": {}
   datasources:
     evidence-connector-clickhouse: {}
+    "@evidence-dev/sqlite": {}

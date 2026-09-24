@@ -1,0 +1,27 @@
+{
+  "chain": {
+    "name": "base",
+    "id": 8453,
+    "startBlock": 43197068,
+    "confirmations": 12,
+    "window": 1000
+  },
+  "abi": {
+    "source": "blockscout",
+    "baseUrl": "https://base.blockscout.com/api"
+  },
+  "contracts": [
+    {
+      "alias": "jackpot",
+      "address": "0x3bAe643002069dBCbcd62B1A4eb4C4A397d042a2",
+      "abiSha256": "8aac4c56dfbc3517cb73f07244d10d3f6b9290e430ae1ae006f1dd9be72e2fe9",
+      "firstBlock": 43197068
+    },
+    {
+      "alias": "lp_manager",
+      "address": "0xE63E54DF82d894396B885CE498F828f2454d9dCf",
+      "abiSha256": "f5b8921870552dc66c716d5dd89acbe56d51cdf574ae8d0bec1e44716ae98c4e",
+      "firstBlock": 43197074
+    }
+  ]
+}

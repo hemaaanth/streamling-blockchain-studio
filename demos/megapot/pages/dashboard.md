@@ -3,7 +3,6 @@ title: Dashboard
 page_width: full
 cards: true
 table_of_contents: true
-auto_refresh: 60000
 sidebar_position: 2
 icon: chart-column
 ---
@@ -264,7 +263,7 @@ LIMIT 25
   <BigValue data={lp_summary} value="net_deposits_usdc" title="Net deposits" fmt="usd2" />
 </Grid>
 
-<DataTable data={lp_backers} rows=15 rowShading=true sortable=true search=true downloadable=true>
+<DataTable data={lp_backers} rows=15 rowShading=true sortable=true search=true downloadable=true emptySet=pass>
   <Column id="backer_url" title="Backer" contentType="link" linkLabel="backer" openInNewTab=true />
   <Column id="deposits_usdc" title="Deposits" contentType="bar" fmt="usd2" barColor="#2563eb" />
   <Column id="withdrawals_usdc" title="Withdrawals" fmt="usd2" />
@@ -276,13 +275,13 @@ LIMIT 25
 ## Ticket velocity and channel mix
 
 <Grid cols=2>
-  <AreaChart
+  <AreaChart emptySet=pass
     data={ticket_flow}
     x="bucket"
     y="tickets"
     title="Tickets purchased in 5-minute buckets"
   />
-  <BarChart
+  <BarChart emptySet=pass
     data={source_mix}
     x="source"
     y="tickets"
@@ -291,7 +290,7 @@ LIMIT 25
 </Grid>
 
 
-<DataTable data={source_mix} rows=10 rowShading=true sortable=true totalRow=true downloadable=true>
+<DataTable data={source_mix} rows=10 rowShading=true sortable=true totalRow=true downloadable=true emptySet=pass>
   <Column id="source" title="Source" chip=true />
   <Column id="tickets" title="Tickets" contentType="bar" fmt="num0" barColor="#2563eb" />
   <Column id="recipients" title="Recipients" fmt="num0" align="right" />
@@ -301,14 +300,14 @@ LIMIT 25
 ## Participant concentration
 
 <Grid cols=2>
-  <DataTable data={participant_leaders} rows=15 rowShading=true sortable=true downloadable=true>
+  <DataTable data={participant_leaders} rows=15 rowShading=true sortable=true downloadable=true emptySet=pass>
     <Column id="recipient_url" title="Recipient" contentType="link" linkLabel="recipient" openInNewTab=true />
     <Column id="tickets" title="Tickets" contentType="bar" fmt="num0" barColor="#2563eb" />
     <Column id="ticket_share" title="Share" contentType="bar" fmt="pct1" barColor="#f59e0b" />
     <Column id="orders" title="Orders" fmt="num0" align="right" />
     <Column id="buyers" title="Buyers" fmt="num0" align="right" />
   </DataTable>
-  <DataTable data={round_snapshot} rows=10 rowShading=true sortable=true>
+  <DataTable data={round_snapshot} rows=10 rowShading=true sortable=true emptySet=pass>
     <Column id="drawing_id" title="Drawing" fmt="num0" />
     <Column id="tickets" title="Tickets" contentType="bar" fmt="num0" barColor="#2563eb" />
     <Column id="buyers" title="Buyers" fmt="num0" />
@@ -322,12 +321,12 @@ LIMIT 25
 ## Referrals and winnings
 
 <Grid cols=2>
-  <DataTable data={referrer_leaders} rows=10 rowShading=true sortable=true totalRow=true>
+  <DataTable data={referrer_leaders} rows=10 rowShading=true sortable=true totalRow=true emptySet=pass>
     <Column id="referrer" title="Referrer" />
     <Column id="fees_usdc" title="Fees" contentType="bar" fmt="usd2" barColor="#16a34a" />
     <Column id="fee_events" title="Fee events" fmt="num0" align="right" />
   </DataTable>
-  <DataTable data={winning_claims} rows=10 rowShading=true sortable=true totalRow=true>
+  <DataTable data={winning_claims} rows=10 rowShading=true sortable=true totalRow=true emptySet=pass>
     <Column id="claimant" title="Claimant" />
     <Column id="winnings_usdc" title="Winnings" contentType="bar" fmt="usd2" barColor="#16a34a" />
     <Column id="claims" title="Claims" fmt="num0" align="right" />
@@ -338,8 +337,8 @@ LIMIT 25
 
 ## Latest ticket orders
 
-<DataTable data={recent_orders} rows=25 rowShading=true sortable=true search=true downloadable=true compact=true>
-  <Column id="purchased_at" title="Purchased" fmt="date" />
+<DataTable data={recent_orders} rows=25 rowShading=true sortable=true search=true downloadable=true compact=true emptySet=pass>
+  <Column id="purchased_at" title="Purchased" fmt="longdate" />
   <Column id="buyer_url" title="Buyer" contentType="link" linkLabel="buyer" openInNewTab=true />
   <Column id="recipient_url" title="Recipient" contentType="link" linkLabel="recipient" openInNewTab=true />
   <Column id="drawing_id" title="Drawing" />

@@ -3,7 +3,6 @@ title: Trends
 page_width: full
 cards: true
 table_of_contents: true
-auto_refresh: 60000
 sidebar_position: 3
 icon: book-open
 ---
@@ -101,7 +100,7 @@ ORDER BY amount_usdc DESC
 
 ## Weekly demand
 
-<AreaChart data={weekly_tickets} x="week" y="tickets" title="Weekly ticket demand" />
+<AreaChart data={weekly_tickets} x="week" y="tickets" title="Weekly ticket demand" emptySet=pass />
 
 
 ## Participant concentration
@@ -114,6 +113,6 @@ ORDER BY amount_usdc DESC
 ## LP earnings and referral fees
 
 <Grid cols=2>
-  <AreaChart data={referral_vs_lp} x="drawing" y="lp_earnings_usdc" series="referral_fees_usdc" title="LP earnings and referral fees by drawing" />
-  <BarChart data={lp_backer_flow} x="event_name" y="amount_usdc" title="LP manager deposits and withdrawals" />
+  <AreaChart data={referral_vs_lp} x="drawing" y="lp_earnings_usdc" series="referral_fees_usdc" title="LP earnings and referral fees by drawing" emptySet=pass />
+  <BarChart data={lp_backer_flow} x="event_name" y="amount_usdc" title="LP manager deposits and withdrawals" emptySet=pass />
 </Grid>
