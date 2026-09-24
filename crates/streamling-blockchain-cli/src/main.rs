@@ -912,7 +912,8 @@ async fn run_streamling(
     command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
     let mut child = command
         .spawn()
         .with_context(|| format!("run {}", streamling.display()))?;
@@ -942,14 +943,49 @@ async fn run_streamling(
                 if status::live(root).await?["backfill"]["caught_up"].as_bool() == Some(true) {
                     tokio::time::sleep(exit_poll).await;
                     if status::live(root).await?["backfill"]["caught_up"].as_bool() == Some(true) {
-                        child.kill().await.with_context(|| format!("stop {}", streamling.display()))?;
-                        let _ = child.wait().await;
+                        stop_streamling(&mut child, streamling).await?;
                         return Ok(());
                     }
                 }
             }
         }
     }
+}
+
+async fn stop_streamling(child: &mut tokio::process::Child, streamling: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let pid = child.id().context("Streamling process has no PID")?;
+        let result = unsafe { libc::kill(pid as i32, libc::SIGINT) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("signal {}", streamling.display()));
+        }
+    }
+    #[cfg(not(unix))]
+    child
+        .start_kill()
+        .with_context(|| format!("stop {}", streamling.display()))?;
+
+    let status = match tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await
+    {
+        Ok(status) => status.with_context(|| format!("wait for {}", streamling.display()))?,
+        Err(_) => {
+            child
+                .kill()
+                .await
+                .with_context(|| format!("force-stop {}", streamling.display()))?;
+            let _ = child.wait().await;
+            bail!(
+                "{} did not checkpoint and stop within 30 seconds",
+                streamling.display()
+            )
+        }
+    };
+    if !status.success() {
+        bail!("Streamling exited with {status} during graceful shutdown")
+    }
+    Ok(())
 }
 
 fn default_plugin_path() -> Result<PathBuf> {
