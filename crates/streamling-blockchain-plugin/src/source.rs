@@ -8,6 +8,7 @@ use ethers_core::{
     abi::{Abi, Event, RawLog, Token},
     types::H256,
 };
+use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
@@ -19,14 +20,19 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 const USER_AGENT: &str = "streamling-blockchain/0.1";
+const MAX_ADDRESSES_PER_LOG_FILTER: usize = 500;
+const MAX_CONCURRENT_LOG_REQUESTS: usize = 4;
 
 fn rpc_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
         .build()
-        .expect("static user agent builds")
+        .expect("static HTTP client configuration builds")
 }
 async fn rpc_request(
     rt: &PluginAsyncRuntimeObj,
@@ -112,13 +118,15 @@ pub struct EvmEventSource {
     window: AtomicU64,
     next_block: AtomicU64,
     progress_path: Option<PathBuf>,
+    latest_progress: Mutex<(u64, u64)>,
     end_block: Option<u64>,
     state: Arc<PluginStateBackend<SourceState>>,
     schema: SchemaRef,
     events: HashMap<H256, Vec<EventDescriptor>>,
     direct_addresses: HashMap<String, String>,
     discovery_rules: Vec<DiscoverySpec>,
-    topics: Vec<String>,
+    direct_topics: Vec<String>,
+    child_topics: Vec<String>,
     running: AtomicBool,
     discovered_rows: Mutex<Vec<PersistedRow>>,
     bootstrap_rows: Mutex<Option<Vec<PersistedRow>>>,
@@ -167,14 +175,29 @@ impl EvmEventSource {
             );
             load_events(&contract.alias, &contract.abi_path, &mut events)?;
         }
-        for rule in &spec.discovery_rules {
-            load_events(&rule.child_contract, &rule.child_abi_path, &mut events)?;
-        }
-        let mut topics = events
+        let mut direct_topics = events
             .keys()
             .map(|topic| format!("{topic:#x}"))
             .collect::<Vec<_>>();
-        topics.sort();
+        direct_topics.sort();
+        for rule in &spec.discovery_rules {
+            load_events(&rule.child_contract, &rule.child_abi_path, &mut events)?;
+        }
+        let child_contracts = spec
+            .discovery_rules
+            .iter()
+            .map(|rule| rule.child_contract.as_str())
+            .collect::<HashSet<_>>();
+        let mut child_topics = events
+            .iter()
+            .filter(|(_, descriptors)| {
+                descriptors
+                    .iter()
+                    .any(|descriptor| child_contracts.contains(descriptor.owner.as_str()))
+            })
+            .map(|(topic, _)| format!("{topic:#x}"))
+            .collect::<Vec<_>>();
+        child_topics.sort();
         let schema = Arc::new(Schema::new(vec![
             Field::new("event_id", DataType::Utf8, false),
             Field::new("chain_id", DataType::UInt64, false),
@@ -203,12 +226,14 @@ impl EvmEventSource {
             end_block,
             next_block: AtomicU64::new(start_block),
             progress_path: options.get("progress_path").map(PathBuf::from),
+            latest_progress: Mutex::new((start_block.saturating_sub(1), 0)),
             state: state_factory.create(),
             schema,
             events,
             direct_addresses,
             discovery_rules: spec.discovery_rules,
-            topics,
+            direct_topics,
+            child_topics,
             running: AtomicBool::new(true),
             discovered_rows: Mutex::new(Vec::new()),
             bootstrap_rows: Mutex::new(None),
@@ -743,39 +768,113 @@ impl SourcePlugin for EvmEventSource {
         )?;
         let safe_head = capped_safe_head(head, self.confirmations, self.end_block);
         let from = self.next_block.load(Ordering::Relaxed);
-        self.write_progress(from.saturating_sub(1), head, safe_head)?;
+        *self
+            .latest_progress
+            .lock()
+            .map_err(|_| PluginError::Internal("progress mutex poisoned".into()))? =
+            (head, safe_head);
         if from > safe_head {
             self.rt.sleep(RDuration::from_millis(1_000)).await;
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
         let mut current_window = self.window.load(Ordering::Relaxed).max(1);
-        let (to, logs) = loop {
+        let (to, logs, child_contracts) = loop {
             let to = safe_head.min(from.saturating_add(current_window - 1));
-            let mut filter = json!({"fromBlock": format!("0x{from:x}"), "toBlock": format!("0x{to:x}"), "topics": [self.topics]});
-            if self.discovery_rules.is_empty() {
-                filter["address"] = Value::Array(
-                    self.direct_addresses
-                        .keys()
-                        .cloned()
-                        .map(Value::String)
-                        .collect(),
-                );
-            }
-            match self.rpc("eth_getLogs", json!([filter])).await {
-                Ok(value) => {
-                    self.window.store(current_window, Ordering::Relaxed);
-                    break (to, value.as_array().cloned().unwrap_or_default());
-                }
+            let direct_filter = json!({
+                "fromBlock": format!("0x{from:x}"),
+                "toBlock": format!("0x{to:x}"),
+                "address": self.direct_addresses.keys().cloned().collect::<Vec<_>>(),
+                "topics": [self.direct_topics]
+            });
+            let mut logs = match self.rpc("eth_getLogs", json!([direct_filter])).await {
+                Ok(value) => value.as_array().cloned().unwrap_or_default(),
                 Err(error) if current_window > 1 && is_get_logs_range_error(&error) => {
                     current_window = (current_window / 2).max(1);
                     self.window.store(current_window, Ordering::Relaxed);
                     continue;
                 }
                 Err(error) => return Err(error),
+            };
+
+            let mut child_contracts = self
+                .discovered_rows
+                .lock()
+                .map_err(|_| PluginError::Internal("discovery registry mutex poisoned".into()))?
+                .iter()
+                .filter_map(|saved| {
+                    Some((
+                        saved.row.discovered_address.clone()?,
+                        saved.row.discovery_rule.clone()?,
+                    ))
+                })
+                .collect::<HashMap<_, _>>();
+            for log in &logs {
+                if let Some(row) = decode_row(
+                    self.chain_id,
+                    log,
+                    &self.events,
+                    &self.direct_addresses,
+                    &self.discovery_rules,
+                    &child_contracts,
+                )? && let (Some(address), Some(rule)) =
+                    (row.discovered_address, row.discovery_rule)
+                {
+                    child_contracts.insert(address, rule);
+                }
             }
+            let mut child_addresses = child_contracts.keys().cloned().collect::<Vec<_>>();
+            child_addresses.sort_unstable();
+
+            if !child_addresses.is_empty() && !self.child_topics.is_empty() {
+                let address_batches = child_addresses
+                    .chunks(MAX_ADDRESSES_PER_LOG_FILTER)
+                    .map(<[String]>::to_vec)
+                    .collect::<Vec<_>>();
+                let requests = stream::iter(address_batches.into_iter().map(|addresses| {
+                    let child_filter = json!({
+                        "fromBlock": format!("0x{from:x}"),
+                        "toBlock": format!("0x{to:x}"),
+                        "address": addresses,
+                        "topics": [self.child_topics]
+                    });
+                    async move { self.rpc("eth_getLogs", json!([child_filter])).await }
+                }))
+                .buffer_unordered(MAX_CONCURRENT_LOG_REQUESTS)
+                .collect::<Vec<_>>()
+                .await;
+                let mut retry_with_smaller_window = false;
+                for result in requests {
+                    match result {
+                        Ok(value) => logs.extend(value.as_array().cloned().unwrap_or_default()),
+                        Err(error) if current_window > 1 && is_get_logs_range_error(&error) => {
+                            current_window = (current_window / 2).max(1);
+                            self.window.store(current_window, Ordering::Relaxed);
+                            retry_with_smaller_window = true;
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                if retry_with_smaller_window {
+                    continue;
+                }
+            }
+
+            let mut seen = HashSet::new();
+            logs.retain(|log| {
+                seen.insert(
+                    json!([
+                        log.get("blockHash"),
+                        log.get("logIndex"),
+                        log.get("address")
+                    ])
+                    .to_string(),
+                )
+            });
+            self.window.store(current_window, Ordering::Relaxed);
+            break (to, logs, child_contracts);
         };
-        let mut timestamps = HashMap::new();
-        let mut decoded = Vec::new();
+        let mut rows = Vec::new();
         for log in logs {
             if let Some(row) = decode_row(
                 self.chain_id,
@@ -783,17 +882,35 @@ impl SourcePlugin for EvmEventSource {
                 &self.events,
                 &self.direct_addresses,
                 &self.discovery_rules,
+                &child_contracts,
             )? {
-                let timestamp = if let Some(value) = timestamps.get(&row.block_number) {
-                    *value
-                } else {
-                    let value = self.block_timestamp(row.block_number).await?;
-                    timestamps.insert(row.block_number, value);
-                    value
-                };
-                decoded.push((row, timestamp));
+                rows.push(row);
             }
         }
+        let blocks = rows
+            .iter()
+            .map(|row| row.block_number)
+            .collect::<HashSet<_>>();
+        let timestamp_results = stream::iter(blocks.into_iter().map(|block| async move {
+            self.block_timestamp(block)
+                .await
+                .map(|timestamp| (block, timestamp))
+        }))
+        .buffer_unordered(8)
+        .collect::<Vec<_>>()
+        .await;
+        let mut timestamps = HashMap::new();
+        for result in timestamp_results {
+            let (block, timestamp) = result?;
+            timestamps.insert(block, timestamp);
+        }
+        let decoded = rows
+            .into_iter()
+            .map(|row| {
+                let timestamp = timestamps[&row.block_number];
+                (row, timestamp)
+            })
+            .collect::<Vec<_>>();
         {
             let mut registry = self
                 .discovered_rows
@@ -814,7 +931,6 @@ impl SourcePlugin for EvmEventSource {
         }
         let next_block = to.saturating_add(1);
         self.next_block.store(next_block, Ordering::Relaxed);
-        self.write_progress(next_block.saturating_sub(1), head, safe_head)?;
         self.metrics
             .record_count("streamling_blockchain_logs", decoded.len() as u64);
         rows_to_batch(self.schema.clone(), decoded)
@@ -826,15 +942,21 @@ impl SourcePlugin for EvmEventSource {
         &self,
         _epoch: CheckpointEpoch,
     ) -> Result<(), PluginError> {
+        let next_block = self.next_block.load(Ordering::Relaxed);
         let state = SourceState {
-            next_block: self.next_block.load(Ordering::Relaxed),
+            next_block,
             discovered_rows: self
                 .discovered_rows
                 .lock()
                 .map_err(|_| PluginError::Internal("discovery registry mutex poisoned".into()))?
                 .clone(),
         };
-        self.state.put(state).await.map_err(PluginError::State)
+        self.state.put(state).await.map_err(PluginError::State)?;
+        let (observed_head, safe_head) = *self
+            .latest_progress
+            .lock()
+            .map_err(|_| PluginError::Internal("progress mutex poisoned".into()))?;
+        self.write_progress(next_block.saturating_sub(1), observed_head, safe_head)
     }
 }
 
@@ -1189,6 +1311,7 @@ fn decode_row(
     events: &HashMap<H256, Vec<EventDescriptor>>,
     direct: &HashMap<String, String>,
     discovery_rules: &[DiscoverySpec],
+    child_contracts: &HashMap<String, String>,
 ) -> Result<Option<DecodedRow>, PluginError> {
     let topics = log
         .get("topics")
@@ -1207,18 +1330,18 @@ fn decode_row(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let preferred = direct.get(&address);
+    let preferred = direct
+        .get(&address)
+        .or_else(|| child_contracts.get(&address));
     let descriptor = candidates
         .iter()
         .find(|candidate| preferred == Some(&candidate.owner))
-        .or_else(|| {
-            candidates.iter().find(|candidate| {
-                discovery_rules
-                    .iter()
-                    .any(|rule| rule.child_contract == candidate.owner)
-            })
-        })
-        .unwrap_or(&candidates[0]);
+        .or_else(|| (candidates.len() == 1).then_some(&candidates[0]))
+        .ok_or_else(|| {
+            PluginError::Execution(format!(
+                "ambiguous event topic {topic0_text} for address {address}"
+            ))
+        })?;
     let raw_topics = topics
         .iter()
         .filter_map(Value::as_str)
@@ -1458,7 +1581,8 @@ fn is_get_logs_range_error(error: &PluginError) -> bool {
     text.contains("eth_getlogs")
         && (text.contains("exceeded max allowed range")
             || text.contains("block range")
-            || text.contains("range too large"))
+            || text.contains("range too large")
+            || text.contains("log query timed out"))
 }
 fn parse_hex(text: &str) -> Result<u64, PluginError> {
     u64::from_str_radix(text.trim_start_matches("0x"), 16).map_err(internal)
@@ -1601,5 +1725,61 @@ mod tests {
             row.contract_address.as_deref(),
             Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
         );
+    }
+
+    #[test]
+    fn log_query_timeouts_reduce_the_window() {
+        let error = PluginError::Execution(
+            "eth_getLogs: {\"code\":-32000,\"message\":\"log query timed out\"}".into(),
+        );
+
+        assert!(is_get_logs_range_error(&error));
+    }
+
+    #[test]
+    fn child_address_selects_its_own_contract_descriptor() {
+        let event: Event = serde_json::from_value(json!({
+            "anonymous": false,
+            "inputs": [],
+            "name": "Ping",
+            "type": "event"
+        }))
+        .unwrap();
+        let topic = event.signature();
+        let child_address = "0x2222222222222222222222222222222222222222";
+        let events = HashMap::from([(
+            topic,
+            vec![
+                EventDescriptor {
+                    owner: "child_a".into(),
+                    event: event.clone(),
+                },
+                EventDescriptor {
+                    owner: "child_b".into(),
+                    event,
+                },
+            ],
+        )]);
+        let child_contracts = HashMap::from([(child_address.to_owned(), "child_b".to_owned())]);
+        let row = decode_row(
+            4663,
+            &json!({
+                "address": child_address,
+                "topics": [format!("{topic:#x}")],
+                "data": "0x",
+                "blockNumber": "0x1",
+                "blockHash": "0xblock",
+                "transactionHash": "0xtx",
+                "logIndex": "0x0"
+            }),
+            &events,
+            &HashMap::new(),
+            &[],
+            &child_contracts,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(row.owner, "child_b");
     }
 }

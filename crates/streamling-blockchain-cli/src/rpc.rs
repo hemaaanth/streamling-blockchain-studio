@@ -26,26 +26,44 @@ pub const BUILTIN_CHAINS: &[(&str, u64, &str)] = &[
     ),
 ];
 
+const RATE_LIMIT_ATTEMPTS: u32 = 6;
+
 pub async fn rpc(client: &Client, url: &str, method: &str, params: Value) -> Result<Value> {
-    let response = client
-        .post(url)
-        .json(&json!({
-            "jsonrpc": "2.0", "id": 1, "method": method, "params": params
-        }))
-        .send()
-        .await
-        .with_context(|| format!("{method} request to {url}"))?;
-    let status = response.status();
-    let body: Value = response.json().await.context("decode JSON-RPC response")?;
-    if !status.is_success() {
-        bail!("{method} returned HTTP {status}: {body}")
+    for attempt in 0..RATE_LIMIT_ATTEMPTS {
+        let response = client
+            .post(url)
+            .json(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+            }))
+            .send()
+            .await
+            .with_context(|| format!("{method} request to {url}"))?;
+        let status = response.status();
+        let body: Value = response.json().await.context("decode JSON-RPC response")?;
+        if is_rate_limited(status, &body) && attempt + 1 < RATE_LIMIT_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+            continue;
+        }
+        if !status.is_success() {
+            bail!("{method} returned HTTP {status}: {body}")
+        }
+        if let Some(error) = body.get("error") {
+            bail!("{method} failed: {error}")
+        }
+        return body
+            .get("result")
+            .cloned()
+            .context("JSON-RPC response omitted result");
     }
-    if let Some(error) = body.get("error") {
-        bail!("{method} failed: {error}")
-    }
-    body.get("result")
-        .cloned()
-        .context("JSON-RPC response omitted result")
+    unreachable!("bounded retry loop returns on final attempt")
+}
+
+fn is_rate_limited(status: reqwest::StatusCode, body: &Value) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || body
+            .pointer("/error/code")
+            .and_then(Value::as_i64)
+            .is_some_and(|code| code == 429)
 }
 
 pub async fn detect_chain(
@@ -206,6 +224,18 @@ pub fn hex_u64(value: &Value) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_limits_are_detected_from_status_or_json_rpc_code() {
+        let ok = reqwest::StatusCode::OK;
+        assert!(is_rate_limited(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            &json!({})
+        ));
+        assert!(is_rate_limited(ok, &json!({"error": {"code": 429}})));
+        assert!(!is_rate_limited(ok, &json!({"error": {"code": -32000}})));
+        assert!(!is_rate_limited(ok, &json!({"result": "0x1"})));
+    }
 
     #[test]
     fn extracts_sourcify_abi() {
