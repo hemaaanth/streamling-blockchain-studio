@@ -39,7 +39,7 @@ def schema_statements(cli: Path) -> list[str]:
         capture_output=True,
         text=True,
     ).stdout
-    return json.loads(output)
+    return json.loads(output)["data"]
 
 
 def post(url: str, query: str, user: str, password: str, body: bytes = b"") -> bytes:

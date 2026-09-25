@@ -1,6 +1,7 @@
 use crate::{
     config::ProjectConfig,
     database::{Backend, BackendKind},
+    output::{CodedError, ErrorCode},
     rpc, status,
 };
 use anyhow::{Context, Result, bail};
@@ -44,7 +45,10 @@ async fn diff_with(
     to: u64,
 ) -> Result<Value> {
     if from > to {
-        bail!("--from must be less than or equal to --to")
+        bail!(CodedError::new(
+            ErrorCode::Validation,
+            "--from must be less than or equal to --to"
+        ))
     }
     let rpc_url = config.rpc_url_value()?;
     let mut events = HashMap::new();
@@ -98,7 +102,10 @@ pub async fn audit_once(
     let snapshot = status::live(root).await?;
     let indexed = snapshot["backfill"]["indexed_through"]
         .as_u64()
-        .context("backfill has not started")?;
+        .ok_or_else(|| {
+            CodedError::new(ErrorCode::NotFound, "backfill has not started")
+                .next("streamling-blockchain dev")
+        })?;
     let start = snapshot["backfill"]["start_block"].as_u64().unwrap_or(0);
     let window = window_blocks.max(1);
     let recent_to = indexed;
@@ -129,15 +136,21 @@ pub async fn audit_once(
     )
 }
 
+/// Prints one JSON line per audit; in `--json` mode they go to stderr.
 pub async fn audit_continuous(
     root: &Path,
+    json: bool,
     interval: std::time::Duration,
     window_blocks: u64,
     backend: Option<BackendKind>,
 ) -> Result<()> {
     loop {
-        let value = audit_once(root, window_blocks, backend).await?;
-        println!("{}", serde_json::to_string(&value)?);
+        let line = serde_json::to_string(&audit_once(root, window_blocks, backend).await?)?;
+        if json {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
         tokio::time::sleep(interval).await;
     }
 }
@@ -283,7 +296,11 @@ async fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value> {
         .await
         .with_context(|| format!("decode {method}"))?;
     if let Some(error) = payload.get("error") {
-        bail!("{method}: {error}")
+        bail!(rpc::call_error(
+            method,
+            &payload,
+            format!("{method}: {error}")
+        ))
     }
     Ok(payload.get("result").cloned().unwrap_or(Value::Null))
 }

@@ -4,23 +4,26 @@ mod database;
 mod doctor;
 mod goldsky;
 mod mcp;
+mod output;
 mod project;
 mod replay;
 mod rpc;
 mod status;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use config::{
     ClickHouseSinkConfig, ContractConfig, DiscoveryRule, ProjectConfig, SinkConfig,
     validate_address, validate_alias,
 };
 use database::{Backend, BackendKind};
+use output::{CodedError, ErrorCode, Output};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitCode, Stdio},
 };
 use tokio::process::Command;
 
@@ -33,6 +36,9 @@ use tokio::process::Command;
 struct Cli {
     #[arg(long, global = true, default_value = ".")]
     project: PathBuf,
+    /// Print one JSON envelope on stdout: {schema_version, ok, command, data, warnings, error}.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -139,8 +145,6 @@ enum Commands {
     },
     Sql {
         query: String,
-        #[arg(long)]
-        json: bool,
         #[arg(long, default_value_t = 500)]
         max_rows: usize,
         #[arg(long = "attach", value_name = "ALIAS=DB")]
@@ -154,8 +158,6 @@ enum Commands {
         backend: Option<BackendKind>,
     },
     Status {
-        #[arg(long)]
-        json: bool,
         #[arg(long)]
         wait: bool,
         #[arg(long, default_value_t = 5)]
@@ -199,8 +201,6 @@ enum Commands {
     },
     RpcDoctor {
         #[arg(long)]
-        json: bool,
-        #[arg(long)]
         apply: bool,
     },
     /// Manage the ClickHouse tables that the Streamling ClickHouse sink writes.
@@ -222,9 +222,6 @@ enum ClickhouseCommand {
         index_blocks: bool,
         #[arg(long)]
         index_transactions: bool,
-        /// Print a JSON array of statements instead of SQL text.
-        #[arg(long)]
-        json: bool,
     },
     /// Create the project's ClickHouse database and tables; `dev` also does this.
     Apply,
@@ -297,8 +294,107 @@ struct AttachedDatabase {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+async fn main() -> ExitCode {
+    let run = execute(std::env::args_os()).await;
+    if run.json {
+        println!("{}", run.envelope());
+    } else if let Err(error) = &run.result {
+        // Same text as returning the error from `main`.
+        eprintln!("Error: {error:?}");
+    }
+    if run.result.is_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+struct Run {
+    json: bool,
+    command: String,
+    result: Result<Value>,
+    warnings: Vec<String>,
+}
+
+impl Run {
+    fn envelope(&self) -> Value {
+        output::envelope(&self.command, &self.result, &self.warnings)
+    }
+}
+
+/// Parses `args` and runs the command. Human output is printed as it happens; JSON mode
+/// prints nothing on stdout and leaves the envelope to the caller.
+async fn execute(args: impl IntoIterator<Item = impl Into<OsString>>) -> Run {
+    let args = args.into_iter().map(Into::into).collect::<Vec<OsString>>();
+    let matches = match Cli::command().try_get_matches_from(&args) {
+        Ok(matches) => matches,
+        Err(error) => {
+            let json = args.iter().any(|arg| arg == "--json");
+            if !json
+                || matches!(
+                    error.kind(),
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                )
+            {
+                error.exit()
+            }
+            let command = raw_command_path(&args);
+            // clap's text without the usage block, on one line.
+            let text = error.to_string();
+            let message = text.split("\n\nUsage:").next().unwrap_or_default();
+            let message = message.strip_prefix("error: ").unwrap_or(message);
+            let error = CodedError::new(
+                ErrorCode::Validation,
+                message.split_whitespace().collect::<Vec<_>>().join(" "),
+            )
+            .next(if command.is_empty() {
+                "streamling-blockchain --help".to_owned()
+            } else {
+                format!("streamling-blockchain {command} --help")
+            });
+            return Run {
+                json,
+                command,
+                result: Err(error.into()),
+                warnings: Vec::new(),
+            };
+        }
+    };
+    let mut path = Vec::new();
+    let mut sub = &matches;
+    while let Some((name, next)) = sub.subcommand() {
+        path.push(name);
+        sub = next;
+    }
+    let command = path.join(" ");
+    let cli = Cli::from_arg_matches(&matches).expect("matches come from the Cli definition");
+    let mut out = Output {
+        json: cli.json,
+        warnings: Vec::new(),
+    };
+    let result = dispatch(cli, &mut out).await;
+    Run {
+        json: out.json,
+        command,
+        result,
+        warnings: out.warnings,
+    }
+}
+
+/// The subcommand path in arguments that clap rejected, e.g. `clickhouse schema`.
+fn raw_command_path(args: &[OsString]) -> String {
+    let mut command = Cli::command();
+    let mut path = Vec::new();
+    for arg in args.iter().skip(1).filter_map(|arg| arg.to_str()) {
+        if let Some(sub) = command.find_subcommand(arg).cloned() {
+            path.push(sub.get_name().to_owned());
+            command = sub;
+        }
+    }
+    path.join(" ")
+}
+
+async fn dispatch(cli: Cli, out: &mut Output) -> Result<Value> {
     let root = absolute(&cli.project)?;
     match cli.command {
         Commands::Init {
@@ -321,26 +417,32 @@ async fn main() -> Result<()> {
             clickhouse_compression,
             clickhouse_database,
         } => {
-            let (rpc_url, rpc_url_env) = if let Some(chain_id) = goldsky_chain_id {
+            let (rpc_url, rpc_url_env, edge_endpoint) = if let Some(chain_id) = goldsky_chain_id {
                 let endpoint = goldsky_endpoint
                     .as_deref()
                     .unwrap_or("streamling-blockchain");
                 let url = goldsky::ensure_rpc(&goldsky_cli, endpoint, chain_id).await?;
-                println!("✓ Goldsky Edge endpoint ready: {endpoint} · chain {chain_id}");
-                (url, None)
+                out.line(format!(
+                    "✓ Goldsky Edge endpoint ready: {endpoint} · chain {chain_id}"
+                ));
+                (url, None, Some(endpoint.to_owned()))
             } else {
                 if goldsky_endpoint.is_some() {
-                    bail!("--goldsky-endpoint requires --goldsky-chain-id")
+                    bail!(CodedError::new(
+                        ErrorCode::Validation,
+                        "--goldsky-endpoint requires --goldsky-chain-id"
+                    ))
                 }
                 let url = if let Some(name) = &rpc_env {
                     std::env::var(name).with_context(|| format!("read ${name}"))?
                 } else {
                     explicit_rpc.unwrap_or_default()
                 };
-                (url, rpc_env)
+                (url, rpc_env, None)
             };
-            init(
+            let mut data = init(
                 &root,
+                out,
                 InitRequest {
                     address,
                     alias,
@@ -359,7 +461,9 @@ async fn main() -> Result<()> {
                     clickhouse_database,
                 },
             )
-            .await
+            .await?;
+            data["goldsky_endpoint"] = json!(edge_endpoint);
+            Ok(data)
         }
         Commands::InitRobinhood {
             assets_url,
@@ -377,6 +481,7 @@ async fn main() -> Result<()> {
         } => {
             init_robinhood(
                 &root,
+                out,
                 assets_url,
                 rpc,
                 rpc_env,
@@ -408,12 +513,12 @@ async fn main() -> Result<()> {
                 config,
                 ContractConfig {
                     alias: alias.clone(),
-                    address,
+                    address: address.clone(),
                     abi: PathBuf::from(format!("abis/{alias}.json")),
                 },
             )?;
-            println!("✓ contract added · alias {alias}");
-            Ok(())
+            out.line(format!("✓ contract added · alias {alias}"));
+            Ok(json!({"alias": alias, "address": address, "abi": target}))
         }
         Commands::AddDiscovery {
             parent_contract,
@@ -432,15 +537,22 @@ async fn main() -> Result<()> {
                 &root,
                 config,
                 DiscoveryRule {
-                    parent_contract,
-                    discovery_event,
+                    parent_contract: parent_contract.clone(),
+                    discovery_event: discovery_event.clone(),
                     address_field,
                     child_contract: child_contract.clone(),
                     child_abi: PathBuf::from(format!("abis/{child_contract}.json")),
                 },
             )?;
-            println!("✓ discovery rule added · dynamic table {child_contract}_contracts");
-            Ok(())
+            let table = format!("{child_contract}_contracts");
+            out.line(format!("✓ discovery rule added · dynamic table {table}"));
+            Ok(json!({
+                "parent_contract": parent_contract,
+                "discovery_event": discovery_event,
+                "child_contract": child_contract,
+                "table": table,
+                "abi": target,
+            }))
         }
         Commands::Dev {
             streamling,
@@ -451,6 +563,7 @@ async fn main() -> Result<()> {
         } => {
             run_streamling(
                 &root,
+                out,
                 &streamling,
                 plugin,
                 no_build,
@@ -458,11 +571,11 @@ async fn main() -> Result<()> {
                 exit_when_caught_up,
                 std::time::Duration::from_secs(exit_poll_seconds.max(1)),
             )
-            .await
+            .await?;
+            status::cached(&root)
         }
         Commands::Sql {
             query,
-            json: as_json,
             max_rows,
             attach,
             backend,
@@ -472,42 +585,36 @@ async fn main() -> Result<()> {
             match &backend {
                 Backend::Sqlite(conn) => attach_databases(conn, attach)?,
                 Backend::ClickHouse { .. } if !attach.is_empty() => {
-                    bail!("--attach works only with the SQLite backend")
+                    bail!(
+                        CodedError::new(
+                            ErrorCode::Validation,
+                            "--attach works only with the SQLite backend"
+                        )
+                        .next("streamling-blockchain sql --backend sqlite")
+                    )
                 }
                 Backend::ClickHouse { .. } => {}
             }
             let value = backend.query(&query, max_rows.min(10_000)).await?;
-            if as_json {
-                println!("{}", serde_json::to_string(&value)?);
-            } else {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            }
-            Ok(())
+            out.line(serde_json::to_string_pretty(&value)?);
+            Ok(value)
         }
         Commands::Schema { backend } => {
             let config = ProjectConfig::load(&root)?;
             let backend = Backend::open(&root, &config, backend)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&backend.schema().await?)?
-            );
+            let schema = backend.schema().await?;
+            out.line(serde_json::to_string_pretty(&schema)?);
             let semantics = std::fs::read_to_string(root.join("semantic.toml")).unwrap_or_default();
-            println!("\n{semantics}");
-            Ok(())
+            out.line(format!("\n{semantics}"));
+            Ok(json!({"schema": schema, "semantics": semantics}))
         }
-        Commands::Status {
-            json: as_json,
-            wait,
-            poll_seconds,
-        } => {
+        Commands::Status { wait, poll_seconds } => {
             let value = if wait {
                 status::wait(&root, std::time::Duration::from_secs(poll_seconds.max(1))).await?
             } else {
                 status::live(&root).await?
             };
-            if as_json {
-                println!("{}", serde_json::to_string(&value)?);
-            } else {
+            if !out.json {
                 let backfill = &value["backfill"];
                 println!(
                     "chain: {} ({})\ncontracts: {}\ndiscovery rules: {}\ndatabase: {} ({})\nclickhouse: {}\nbackfill: {}\nindexed through: {}\nsafe head: {}\nremaining blocks: {}\nprogress: {:.2}%",
@@ -544,13 +651,23 @@ async fn main() -> Result<()> {
                     backfill["progress_percent"].as_f64().unwrap_or(0.0),
                 );
             }
-            Ok(())
+            Ok(value)
         }
-        Commands::Mcp { backend } => mcp::run_stdio(root, backend).await,
+        Commands::Mcp { .. } if out.json => bail!(
+            CodedError::new(
+                ErrorCode::Validation,
+                "mcp speaks the MCP protocol on stdout and does not accept --json"
+            )
+            .next("streamling-blockchain mcp")
+        ),
+        Commands::Mcp { backend } => {
+            mcp::run_stdio(root, backend).await?;
+            Ok(Value::Null)
+        }
         Commands::Replay { from, to, backend } => {
             let value = replay::diff(&root, from, to, backend).await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
+            out.line(serde_json::to_string_pretty(&value)?);
+            Ok(value)
         }
         Commands::Audit {
             window_blocks,
@@ -560,37 +677,34 @@ async fn main() -> Result<()> {
         } => {
             if once {
                 let value = replay::audit_once(&root, window_blocks, backend).await?;
-                println!("{}", serde_json::to_string_pretty(&value)?);
-                Ok(())
+                out.line(serde_json::to_string_pretty(&value)?);
+                Ok(value)
             } else {
                 replay::audit_continuous(
                     &root,
+                    out.json,
                     std::time::Duration::from_secs(interval_seconds.max(1)),
                     window_blocks,
                     backend,
                 )
-                .await
+                .await?;
+                Ok(Value::Null)
             }
         }
         Commands::Semantics { command } => {
             let config = ProjectConfig::load(&root)?;
             project::write_semantics(&root, &config)?;
-            match command {
-                SemanticsCommand::Generate => {
-                    println!("✓ semantic.toml generated");
-                    Ok(())
-                }
-                SemanticsCommand::Check => {
-                    println!("✓ semantic.toml is valid for configured ABIs");
-                    Ok(())
-                }
-            }
+            out.line(match command {
+                SemanticsCommand::Generate => "✓ semantic.toml generated",
+                SemanticsCommand::Check => "✓ semantic.toml is valid for configured ABIs",
+            });
+            Ok(json!({"path": root.join("semantic.toml"), "valid": true}))
         }
         Commands::Abi { command } => match command {
             AbiCommand::Fetch {
                 address,
                 chain_id,
-                out,
+                out: path,
                 source,
                 etherscan_base_url,
                 etherscan_api_key_env,
@@ -629,31 +743,27 @@ async fn main() -> Result<()> {
                         .await?
                     }
                     AbiSource::Blockscout => {
-                        let base = blockscout_base_url.as_deref().context(
-                            "--blockscout-base-url is required with --source blockscout",
-                        )?;
+                        let base = blockscout_base_url.as_deref().ok_or_else(|| {
+                            CodedError::new(
+                                ErrorCode::Validation,
+                                "--blockscout-base-url is required with --source blockscout",
+                            )
+                        })?;
                         rpc::fetch_blockscout_abi(&client, &address, base).await?
                     }
                 };
-                if let Some(parent) = out.parent() {
+                if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::write(&out, serde_json::to_vec_pretty(&abi)?)?;
-                println!("✓ ABI written: {}", out.display());
-                Ok(())
+                std::fs::write(&path, serde_json::to_vec_pretty(&abi)?)?;
+                out.line(format!("✓ ABI written: {}", path.display()));
+                Ok(json!({"path": path, "address": address, "chain_id": chain_id}))
             }
         },
-        Commands::RpcDoctor {
-            json: as_json,
-            apply,
-        } => {
+        Commands::RpcDoctor { apply } => {
             let report = doctor::rpc_doctor(&root, apply).await?;
-            if as_json {
-                println!("{}", serde_json::to_string(&report)?);
-            } else {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            }
-            Ok(())
+            out.line(serde_json::to_string_pretty(&report)?);
+            Ok(report)
         }
         Commands::Clickhouse { command } => match command {
             ClickhouseCommand::Schema {
@@ -661,7 +771,6 @@ async fn main() -> Result<()> {
                 database,
                 index_blocks,
                 index_transactions,
-                json: as_json,
             } => {
                 validate_alias(&table).context("ClickHouse table")?;
                 if let Some(database) = &database {
@@ -673,31 +782,29 @@ async fn main() -> Result<()> {
                     index_blocks,
                     index_transactions,
                 );
-                if as_json {
-                    let sql = statements
+                for statement in &statements {
+                    out.line(format!("{};\n", statement.sql));
+                }
+                Ok(json!(
+                    statements
                         .iter()
                         .map(|s| s.sql.as_str())
-                        .collect::<Vec<_>>();
-                    println!("{}", serde_json::to_string_pretty(&sql)?);
-                } else {
-                    for statement in statements {
-                        println!("{};\n", statement.sql);
-                    }
-                }
-                Ok(())
+                        .collect::<Vec<_>>()
+                ))
             }
             ClickhouseCommand::Apply => {
                 let config = ProjectConfig::load(&root)?;
                 for warning in clickhouse::apply_schema(&config).await? {
-                    eprintln!("warning: {warning}");
+                    out.warn(warning);
                 }
-                println!("✓ ClickHouse tables ready");
-                Ok(())
+                out.line("✓ ClickHouse tables ready");
+                Ok(clickhouse_tables(&config))
             }
         },
         Commands::Doctor { streamling, plugin } => {
             run_streamling(
                 &root,
+                out,
                 &streamling,
                 plugin,
                 false,
@@ -705,12 +812,13 @@ async fn main() -> Result<()> {
                 false,
                 std::time::Duration::from_secs(5),
             )
-            .await
+            .await?;
+            Ok(json!({"valid": true, "pipeline": root.join("pipeline.yaml")}))
         }
     }
 }
 
-async fn init(root: &Path, request: InitRequest) -> Result<()> {
+async fn init(root: &Path, out: &Output, request: InitRequest) -> Result<Value> {
     let InitRequest {
         address,
         alias,
@@ -734,7 +842,10 @@ async fn init(root: &Path, request: InitRequest) -> Result<()> {
         validate_alias(&clickhouse_table).context("ClickHouse table")?;
     }
     if root.join("streamling-blockchain.toml").exists() {
-        bail!("project already exists at {}", root.display())
+        bail!(CodedError::new(
+            ErrorCode::Validation,
+            format!("project already exists at {}", root.display())
+        ))
     }
     std::fs::create_dir_all(root.join("abis"))?;
     std::fs::create_dir_all(root.join(".streamling-blockchain"))?;
@@ -745,7 +856,7 @@ async fn init(root: &Path, request: InitRequest) -> Result<()> {
         (!explicit_rpc.is_empty()).then_some(explicit_rpc.as_str()),
     )
     .await?;
-    println!("✓ chain detected: {chain}");
+    out.line(format!("✓ chain detected: {chain}"));
     let abi: Value = if let Some(path) = abi_path {
         serde_json::from_slice(
             &std::fs::read(&path).with_context(|| format!("read {}", path.display()))?,
@@ -759,7 +870,7 @@ async fn init(root: &Path, request: InitRequest) -> Result<()> {
         Some(value) => value,
         None => {
             let value = rpc::deployment_block(&client, &rpc_url, &address).await?;
-            println!("✓ deployment block: {value}");
+            out.line(format!("✓ deployment block: {value}"));
             value
         }
     };
@@ -773,7 +884,10 @@ async fn init(root: &Path, request: InitRequest) -> Result<()> {
         })
         .unwrap_or(0);
     if event_count == 0 {
-        bail!("ABI declares no events")
+        bail!(CodedError::new(
+            ErrorCode::Validation,
+            "ABI declares no events"
+        ))
     }
     let sinks = SinkConfig {
         sqlite: matches!(sink, SinkMode::Sqlite | SinkMode::Both),
@@ -811,13 +925,52 @@ async fn init(root: &Path, request: InitRequest) -> Result<()> {
     };
     config.save(root)?;
     project::write_generated_files(root, &config)?;
-    println!("✓ {event_count} events · pipeline, semantic layer, MCP skill scaffolded");
-    println!("✓ project state is restart-safe on persistent storage");
-    println!(
+    out.line(format!(
+        "✓ {event_count} events · pipeline, semantic layer, MCP skill scaffolded"
+    ));
+    out.line("✓ project state is restart-safe on persistent storage");
+    out.line(format!(
         "next: cargo build --release && streamling-blockchain --project {} dev",
         root.display()
-    );
-    Ok(())
+    ));
+    let mut data = project_summary(root, &config);
+    data["event_count"] = event_count.into();
+    Ok(data)
+}
+
+/// The `--json` result of `init` and `init-robinhood`.
+fn project_summary(root: &Path, config: &ProjectConfig) -> Value {
+    json!({
+        "project": root,
+        "config": root.join("streamling-blockchain.toml"),
+        "pipeline": root.join("pipeline.yaml"),
+        "semantics": root.join("semantic.toml"),
+        "chain": config.chain,
+        "chain_id": config.chain_id,
+        "contracts": config.contracts.iter().map(|c| &c.alias).collect::<Vec<_>>(),
+        "start_block": config.start_block,
+        "end_block": config.end_block,
+        "sinks": config.sinks,
+        "next": format!("streamling-blockchain --project {} dev", root.display()),
+    })
+}
+
+/// The `--json` result of `clickhouse apply`: the tables that now exist.
+fn clickhouse_tables(config: &ProjectConfig) -> Value {
+    let Some(sink) = &config.sinks.clickhouse else {
+        return Value::Null;
+    };
+    let tables = project::clickhouse_statements(
+        sink.database.as_deref(),
+        &sink.table,
+        config.index_blocks,
+        config.index_transactions,
+    )
+    .into_iter()
+    .filter(|statement| statement.sorting_key.is_some())
+    .map(|statement| statement.name)
+    .collect::<Vec<_>>();
+    json!({"database": sink.database, "tables": tables})
 }
 
 fn parse_attach(value: &str) -> Result<AttachedDatabase> {
@@ -852,6 +1005,7 @@ fn quote_identifier(value: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn init_robinhood(
     root: &Path,
+    out: &Output,
     assets_url: String,
     rpc_url: String,
     rpc_url_env: Option<String>,
@@ -864,9 +1018,12 @@ async fn init_robinhood(
     clickhouse_table: String,
     clickhouse_database: Option<String>,
     clickhouse_compression: Option<String>,
-) -> Result<()> {
+) -> Result<Value> {
     if root.join("streamling-blockchain.toml").exists() {
-        bail!("project already exists at {}", root.display())
+        bail!(CodedError::new(
+            ErrorCode::Validation,
+            format!("project already exists at {}", root.display())
+        ))
     }
     let client = rpc::client()?;
     let actual_rpc = if let Some(name) = &rpc_url_env {
@@ -877,7 +1034,10 @@ async fn init_robinhood(
     let chain_id =
         rpc::hex_u64(&rpc::rpc(&client, &actual_rpc, "eth_chainId", serde_json::json!([])).await?)?;
     if chain_id != 4663 {
-        bail!("Robinhood Stock Tokens expected chain 4663, got {chain_id}")
+        bail!(CodedError::new(
+            ErrorCode::Validation,
+            format!("Robinhood Stock Tokens expected chain 4663, got {chain_id}")
+        ))
     }
     let payload: Value = client
         .get(&assets_url)
@@ -956,22 +1116,24 @@ async fn init_robinhood(
     };
     config.save(root)?;
     project::write_generated_files(root, &config)?;
-    println!(
+    out.line(format!(
         "✓ {} Robinhood Stock Token contracts · unbounded project scaffolded",
         config.contracts.len()
-    );
-    println!("✓ start block: {start_block}; end block: none");
-    println!(
+    ));
+    out.line(format!("✓ start block: {start_block}; end block: none"));
+    out.line(format!(
         "next: cargo build --release && streamling-blockchain --project {} dev",
         root.display()
-    );
-    Ok(())
+    ));
+    Ok(project_summary(root, &config))
 }
 
 const ERC20_TRANSFER_ABI: &str = r#"[{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"from","type":"address"},{"indexed":true,"internalType":"address","name":"to","type":"address"},{"indexed":false,"internalType":"uint256","name":"value","type":"uint256"}],"name":"Transfer","type":"event"}]"#;
 
+#[allow(clippy::too_many_arguments)]
 async fn run_streamling(
     root: &Path,
+    out: &mut Output,
     streamling: &Path,
     plugin: Option<PathBuf>,
     no_build: bool,
@@ -986,6 +1148,7 @@ async fn run_streamling(
     if !plugin.exists() && !no_build {
         let status = Command::new("cargo")
             .args(["build", "--release", "-p", "streamling-blockchain-plugin"])
+            .stdout(out.child_stdout())
             .status()
             .await?;
         if !status.success() {
@@ -993,11 +1156,17 @@ async fn run_streamling(
         }
     }
     if !plugin.exists() {
-        bail!("plugin library not found: {}", plugin.display())
+        bail!(
+            CodedError::new(
+                ErrorCode::NotFound,
+                format!("plugin library not found: {}", plugin.display())
+            )
+            .next("cargo build --release -p streamling-blockchain-plugin")
+        )
     }
     let config = ProjectConfig::load(root)?;
     if !validate && config.sinks.clickhouse.is_some() {
-        prepare_clickhouse(&config).await?;
+        prepare_clickhouse(&config, out).await?;
     }
     let mut command = Command::new(streamling);
     command
@@ -1014,7 +1183,7 @@ async fn run_streamling(
     }
     command
         .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
+        .stdout(out.child_stdout())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
     let mut child = command
@@ -1031,7 +1200,10 @@ async fn run_streamling(
         return Ok(());
     }
     if config.end_block.is_none() {
-        bail!("--exit-when-caught-up requires a bounded project with end_block")
+        bail!(CodedError::new(
+            ErrorCode::Validation,
+            "--exit-when-caught-up requires a bounded project with end_block"
+        ))
     }
     loop {
         tokio::select! {
@@ -1057,18 +1229,18 @@ async fn run_streamling(
 
 /// Creates the ClickHouse tables with the project's sorting key before the sink can create
 /// them with its default key.
-async fn prepare_clickhouse(config: &ProjectConfig) -> Result<()> {
+async fn prepare_clickhouse(config: &ProjectConfig, out: &mut Output) -> Result<()> {
     if std::env::var_os(clickhouse::URL_ENV).is_none() {
-        eprintln!(
-            "warning: {} is not set, so ClickHouse tables were not prepared; Streamling will create missing tables ordered by their primary key only",
+        out.warn(format!(
+            "{} is not set, so ClickHouse tables were not prepared; Streamling will create missing tables ordered by their primary key only",
             clickhouse::URL_ENV
-        );
+        ));
         return Ok(());
     }
     for warning in clickhouse::apply_schema(config).await? {
-        eprintln!("warning: {warning}");
+        out.warn(warning);
     }
-    println!("✓ ClickHouse tables ready");
+    out.line("✓ ClickHouse tables ready");
     Ok(())
 }
 
@@ -1137,5 +1309,122 @@ fn absolute_from(root: &Path, path: &Path) -> PathBuf {
         path.to_path_buf()
     } else {
         root.join(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal project whose SQLite sink database the test writes itself.
+    fn sqlite_project(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "streamling-blockchain-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".streamling-blockchain")).unwrap();
+        std::fs::write(
+            root.join("streamling-blockchain.toml"),
+            "chain = \"ethereum\"\nchain_id = 1\nrpc_url = \"http://127.0.0.1:9\"\ndatabase = \".streamling-blockchain/events.db\"\nstart_block = 0\n\n[[contracts]]\nalias = \"token\"\naddress = \"0x1111111111111111111111111111111111111111\"\nabi = \"abis/token.json\"\n",
+        )
+        .unwrap();
+        root
+    }
+
+    async fn run_json(args: &[&str]) -> Value {
+        let run =
+            execute(std::iter::once("streamling-blockchain").chain(args.iter().copied())).await;
+        assert!(run.json);
+        run.envelope()
+    }
+
+    #[tokio::test]
+    async fn sql_json_wraps_rows_and_codes_failures() {
+        let root = sqlite_project("sql-json");
+        let project = root.to_str().unwrap();
+        let database = root.join(".streamling-blockchain/events.db");
+
+        let missing = run_json(&["--project", project, "sql", "SELECT 1", "--json"]).await;
+        assert_eq!(missing["ok"], false);
+        assert_eq!(missing["error"]["code"], "not_found");
+        assert_eq!(
+            missing["error"]["suggested_next"],
+            "streamling-blockchain dev"
+        );
+
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE events (event_name TEXT); INSERT INTO events VALUES ('Transfer'), ('Approval');",
+            )
+            .unwrap();
+        let rows = run_json(&[
+            "--project",
+            project,
+            "sql",
+            "--json",
+            "SELECT event_name FROM events ORDER BY event_name",
+        ])
+        .await;
+        assert_eq!(
+            rows,
+            json!({
+                "schema_version": 1,
+                "ok": true,
+                "command": "sql",
+                "data": {
+                    "columns": ["event_name"],
+                    "rows": [{"event_name": "Approval"}, {"event_name": "Transfer"}],
+                    "truncated": false
+                },
+                "warnings": [],
+                "error": null
+            })
+        );
+
+        let bad_sql = run_json(&["--json", "--project", project, "sql", "SELEC 1"]).await;
+        assert_eq!(bad_sql["error"]["code"], "validation");
+        let write = run_json(&["--json", "--project", project, "sql", "DELETE FROM events"]).await;
+        assert_eq!(write["error"]["code"], "validation");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mcp_refuses_json() {
+        let value = run_json(&["mcp", "--json"]).await;
+        assert_eq!(value["command"], "mcp");
+        assert_eq!(value["error"]["code"], "validation");
+    }
+
+    #[tokio::test]
+    async fn json_argument_errors_are_validation_envelopes() {
+        let value = run_json(&["--json", "clickhouse", "schema", "--bogus"]).await;
+        assert_eq!(value["command"], "clickhouse schema");
+        assert_eq!(value["error"]["code"], "validation");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("unexpected argument '--bogus' found")
+        );
+        assert_eq!(
+            value["error"]["suggested_next"],
+            "streamling-blockchain clickhouse schema --help"
+        );
+    }
+
+    #[tokio::test]
+    async fn clickhouse_schema_data_is_the_statement_list() {
+        let value = run_json(&["clickhouse", "schema", "--database", "analytics", "--json"]).await;
+        assert_eq!(value["command"], "clickhouse schema");
+        let statements = value["data"].as_array().unwrap();
+        assert!(
+            statements[0]
+                .as_str()
+                .unwrap()
+                .starts_with("CREATE DATABASE")
+        );
     }
 }

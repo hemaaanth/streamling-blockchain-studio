@@ -57,7 +57,10 @@ class ClickHouseSyncTests(unittest.TestCase):
         self.assertIn("discovered_address", [column[0] for column in cursor.description])
 
     def test_schema_comes_from_the_cli(self) -> None:
-        completed = mock.MagicMock(stdout='["CREATE DATABASE IF NOT EXISTS megapot_analytics"]')
+        completed = mock.MagicMock(
+            stdout='{"schema_version": 1, "ok": true, "command": "clickhouse schema", '
+            '"data": ["CREATE DATABASE IF NOT EXISTS megapot_analytics"], "warnings": [], "error": null}'
+        )
         with mock.patch.object(sync.subprocess, "run", return_value=completed) as run:
             statements = sync.schema_statements(Path("/bin/streamling-blockchain"))
         self.assertEqual(statements, ["CREATE DATABASE IF NOT EXISTS megapot_analytics"])

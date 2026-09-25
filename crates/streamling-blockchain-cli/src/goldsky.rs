@@ -1,3 +1,4 @@
+use crate::output::{CodedError, ErrorCode};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 use tokio::process::Command;
@@ -22,21 +23,21 @@ pub async fn ensure_rpc(cli: &Path, endpoint_name: &str, chain_id: u64) -> Resul
         )
         .await?;
         if !created.status.success() {
-            bail!(
+            bail!(command_failure(format!(
                 "Goldsky could not create Edge endpoint '{}': {}",
                 endpoint_name,
                 command_error(&created)
-            );
+            )));
         }
     }
 
     let revealed = run(cli, &["edge", "reveal", endpoint_name, "--color", "false"]).await?;
     if !revealed.status.success() {
-        bail!(
+        bail!(command_failure(format!(
             "Goldsky could not reveal Edge endpoint '{}': {}",
             endpoint_name,
             command_error(&revealed)
-        );
+        )));
     }
     let revealed_stdout =
         String::from_utf8(revealed.stdout).context("Goldsky Edge key was not UTF-8")?;
@@ -61,10 +62,13 @@ async fn ensure_edge_capability(cli: &Path) -> Result<()> {
     let output = run(cli, &["edge", "--help"]).await?;
     let help = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() || !help.contains("goldsky edge create") {
-        bail!(
-            "{} does not provide `goldsky edge`; install Goldsky CLI 13.9.0 or newer from https://docs.goldsky.com/installation",
-            cli.display()
-        )
+        bail!(CodedError::new(
+            ErrorCode::NotFound,
+            format!(
+                "{} does not provide `goldsky edge`; install Goldsky CLI 13.9.0 or newer from https://docs.goldsky.com/installation",
+                cli.display()
+            )
+        ))
     }
     Ok(())
 }
@@ -75,6 +79,27 @@ async fn run(cli: &Path, arguments: &[&str]) -> Result<std::process::Output> {
         .output()
         .await
         .with_context(|| format!("run {} {}", cli.display(), arguments.join(" ")))
+}
+
+/// A failed Goldsky command; an unauthenticated CLI is a credentials problem.
+fn command_failure(message: String) -> anyhow::Error {
+    let lower = message.to_ascii_lowercase();
+    if [
+        "login",
+        "log in",
+        "logged in",
+        "unauthorized",
+        "unauthenticated",
+    ]
+    .iter()
+    .any(|hint| lower.contains(hint))
+    {
+        CodedError::new(ErrorCode::MissingCredentials, message)
+            .next("goldsky login")
+            .into()
+    } else {
+        anyhow::Error::msg(message)
+    }
 }
 
 fn command_error(output: &std::process::Output) -> String {
@@ -94,7 +119,10 @@ fn validate_endpoint_name(name: &str) -> Result<()> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     {
-        bail!("Goldsky endpoint names may contain only letters, numbers, '-' and '_'")
+        bail!(CodedError::new(
+            ErrorCode::Validation,
+            "Goldsky endpoint names may contain only letters, numbers, '-' and '_'"
+        ))
     }
     Ok(())
 }

@@ -87,7 +87,7 @@ streamling-blockchain --project ./my-project init \
 
 `--sink sqlite` is the default local mode and is enough for the included Evidence pages. `--sink clickhouse` writes only through Streamling's built-in ClickHouse sink; `--sink both` keeps the local SQLite database and adds a ClickHouse sidecar sink. The Evidence app supports both SQLite and ClickHouse connectors: use SQLite sources for local project files, and add ClickHouse sources when the project is intentionally writing to a warehouse. Configure the ClickHouse sink with Streamling's environment variables, including `STREAMLING__CLICKHOUSE_SINK__URL`, `STREAMLING__CLICKHOUSE_SINK__USER`, `STREAMLING__CLICKHOUSE_SINK__PASSWORD`, and `STREAMLING__CLICKHOUSE_SINK__DATABASE`. The CLI writes readable schema files under `clickhouse/`: `<table>.sql` for decoded events, and `<table>_blocks.sql` / `<table>_transactions.sql` when block or transaction indexing is enabled.
 
-Before starting Streamling, `dev` creates the configured database and these tables when they do not exist; `streamling-blockchain --project <dir> clickhouse apply` does the same on its own. This matters because Streamling's sink otherwise creates missing tables ordered by their primary key alone. The tables use `ReplacingMergeTree(insert_time, is_deleted)`, which makes Streamling's at-least-once redelivery idempotent. They are partitioned by month and sorted by chain, contract alias, event name, and block, ending with the row ID, so filtered and `FINAL` reads touch fewer parts. Read current rows with `FROM <table> FINAL WHERE is_deleted = 0`. `CREATE TABLE IF NOT EXISTS` never changes an existing table, so `dev` warns when an existing table has a different sorting key; recreate it to adopt the new key. `streamling-blockchain clickhouse schema --database <db> --table <table> [--index-blocks] [--index-transactions] [--json]` prints the same DDL without a project.
+Before starting Streamling, `dev` creates the configured database and these tables when they do not exist; `streamling-blockchain --project <dir> clickhouse apply` does the same on its own. This matters because Streamling's sink otherwise creates missing tables ordered by their primary key alone. The tables use `ReplacingMergeTree(insert_time, is_deleted)`, which makes Streamling's at-least-once redelivery idempotent. They are partitioned by month and sorted by chain, contract alias, event name, and block, ending with the row ID, so filtered and `FINAL` reads touch fewer parts. Read current rows with `FROM <table> FINAL WHERE is_deleted = 0`. `CREATE TABLE IF NOT EXISTS` never changes an existing table, so `dev` warns when an existing table has a different sorting key; recreate it to adopt the new key. `streamling-blockchain clickhouse schema --database <db> --table <table> [--index-blocks] [--index-transactions]` prints the same DDL without a project.
 
 Use `--end-block` for bounded demos and reproducible backfills. `streamling-blockchain dev --exit-when-caught-up` turns a bounded project into a batch job: once the indexed height reaches the safe `end_block`, the wrapper stops Streamling and exits. Use `--index-blocks` when dashboards need chain context beyond decoded logs. Use `--index-transactions` when dashboards need transaction inputs, sender/recipient/value, and receipt fields such as status, gas used, effective gas price, contract creation address, and log count. These flags add `streamling_blockchain.evm_blocks` and `streamling_blockchain.evm_transactions` sources and write rows with `chain_id` to the same SQLite database through the existing `streamling_blockchain.sqlite_sink`.
 
@@ -146,18 +146,18 @@ streamling-blockchain --project ./my-project add-discovery \
 ## Query and inspect
 
 ```sh
-streamling-blockchain --project ./my-project status --json
+streamling-blockchain --project ./my-project status
 streamling-blockchain --project ./my-project status --wait
 streamling-blockchain --project ./my-project audit --once --window-blocks 1000
 streamling-blockchain --project ./my-project audit --window-blocks 1000 --interval-seconds 300
 streamling-blockchain --project ./my-project schema
-streamling-blockchain --project ./my-project sql --json \
+streamling-blockchain --project ./my-project sql \
   'SELECT event_name, count(*) AS events FROM events GROUP BY event_name LIMIT 20'
-streamling-blockchain --project ./my-project sql --json \
+streamling-blockchain --project ./my-project sql \
   'SELECT chain_id, block_number, block_timestamp, transaction_count FROM evm_blocks ORDER BY block_number DESC LIMIT 20'
-streamling-blockchain --project ./my-project sql --json \
+streamling-blockchain --project ./my-project sql \
   'SELECT chain_id, block_number, transaction_index, from_address, to_address, receipt_status, receipt_gas_used FROM evm_transactions ORDER BY block_number DESC, transaction_index DESC LIMIT 20'
-streamling-blockchain --project ./my-project sql --json \
+streamling-blockchain --project ./my-project sql \
   --attach base=../base/.streamling-blockchain/events.db \
   --attach arbitrum=../arbitrum/.streamling-blockchain/events.db \
   'SELECT chain_id, count(*) AS events FROM events GROUP BY chain_id
@@ -167,7 +167,7 @@ streamling-blockchain --project ./my-project sql --json \
    SELECT chain_id, count(*) AS events FROM arbitrum.events GROUP BY chain_id'
 streamling-blockchain --project ./my-project replay --from 1000000 --to 1000100
 streamling-blockchain --project ./my-project semantics check
-streamling-blockchain --project ./my-project rpc-doctor --json --apply
+streamling-blockchain --project ./my-project rpc-doctor --apply
 streamling-blockchain --project ./my-project mcp
 ```
 
@@ -175,7 +175,7 @@ streamling-blockchain --project ./my-project mcp
 
 ```sh
 streamling-blockchain --project ./my-project schema --backend clickhouse
-streamling-blockchain --project ./my-project sql --backend clickhouse --json \
+streamling-blockchain --project ./my-project sql --backend clickhouse \
   "SELECT event_name, count() AS events FROM events FINAL WHERE is_deleted = 0 GROUP BY event_name"
 streamling-blockchain --project ./my-project audit --backend clickhouse --once --window-blocks 1000
 ```
@@ -191,6 +191,25 @@ npm --prefix demos/robinhood-stock-tokens run build
 `sources:sqlite` symlinks Evidence's local `events.db` source file to the generated project database, then lets Evidence's SQLite connector build its normal Parquet extracts. Evidence reads SQLite directly; no SQLite-to-ClickHouse sync path is involved.
 
 MCP is available over stdio with the tools `streamling_blockchain_schema`, `streamling_blockchain_query`, and `streamling_blockchain_status`. `replay` refetches a closed block range and reports missing, extra, or changed local events without mutating the database. `audit` continuously replays the latest closed window and one older sampled window, then stores summaries in `quality_replay_checks`. `rpc-doctor --apply` writes a lower working `window` when the configured `eth_getLogs` range is too wide for the RPC provider.
+
+## JSON output
+
+Every command accepts `--json` in any position. stdout then carries exactly one JSON object, and the exit code is non-zero on failure:
+
+```json
+{"schema_version":1,"ok":true,"command":"sql","data":{"columns":["n"],"rows":[{"n":1}],"truncated":false},"warnings":[],"error":null}
+{"schema_version":1,"ok":false,"command":"sql","data":null,"warnings":[],"error":{"code":"not_found","message":"database does not exist yet: run `streamling-blockchain dev`","retryable":false,"suggested_next":"streamling-blockchain dev"}}
+```
+
+`command` is the subcommand path, such as `clickhouse schema`. `data` holds the result: rows for `sql`, the status object for `status`, the report for `rpc-doctor`, the statement list for `clickhouse schema`, and the paths and facts that the `✓` lines state for commands such as `init` and `abi fetch`. `warnings` collects what human mode prints as `warning:` on stderr. `error.code` is one of:
+
+- `validation`: bad arguments, configuration, or SQL, or a write refused by a read-only surface.
+- `not_found`: a missing project, database, ABI, contract, or binary.
+- `missing_credentials`: an unset credential environment variable, a Goldsky CLI that is not logged in, or rejected ClickHouse credentials.
+- `transient_dependency`: an RPC, ClickHouse, ABI explorer, or Goldsky call that failed, timed out, or was rate limited. Only this code sets `retryable: true`.
+- `internal`: anything else.
+
+`dev`, `doctor`, `status --wait`, and `audit` without `--once` send Streamling's output and progress lines to stderr in JSON mode and print the envelope when they exit; `dev` returns the final status in `data`. `mcp` owns stdout for the MCP protocol and refuses `--json`.
 
 
 Each initialized project contains:
