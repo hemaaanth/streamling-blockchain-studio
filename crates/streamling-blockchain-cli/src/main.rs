@@ -1,3 +1,4 @@
+mod clickhouse;
 mod config;
 mod database;
 mod doctor;
@@ -14,6 +15,7 @@ use config::{
     ClickHouseSinkConfig, ContractConfig, DiscoveryRule, ProjectConfig, SinkConfig,
     validate_address, validate_alias,
 };
+use database::{Backend, BackendKind};
 
 use serde_json::Value;
 use std::{
@@ -143,8 +145,14 @@ enum Commands {
         max_rows: usize,
         #[arg(long = "attach", value_name = "ALIAS=DB")]
         attach: Vec<String>,
+        /// Sink to query; defaults to SQLite when enabled, otherwise ClickHouse.
+        #[arg(long, value_enum)]
+        backend: Option<BackendKind>,
     },
-    Schema,
+    Schema {
+        #[arg(long, value_enum)]
+        backend: Option<BackendKind>,
+    },
     Status {
         #[arg(long)]
         json: bool,
@@ -153,7 +161,10 @@ enum Commands {
         #[arg(long, default_value_t = 5)]
         poll_seconds: u64,
     },
-    Mcp,
+    Mcp {
+        #[arg(long, value_enum)]
+        backend: Option<BackendKind>,
+    },
     Doctor {
         #[arg(long, default_value = "streamling")]
         streamling: PathBuf,
@@ -165,6 +176,8 @@ enum Commands {
         from: u64,
         #[arg(long)]
         to: u64,
+        #[arg(long, value_enum)]
+        backend: Option<BackendKind>,
     },
     Audit {
         #[arg(long, default_value_t = 1_000)]
@@ -173,6 +186,8 @@ enum Commands {
         interval_seconds: u64,
         #[arg(long)]
         once: bool,
+        #[arg(long, value_enum)]
+        backend: Option<BackendKind>,
     },
     Semantics {
         #[command(subcommand)]
@@ -188,6 +203,31 @@ enum Commands {
         #[arg(long)]
         apply: bool,
     },
+    /// Manage the ClickHouse tables that the Streamling ClickHouse sink writes.
+    Clickhouse {
+        #[command(subcommand)]
+        command: ClickhouseCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClickhouseCommand {
+    /// Print the ClickHouse DDL for a sink table set; no project is needed.
+    Schema {
+        #[arg(long, default_value = "events")]
+        table: String,
+        #[arg(long)]
+        database: Option<String>,
+        #[arg(long)]
+        index_blocks: bool,
+        #[arg(long)]
+        index_transactions: bool,
+        /// Print a JSON array of statements instead of SQL text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create the project's ClickHouse database and tables; `dev` also does this.
+    Apply,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -425,11 +465,18 @@ async fn main() -> Result<()> {
             json: as_json,
             max_rows,
             attach,
+            backend,
         } => {
             let config = ProjectConfig::load(&root)?;
-            let conn = database::open(&config.absolute_database(&root))?;
-            attach_databases(&conn, attach)?;
-            let value = database::query(&conn, &query, max_rows.min(10_000))?;
+            let backend = Backend::open(&root, &config, backend)?;
+            match &backend {
+                Backend::Sqlite(conn) => attach_databases(conn, attach)?,
+                Backend::ClickHouse { .. } if !attach.is_empty() => {
+                    bail!("--attach works only with the SQLite backend")
+                }
+                Backend::ClickHouse { .. } => {}
+            }
+            let value = backend.query(&query, max_rows.min(10_000)).await?;
             if as_json {
                 println!("{}", serde_json::to_string(&value)?);
             } else {
@@ -437,12 +484,12 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Commands::Schema => {
+        Commands::Schema { backend } => {
             let config = ProjectConfig::load(&root)?;
-            let conn = database::open(&config.absolute_database(&root))?;
+            let backend = Backend::open(&root, &config, backend)?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&database::schema(&conn)?)?
+                serde_json::to_string_pretty(&backend.schema().await?)?
             );
             let semantics = std::fs::read_to_string(root.join("semantic.toml")).unwrap_or_default();
             println!("\n{semantics}");
@@ -463,16 +510,26 @@ async fn main() -> Result<()> {
             } else {
                 let backfill = &value["backfill"];
                 println!(
-                    "chain: {} ({})\ncontracts: {}\ndiscovery rules: {}\ndatabase: {} ({})\nbackfill: {}\nindexed through: {}\nsafe head: {}\nremaining blocks: {}\nprogress: {:.2}%",
+                    "chain: {} ({})\ncontracts: {}\ndiscovery rules: {}\ndatabase: {} ({})\nclickhouse: {}\nbackfill: {}\nindexed through: {}\nsafe head: {}\nremaining blocks: {}\nprogress: {:.2}%",
                     value["chain"].as_str().unwrap_or("unknown"),
                     value["chain_id"],
                     value["contracts"].as_array().map_or(0, Vec::len),
                     value["discovery_rules"].as_array().map_or(0, Vec::len),
                     value["database"].as_str().unwrap_or("unknown"),
-                    if value["database_ready"].as_bool() == Some(true) {
+                    if value["sinks"]["sqlite"].as_bool() == Some(false) {
+                        "SQLite sink disabled"
+                    } else if value["database_ready"].as_bool() == Some(true) {
                         "ready"
                     } else {
                         "not created"
+                    },
+                    match &value["sinks"]["clickhouse"] {
+                        Value::Object(sink) => match sink.get("database").and_then(Value::as_str) {
+                            Some(database) =>
+                                format!("{database}.{}", sink["table"].as_str().unwrap_or("events")),
+                            None => sink["table"].as_str().unwrap_or("events").to_owned(),
+                        },
+                        _ => "not configured".to_owned(),
                     },
                     backfill["state"].as_str().unwrap_or("unknown"),
                     backfill["indexed_through"]
@@ -489,9 +546,9 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Commands::Mcp => mcp::run_stdio(root),
-        Commands::Replay { from, to } => {
-            let value = replay::diff(&root, from, to).await?;
+        Commands::Mcp { backend } => mcp::run_stdio(root, backend).await,
+        Commands::Replay { from, to, backend } => {
+            let value = replay::diff(&root, from, to, backend).await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
@@ -499,9 +556,10 @@ async fn main() -> Result<()> {
             window_blocks,
             interval_seconds,
             once,
+            backend,
         } => {
             if once {
-                let value = replay::audit_once(&root, window_blocks).await?;
+                let value = replay::audit_once(&root, window_blocks, backend).await?;
                 println!("{}", serde_json::to_string_pretty(&value)?);
                 Ok(())
             } else {
@@ -509,6 +567,7 @@ async fn main() -> Result<()> {
                     &root,
                     std::time::Duration::from_secs(interval_seconds.max(1)),
                     window_blocks,
+                    backend,
                 )
                 .await
             }
@@ -596,6 +655,46 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Commands::Clickhouse { command } => match command {
+            ClickhouseCommand::Schema {
+                table,
+                database,
+                index_blocks,
+                index_transactions,
+                json: as_json,
+            } => {
+                validate_alias(&table).context("ClickHouse table")?;
+                if let Some(database) = &database {
+                    validate_alias(database).context("ClickHouse database")?;
+                }
+                let statements = project::clickhouse_statements(
+                    database.as_deref(),
+                    &table,
+                    index_blocks,
+                    index_transactions,
+                );
+                if as_json {
+                    let sql = statements
+                        .iter()
+                        .map(|s| s.sql.as_str())
+                        .collect::<Vec<_>>();
+                    println!("{}", serde_json::to_string_pretty(&sql)?);
+                } else {
+                    for statement in statements {
+                        println!("{};\n", statement.sql);
+                    }
+                }
+                Ok(())
+            }
+            ClickhouseCommand::Apply => {
+                let config = ProjectConfig::load(&root)?;
+                for warning in clickhouse::apply_schema(&config).await? {
+                    eprintln!("warning: {warning}");
+                }
+                println!("✓ ClickHouse tables ready");
+                Ok(())
+            }
+        },
         Commands::Doctor { streamling, plugin } => {
             run_streamling(
                 &root,
@@ -750,6 +849,7 @@ fn attach_databases(conn: &rusqlite::Connection, values: Vec<String>) -> Result<
 fn quote_identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
+#[allow(clippy::too_many_arguments)]
 async fn init_robinhood(
     root: &Path,
     assets_url: String,
@@ -896,6 +996,9 @@ async fn run_streamling(
         bail!("plugin library not found: {}", plugin.display())
     }
     let config = ProjectConfig::load(root)?;
+    if !validate && config.sinks.clickhouse.is_some() {
+        prepare_clickhouse(&config).await?;
+    }
     let mut command = Command::new(streamling);
     command
         .current_dir(root)
@@ -950,6 +1053,23 @@ async fn run_streamling(
             }
         }
     }
+}
+
+/// Creates the ClickHouse tables with the project's sorting key before the sink can create
+/// them with its default key.
+async fn prepare_clickhouse(config: &ProjectConfig) -> Result<()> {
+    if std::env::var_os(clickhouse::URL_ENV).is_none() {
+        eprintln!(
+            "warning: {} is not set, so ClickHouse tables were not prepared; Streamling will create missing tables ordered by their primary key only",
+            clickhouse::URL_ENV
+        );
+        return Ok(());
+    }
+    for warning in clickhouse::apply_schema(config).await? {
+        eprintln!("warning: {warning}");
+    }
+    println!("✓ ClickHouse tables ready");
+    Ok(())
 }
 
 async fn stop_streamling(child: &mut tokio::process::Child, streamling: &Path) -> Result<()> {

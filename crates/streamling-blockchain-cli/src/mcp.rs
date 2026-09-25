@@ -1,16 +1,19 @@
-use crate::{config::ProjectConfig, database, status};
+use crate::{
+    config::ProjectConfig,
+    database::{Backend, BackendKind},
+    status,
+};
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use std::{
-    io::{BufRead, Write},
+    io::Write,
     path::{Path, PathBuf},
 };
+use tokio::io::AsyncBufReadExt;
 
-pub fn run_stdio(root: PathBuf) -> Result<()> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line?;
+pub async fn run_stdio(root: PathBuf, backend: Option<BackendKind>) -> Result<()> {
+    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
         }
@@ -18,7 +21,8 @@ pub fn run_stdio(root: PathBuf) -> Result<()> {
         if request.get("id").is_none() {
             continue;
         }
-        let response = dispatch(&root, request);
+        let response = dispatch(&root, backend, request).await;
+        let mut stdout = std::io::stdout().lock();
         serde_json::to_writer(&mut stdout, &response)?;
         stdout.write_all(b"\n")?;
         stdout.flush()?;
@@ -26,7 +30,7 @@ pub fn run_stdio(root: PathBuf) -> Result<()> {
     Ok(())
 }
 
-pub fn dispatch(root: &Path, request: Value) -> Value {
+pub async fn dispatch(root: &Path, backend: Option<BackendKind>, request: Value) -> Value {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     let result = match method {
@@ -37,17 +41,21 @@ pub fn dispatch(root: &Path, request: Value) -> Value {
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(tool_list()),
-        "tools/call" => call_tool(
-            root,
-            request
-                .pointer("/params/name")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            request
-                .pointer("/params/arguments")
-                .cloned()
-                .unwrap_or_else(|| json!({})),
-        ),
+        "tools/call" => {
+            call_tool(
+                root,
+                backend,
+                request
+                    .pointer("/params/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                request
+                    .pointer("/params/arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            )
+            .await
+        }
         _ => Err(anyhow::anyhow!("unknown MCP method: {method}")),
     };
     match result {
@@ -62,12 +70,12 @@ fn tool_list() -> Value {
     json!({"tools": [
         {
             "name": "streamling_blockchain_schema",
-            "description": "Read the live SQLite schema plus governed semantic descriptions before writing SQL.",
+            "description": "Read the live database schema, its SQL dialect, and governed semantic descriptions before writing SQL.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         },
         {
             "name": "streamling_blockchain_query",
-            "description": "Run read-only SQL against locally indexed EVM event tables.",
+            "description": "Run read-only SQL against indexed EVM event tables in the configured SQLite or ClickHouse sink.",
             "inputSchema": {"type": "object", "properties": {
                 "sql": {"type": "string"}, "max_rows": {"type": "integer", "minimum": 1, "maximum": 1000}
             }, "required": ["sql"], "additionalProperties": false}
@@ -80,13 +88,18 @@ fn tool_list() -> Value {
     ]})
 }
 
-fn call_tool(root: &Path, name: &str, arguments: Value) -> Result<Value> {
+async fn call_tool(
+    root: &Path,
+    backend: Option<BackendKind>,
+    name: &str,
+    arguments: Value,
+) -> Result<Value> {
     let payload = match name {
         "streamling_blockchain_schema" => {
             let config = ProjectConfig::load(root)?;
-            let conn = database::open(&config.absolute_database(root))?;
+            let backend = Backend::open(root, &config, backend)?;
             let semantics = std::fs::read_to_string(root.join("semantic.toml")).unwrap_or_default();
-            json!({"schema": database::schema(&conn)?, "semantics": semantics})
+            json!({"schema": backend.schema().await?, "semantics": semantics})
         }
         "streamling_blockchain_query" => {
             let sql = arguments
@@ -100,8 +113,9 @@ fn call_tool(root: &Path, name: &str, arguments: Value) -> Result<Value> {
                 .unwrap_or(200)
                 .min(1000) as usize;
             let config = ProjectConfig::load(root)?;
-            let conn = database::open(&config.absolute_database(root))?;
-            database::query(&conn, sql, max_rows)?
+            Backend::open(root, &config, backend)?
+                .query(sql, max_rows)
+                .await?
         }
         "streamling_blockchain_status" => status::cached(root)?,
         _ => bail!("unknown tool: {name}"),

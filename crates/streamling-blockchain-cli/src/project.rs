@@ -272,64 +272,85 @@ fn write_clickhouse_schemas(
 ) -> Result<()> {
     let schema_dir = root.join("clickhouse");
     std::fs::create_dir_all(&schema_dir)?;
-    if let Some(db) = database {
+    for statement in
+        clickhouse_statements(database, events_table, include_blocks, include_transactions)
+    {
         std::fs::write(
-            schema_dir.join("database.sql"),
-            format!("CREATE DATABASE IF NOT EXISTS {db};\n"),
+            schema_dir.join(format!("{}.sql", statement.name)),
+            format!("{};\n", statement.sql),
         )?;
     }
-    write_clickhouse_schema_file(
-        root,
-        events_table,
-        clickhouse_qualified(database, events_table),
-        "  event_id String,\n  chain_id UInt64,\n  contract_alias String,\n  event_name String,\n  address String,\n  block_number UInt64,\n  block_hash String,\n  block_timestamp UInt64,\n  tx_hash String,\n  log_index UInt64,\n  topic0 String,\n  fields_json String,\n  discovered_address Nullable(String),\n  discovery_rule Nullable(String),\n  insert_time DateTime64(3),\n  is_deleted UInt8",
-        "event_id",
-    )?;
+    Ok(())
+}
+
+pub struct ClickHouseStatement {
+    /// `database` for the database statement, otherwise the unqualified table name.
+    pub name: String,
+    pub sql: String,
+    /// Expected `system.tables.sorting_key` for table statements.
+    pub sorting_key: Option<&'static str>,
+}
+
+/// DDL for the tables Streamling's ClickHouse sink writes. The tables must exist before
+/// Streamling starts: otherwise the sink creates them itself, ordered by the primary key
+/// alone. ReplacingMergeTree(insert_time, is_deleted) is what the sink expects; it makes
+/// at-least-once redelivery idempotent. The sorting key is also the deduplication key, so
+/// each one ends with the row's unique ID; the leading columns never change for an ID.
+pub fn clickhouse_statements(
+    database: Option<&str>,
+    events_table: &str,
+    include_blocks: bool,
+    include_transactions: bool,
+) -> Vec<ClickHouseStatement> {
+    let mut statements = Vec::new();
+    if let Some(db) = database {
+        statements.push(ClickHouseStatement {
+            name: "database".into(),
+            sql: format!("CREATE DATABASE IF NOT EXISTS {db}"),
+            sorting_key: None,
+        });
+    }
+    let mut table = |name: String, columns: &str, sorting_key: &'static str| {
+        statements.push(ClickHouseStatement {
+            sql: format!(
+                "CREATE TABLE IF NOT EXISTS {} (\n{columns},\n  insert_time DateTime64(3) DEFAULT now64(3),\n  is_deleted UInt8\n)\nENGINE = ReplacingMergeTree(insert_time, is_deleted)\nPARTITION BY toYYYYMM(toDateTime(block_timestamp))\nORDER BY ({sorting_key})",
+                database.map_or_else(|| name.clone(), |db| format!("{db}.{name}"))
+            ),
+            name,
+            sorting_key: Some(sorting_key),
+        });
+    };
+    table(
+        events_table.to_owned(),
+        "  event_id String,\n  chain_id UInt64,\n  contract_alias LowCardinality(String),\n  event_name LowCardinality(String),\n  address String,\n  block_number UInt64,\n  block_hash String,\n  block_timestamp UInt64,\n  tx_hash String,\n  log_index UInt64,\n  topic0 LowCardinality(String),\n  fields_json String,\n  discovered_address Nullable(String),\n  discovery_rule Nullable(String)",
+        "chain_id, contract_alias, event_name, block_number, event_id",
+    );
     if include_blocks {
-        let table = format!("{events_table}_blocks");
-        write_clickhouse_schema_file(
-            root,
-            &table,
-            clickhouse_qualified(database, &table),
-            "  block_id String,\n  chain_id UInt64,\n  block_number UInt64,\n  block_hash String,\n  parent_hash String,\n  block_timestamp UInt64,\n  miner Nullable(String),\n  gas_limit UInt64,\n  gas_used UInt64,\n  base_fee_per_gas Nullable(String),\n  transaction_count UInt64,\n  insert_time DateTime64(3),\n  is_deleted UInt8",
-            "block_id",
-        )?;
+        table(
+            format!("{events_table}_blocks"),
+            "  block_id String,\n  chain_id UInt64,\n  block_number UInt64,\n  block_hash String,\n  parent_hash String,\n  block_timestamp UInt64,\n  miner Nullable(String),\n  gas_limit UInt64,\n  gas_used UInt64,\n  base_fee_per_gas Nullable(String),\n  transaction_count UInt64",
+            "chain_id, block_number, block_id",
+        );
     }
     if include_transactions {
-        let table = format!("{events_table}_transactions");
-        write_clickhouse_schema_file(
-            root,
-            &table,
-            clickhouse_qualified(database, &table),
-            "  transaction_id String,\n  chain_id UInt64,\n  tx_hash String,\n  block_number UInt64,\n  block_hash String,\n  block_timestamp UInt64,\n  transaction_index UInt64,\n  from_address String,\n  to_address Nullable(String),\n  value String,\n  gas UInt64,\n  gas_price Nullable(String),\n  max_fee_per_gas Nullable(String),\n  max_priority_fee_per_gas Nullable(String),\n  input String,\n  method_id Nullable(String),\n  nonce UInt64,\n  receipt_status Nullable(UInt64),\n  receipt_gas_used Nullable(UInt64),\n  receipt_effective_gas_price Nullable(String),\n  contract_address Nullable(String),\n  logs_count Nullable(UInt64),\n  insert_time DateTime64(3),\n  is_deleted UInt8",
-            "transaction_id",
-        )?;
+        table(
+            format!("{events_table}_transactions"),
+            "  transaction_id String,\n  chain_id UInt64,\n  tx_hash String,\n  block_number UInt64,\n  block_hash String,\n  block_timestamp UInt64,\n  transaction_index UInt64,\n  from_address String,\n  to_address Nullable(String),\n  value String,\n  gas UInt64,\n  gas_price Nullable(String),\n  max_fee_per_gas Nullable(String),\n  max_priority_fee_per_gas Nullable(String),\n  input String,\n  method_id Nullable(String),\n  nonce UInt64,\n  receipt_status Nullable(UInt64),\n  receipt_gas_used Nullable(UInt64),\n  receipt_effective_gas_price Nullable(String),\n  contract_address Nullable(String),\n  logs_count Nullable(UInt64)",
+            "chain_id, block_number, transaction_index, transaction_id",
+        );
     }
-    Ok(())
-}
-
-fn clickhouse_qualified(database: Option<&str>, table: &str) -> String {
-    database.map_or_else(|| table.to_owned(), |db| format!("{db}.{table}"))
-}
-
-fn write_clickhouse_schema_file(
-    root: &Path,
-    file_stem: &str,
-    qualified_table: String,
-    columns: &str,
-    order_by: &str,
-) -> Result<()> {
-    std::fs::write(
-        root.join("clickhouse").join(format!("{file_stem}.sql")),
-        format!(
-            "CREATE TABLE IF NOT EXISTS {qualified_table} (\n{columns}\n)\nENGINE = ReplacingMergeTree(insert_time, is_deleted)\nORDER BY {order_by};\n"
-        ),
-    )?;
-    Ok(())
+    statements
 }
 pub fn write_semantics(root: &Path, config: &ProjectConfig) -> Result<()> {
     let mut out =
-        String::from("# Generated from the live ABI registry. Edit descriptions freely.\n\n");
+        String::from("# Generated from the live ABI registry. Edit descriptions freely.\n");
+    if let Some(clickhouse) = &config.sinks.clickhouse {
+        out.push_str(&format!(
+            "# Tables below are SQLite sink tables. In ClickHouse, filter `{}` by contract_alias and event_name and read fields with JSONExtractString(fields_json, '<source_name>').\n",
+            clickhouse.table
+        ));
+    }
+    out.push('\n');
     for contract in &config.contracts {
         let abi_path = root.join(&contract.abi);
         let abi: Value = serde_json::from_slice(&std::fs::read(&abi_path)?)?;
@@ -442,18 +463,41 @@ fn write_agent_files(root: &Path, config: &ProjectConfig) -> Result<()> {
         .map(|c| c.alias.as_str())
         .collect::<Vec<_>>()
         .join(", ");
+    let backends = backend_guidance(config);
     std::fs::write(
         root.join("llms.txt"),
         format!(
-            "# Streamling Blockchain Studio project\n\nContracts: {aliases}\n\nKeep this project on persistent storage. Streamling checkpoints and the SQLite database live inside the project directory; restarting `streamling-blockchain dev` with the same project resumes from the last committed checkpoint. Use `streamling-blockchain status --json` to inspect backfill progress and `streamling-blockchain status --wait` to block until the safe chain head is indexed. Use `streamling-blockchain schema` before writing SQL. Query with `streamling-blockchain sql --json <QUERY>`. Event tables are named `<alias>__<event>`. Quote Solidity names such as `from`. Discovered child contracts are filtered by Streamling dynamic tables before persistence.\n"
+            "# Streamling Blockchain Studio project\n\nContracts: {aliases}\n\nKeep this project on persistent storage. Streamling checkpoints live inside the project directory; restarting `streamling-blockchain dev` with the same project resumes from the last committed checkpoint. Use `streamling-blockchain status --json` to inspect backfill progress and `streamling-blockchain status --wait` to block until the safe chain head is indexed. Use `streamling-blockchain schema` before writing SQL. Query with `streamling-blockchain sql --json <QUERY>`. Quote Solidity names such as `from`. Discovered child contracts are filtered by Streamling dynamic tables before persistence.\n\n{backends}"
         ),
     )?;
     std::fs::create_dir_all(root.join("skills/streamling-blockchain-query"))?;
     std::fs::write(
         root.join("skills/streamling-blockchain-query/SKILL.md"),
-        "---\nname: streamling-blockchain-query\ndescription: Query a local Streamling Blockchain Studio event database.\n---\n\nKeep the project on persistent storage and reuse it after restarts so Streamling resumes its checkpoint. Run `streamling-blockchain status --json` to inspect backfill progress or `streamling-blockchain status --wait` when work must begin only after catch-up. Run `streamling-blockchain schema` before querying, then use `streamling-blockchain sql --json '<SQL>'`. Prefer explicit columns, quote Solidity identifiers, and include LIMIT for exploratory queries.\n",
+        format!(
+            "---\nname: streamling-blockchain-query\ndescription: Query a Streamling Blockchain Studio event database.\n---\n\nKeep the project on persistent storage and reuse it after restarts so Streamling resumes its checkpoint. Run `streamling-blockchain status --json` to inspect backfill progress or `streamling-blockchain status --wait` when work must begin only after catch-up. Run `streamling-blockchain schema` before querying, then use `streamling-blockchain sql --json '<SQL>'`. Prefer explicit columns, quote Solidity identifiers, and include LIMIT for exploratory queries.\n\n{backends}"
+        ),
     )?;
     Ok(())
+}
+
+fn backend_guidance(config: &ProjectConfig) -> String {
+    let mut out = String::new();
+    if config.sinks.sqlite {
+        out.push_str("SQLite sink: `events` holds every decoded event with fields as JSON in `data`, and `<alias>__<event>` tables hold one column per event field. Use SQLite SQL, for example `json_extract(data, '$.from')`.\n");
+    }
+    if let Some(clickhouse) = &config.sinks.clickhouse {
+        let table = clickhouse.database.as_deref().map_or_else(
+            || clickhouse.table.clone(),
+            |db| format!("{db}.{}", clickhouse.table),
+        );
+        out.push_str(&format!(
+            "ClickHouse sink: `{table}` holds every decoded event with fields as JSON in `fields_json`; there are no per-event tables. Use ClickHouse SQL, for example `JSONExtractString(fields_json, 'from')`, and read current rows with `FROM {table} FINAL WHERE is_deleted = 0`. Connection settings come from the `STREAMLING__CLICKHOUSE_SINK__*` environment variables.\n"
+        ));
+    }
+    if config.sinks.sqlite && config.sinks.clickhouse.is_some() {
+        out.push_str("Commands read SQLite by default; pass `--backend clickhouse` to `sql`, `schema`, `replay`, `audit`, or `mcp` to read ClickHouse.\n");
+    }
+    out
 }
 
 pub fn add_contract(
@@ -608,15 +652,36 @@ mod tests {
         let clickhouse_schema =
             std::fs::read_to_string(root.join("clickhouse/events.sql")).unwrap();
         assert!(clickhouse_schema.contains("chain_id UInt64"));
-        assert!(clickhouse_schema.contains("ReplacingMergeTree"));
+        assert!(clickhouse_schema.starts_with("CREATE TABLE IF NOT EXISTS analytics.events ("));
+        assert!(clickhouse_schema.contains("ENGINE = ReplacingMergeTree(insert_time, is_deleted)"));
+        assert!(clickhouse_schema.contains("insert_time DateTime64(3) DEFAULT now64(3)"));
+        assert!(clickhouse_schema.contains("PARTITION BY toYYYYMM(toDateTime(block_timestamp))"));
+        assert!(
+            clickhouse_schema.contains(
+                "ORDER BY (chain_id, contract_alias, event_name, block_number, event_id);"
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("clickhouse/database.sql")).unwrap(),
+            "CREATE DATABASE IF NOT EXISTS analytics;\n"
+        );
         let clickhouse_block_schema =
             std::fs::read_to_string(root.join("clickhouse/events_blocks.sql")).unwrap();
         assert!(clickhouse_block_schema.contains("block_id String"));
         assert!(clickhouse_block_schema.contains("transaction_count UInt64"));
+        assert!(clickhouse_block_schema.contains("ORDER BY (chain_id, block_number, block_id);"));
         let clickhouse_transaction_schema =
             std::fs::read_to_string(root.join("clickhouse/events_transactions.sql")).unwrap();
         assert!(clickhouse_transaction_schema.contains("transaction_id String"));
         assert!(clickhouse_transaction_schema.contains("receipt_gas_used Nullable(UInt64)"));
+        assert!(
+            clickhouse_transaction_schema
+                .contains("ORDER BY (chain_id, block_number, transaction_index, transaction_id);")
+        );
+        let llms = std::fs::read_to_string(root.join("llms.txt")).unwrap();
+        assert!(llms.contains("`<alias>__<event>` tables"));
+        assert!(llms.contains("FROM analytics.events FINAL WHERE is_deleted = 0"));
+        assert!(llms.contains("--backend clickhouse"));
         let semantics = std::fs::read_to_string(root.join("semantic.toml")).unwrap();
         assert!(semantics.contains("signature = \"Transfer(address,address,uint256)\""));
         assert!(semantics.contains("topic0 = \"0xddf252ad"));

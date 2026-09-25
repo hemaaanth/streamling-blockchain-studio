@@ -85,7 +85,9 @@ streamling-blockchain --project ./my-project init \
   --clickhouse-table events
 ```
 
-`--sink sqlite` is the default local mode and is enough for the included Evidence pages. `--sink clickhouse` writes only through Streamling's built-in ClickHouse sink; `--sink both` keeps the local SQLite database and adds a ClickHouse sidecar sink. The Evidence app supports both SQLite and ClickHouse connectors: use SQLite sources for local project files, and add ClickHouse sources when the project is intentionally writing to a warehouse. Configure the ClickHouse sink with Streamling's environment variables, including `STREAMLING__CLICKHOUSE_SINK__URL`, `STREAMLING__CLICKHOUSE_SINK__USER`, `STREAMLING__CLICKHOUSE_SINK__PASSWORD`, and `STREAMLING__CLICKHOUSE_SINK__DATABASE`; create that database before starting `dev`. The CLI writes readable schema files under `clickhouse/`: `<table>.sql` for decoded events, and `<table>_blocks.sql` / `<table>_transactions.sql` when block or transaction indexing is enabled.
+`--sink sqlite` is the default local mode and is enough for the included Evidence pages. `--sink clickhouse` writes only through Streamling's built-in ClickHouse sink; `--sink both` keeps the local SQLite database and adds a ClickHouse sidecar sink. The Evidence app supports both SQLite and ClickHouse connectors: use SQLite sources for local project files, and add ClickHouse sources when the project is intentionally writing to a warehouse. Configure the ClickHouse sink with Streamling's environment variables, including `STREAMLING__CLICKHOUSE_SINK__URL`, `STREAMLING__CLICKHOUSE_SINK__USER`, `STREAMLING__CLICKHOUSE_SINK__PASSWORD`, and `STREAMLING__CLICKHOUSE_SINK__DATABASE`. The CLI writes readable schema files under `clickhouse/`: `<table>.sql` for decoded events, and `<table>_blocks.sql` / `<table>_transactions.sql` when block or transaction indexing is enabled.
+
+Before starting Streamling, `dev` creates the configured database and these tables when they do not exist; `streamling-blockchain --project <dir> clickhouse apply` does the same on its own. This matters because Streamling's sink otherwise creates missing tables ordered by their primary key alone. The tables use `ReplacingMergeTree(insert_time, is_deleted)`, which makes Streamling's at-least-once redelivery idempotent. They are partitioned by month and sorted by chain, contract alias, event name, and block, ending with the row ID, so filtered and `FINAL` reads touch fewer parts. Read current rows with `FROM <table> FINAL WHERE is_deleted = 0`. `CREATE TABLE IF NOT EXISTS` never changes an existing table, so `dev` warns when an existing table has a different sorting key; recreate it to adopt the new key. `streamling-blockchain clickhouse schema --database <db> --table <table> [--index-blocks] [--index-transactions] [--json]` prints the same DDL without a project.
 
 Use `--end-block` for bounded demos and reproducible backfills. `streamling-blockchain dev --exit-when-caught-up` turns a bounded project into a batch job: once the indexed height reaches the safe `end_block`, the wrapper stops Streamling and exits. Use `--index-blocks` when dashboards need chain context beyond decoded logs. Use `--index-transactions` when dashboards need transaction inputs, sender/recipient/value, and receipt fields such as status, gas used, effective gas price, contract creation address, and log count. These flags add `streamling_blockchain.evm_blocks` and `streamling_blockchain.evm_transactions` sources and write rows with `chain_id` to the same SQLite database through the existing `streamling_blockchain.sqlite_sink`.
 
@@ -169,6 +171,15 @@ streamling-blockchain --project ./my-project rpc-doctor --json --apply
 streamling-blockchain --project ./my-project mcp
 ```
 
+`sql`, `schema`, `replay`, `audit`, and `mcp` read the SQLite sink by default and the ClickHouse sink when SQLite is disabled. Pass `--backend sqlite` or `--backend clickhouse` to choose when both sinks are enabled. ClickHouse commands use the `STREAMLING__CLICKHOUSE_SINK__*` connection settings. Every `sql` and MCP query runs with ClickHouse's `readonly=1` setting, so the server rejects writes; this also works for users whose profile is already read-only. SQL uses the backend's dialect: `json_extract(data, '$.from')` in SQLite and `JSONExtractString(fields_json, 'from')` in ClickHouse. The per-event `<alias>__<event>` tables exist only in SQLite. On ClickHouse, `audit` stores its summaries in `<table>_quality_replay_checks`, and `--attach` is SQLite-only.
+
+```sh
+streamling-blockchain --project ./my-project schema --backend clickhouse
+streamling-blockchain --project ./my-project sql --backend clickhouse --json \
+  "SELECT event_name, count() AS events FROM events FINAL WHERE is_deleted = 0 GROUP BY event_name"
+streamling-blockchain --project ./my-project audit --backend clickhouse --once --window-blocks 1000
+```
+
 To refresh a demo dashboard from a generated SQLite project database:
 
 ```sh
@@ -206,6 +217,8 @@ cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo build --release --workspace
 ```
+
+ClickHouse integration tests run when `STREAMLING_BLOCKCHAIN_TEST_CLICKHOUSE_URL` names a disposable ClickHouse HTTP endpoint, with optional `STREAMLING_BLOCKCHAIN_TEST_CLICKHOUSE_USER` and `STREAMLING_BLOCKCHAIN_TEST_CLICKHOUSE_PASSWORD`. They create and drop their own `sbs_test_*` databases, and they skip when the URL is unset.
 
 For a behavioral smoke test, initialize against a known RPC fixture, run `dev`, wait for `status --wait`, then query the indexed events through CLI, HTTP, and MCP.
 

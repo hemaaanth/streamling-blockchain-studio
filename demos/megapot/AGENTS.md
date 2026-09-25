@@ -8,7 +8,7 @@ This directory is the specific Megapot v2 Evidence dashboard for Base activity. 
 
 Do not replace this demo with another protocol. Add new demos as sibling directories under `demos/`.
 
-SQLite and ClickHouse must expose the same page-facing columns. Backend templates live under `backends/`; `scripts/configure_source.py` materializes the selected source under ignored `sources/megapot/`. ClickHouse uses `megapot_analytics.events`. Streamling remains the canonical data producer.
+SQLite and ClickHouse must expose the same page-facing columns. Backend templates live under `backends/`; `scripts/configure_source.py` materializes the selected source under ignored `sources/megapot/`. ClickHouse uses `megapot_analytics.events`. Its DDL comes only from `streamling-blockchain clickhouse schema` (applied by `dev` or the importer); do not hand-write ClickHouse table DDL in this demo. Streamling remains the canonical data producer.
 
 The local ClickHouse username and password are loopback-only development defaults. Use Evidence source environment overrides for remote deployments. Do not commit `.env`, generated Evidence sources, `.evidence/`, `build/`, `node_modules/`, generated Streamling projects, copied ABIs, data extracts, state, progress, or credentials.
 

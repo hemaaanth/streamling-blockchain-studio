@@ -570,18 +570,17 @@ impl EvmTransactionSource {
                 json!([format!("0x{block_number:x}")]),
             )
             .await
+            && let Some(items) = receipts.as_array()
         {
-            if let Some(items) = receipts.as_array() {
-                return Ok(items
-                    .iter()
-                    .filter_map(|receipt| {
-                        receipt
-                            .get("transactionHash")
-                            .and_then(Value::as_str)
-                            .map(|hash| (hash.to_owned(), receipt.clone()))
-                    })
-                    .collect());
-            }
+            return Ok(items
+                .iter()
+                .filter_map(|receipt| {
+                    receipt
+                        .get("transactionHash")
+                        .and_then(Value::as_str)
+                        .map(|hash| (hash.to_owned(), receipt.clone()))
+                })
+                .collect());
         }
         let mut receipts = HashMap::new();
         for tx in txs {
