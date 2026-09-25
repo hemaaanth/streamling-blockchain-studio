@@ -1,5 +1,6 @@
-//! `publish`: build a demo's Evidence site from the project's SQLite data, stamp it with a
-//! release manifest, check that it is safe to publish, and ship it to a directory or here.now.
+//! `publish`: build a demo's Evidence site from the project's SQLite data (or use an
+//! already-built site with `--build-dir`), stamp it with a release manifest, check that it is
+//! safe to publish, and ship it to a directory or here.now.
 
 use crate::{
     config::ProjectConfig,
@@ -34,9 +35,18 @@ pub enum Target {
 }
 
 #[derive(clap::Args)]
+#[command(group(
+    clap::ArgGroup::new("source")
+        .args(["demo", "build_dir"])
+        .required(true)
+))]
 pub struct PublishArgs {
     /// Evidence demo directory with a `sources:sqlite` npm script.
-    demo: PathBuf,
+    demo: Option<PathBuf>,
+    /// A prebuilt site directory to publish as-is, skipping the Streamling build. `--project`
+    /// is ignored in this mode.
+    #[arg(long)]
+    build_dir: Option<PathBuf>,
     #[arg(long, value_enum)]
     target: Target,
     /// Directory that receives the site with `--target dir`.
@@ -54,6 +64,11 @@ pub struct PublishArgs {
     /// Create a new here.now site instead of updating the one recorded for this demo.
     #[arg(long)]
     new_site: bool,
+    /// Where to save the here.now site record. Defaults to
+    /// `<project>/.streamling-blockchain/publish/<demo>.json` for a demo directory, or
+    /// `<build-dir>/../.publish/herenow.json` for `--build-dir`.
+    #[arg(long)]
+    record: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -73,24 +88,54 @@ struct SiteRecord {
     claim_token: Option<String>,
 }
 
-pub async fn run(root: &Path, out: &mut Output, args: PublishArgs) -> Result<Value> {
-    let config = ProjectConfig::load(root)?;
-    let demo = std::fs::canonicalize(&args.demo)
-        .with_context(|| format!("open demo {}", args.demo.display()))?;
-    let build = build_site(root, &config, &demo, out).await?;
-    out.line(format!("✓ built {}", build.display()));
+/// `env` is a snapshot of the process environment, taken once by the caller: passing it in
+/// keeps this function free of global state, so tests can exercise it with a fabricated
+/// environment instead of mutating the real one.
+pub async fn run(
+    root: &Path,
+    out: &mut Output,
+    args: PublishArgs,
+    env: &[(String, String)],
+) -> Result<Value> {
+    let (build, config, demo) = match (&args.demo, &args.build_dir) {
+        (Some(demo), None) => {
+            let config = ProjectConfig::load(root)?;
+            let demo = std::fs::canonicalize(demo)
+                .with_context(|| format!("open demo {}", demo.display()))?;
+            let build = build_site(root, &config, &demo, out).await?;
+            out.line(format!("✓ built {}", build.display()));
+            (build, Some(config), Some(demo))
+        }
+        (None, Some(build_dir)) => {
+            let build = std::fs::canonicalize(build_dir)
+                .with_context(|| format!("open build directory {}", build_dir.display()))?;
+            if build.join("_app/immutable").exists() && !build.join("data/manifest.json").exists() {
+                out.warn(format!(
+                    "{} looks like an Evidence build but has no data/manifest.json; the site may show only \"Timeout while initializing database\"",
+                    build.display()
+                ));
+            }
+            (build, None, None)
+        }
+        _ => unreachable!("clap requires exactly one of <demo> or --build-dir"),
+    };
 
     let mut files = list_files(&build)?;
     files.retain(|file| file.path != "release.json");
     let manifest_path = build.join("release.json");
-    std::fs::write(
-        &manifest_path,
-        serde_json::to_vec_pretty(&manifest(root, &config, &files)?)?,
-    )?;
+    let manifest_value = match &config {
+        Some(config) => manifest(root, config, &files)?,
+        None => prebuilt_manifest(&files),
+    };
+    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest_value)?)?;
     files.push(build_file(&build, "release.json".into())?);
     out.line(format!("✓ manifest written: {}", manifest_path.display()));
 
-    scan_secrets(&build, &files, &secrets(&config))?;
+    let secret_list = match &config {
+        Some(config) => secrets(config, env),
+        None => common_secrets(env),
+    };
+    scan_secrets(&build, &files, &secret_list)?;
     out.line("✓ checks passed: no RPC URL or credential found in the build");
     let total_bytes: u64 = files.iter().map(|file| file.bytes).sum();
     let mut largest = files.clone();
@@ -127,10 +172,11 @@ pub async fn run(root: &Path, out: &mut Output, args: PublishArgs) -> Result<Val
         }
         Target::Herenow => {
             check_limits(&files, args.anonymous)?;
-            let name = demo.file_name().context("demo directory has no name")?;
-            let record_path = root
-                .join(".streamling-blockchain/publish")
-                .join(format!("{}.json", name.to_string_lossy()));
+            let record_path = record_path(args.record.as_deref(), root, demo.as_deref(), &build)?;
+            out.line(format!(
+                "using site record: {} (add it to .gitignore)",
+                record_path.display()
+            ));
             if !args.yes {
                 let existing = read_record(&record_path)?.filter(|_| !args.new_site);
                 let action = if existing.is_some() {
@@ -148,8 +194,13 @@ pub async fn run(root: &Path, out: &mut Output, args: PublishArgs) -> Result<Val
                 data["url"] = json!(existing.map(|site| site.site_url));
                 return Ok(data);
             }
-            let key = herenow_key(std::env::var(HERENOW_KEY_ENV).ok(), args.anonymous)?;
-            let api = std::env::var(HERENOW_API_ENV).unwrap_or_else(|_| HERENOW_API.into());
+            let key = herenow_key(
+                env_value(env, HERENOW_KEY_ENV).map(str::to_owned),
+                args.anonymous,
+            )?;
+            let api = env_value(env, HERENOW_API_ENV)
+                .map(str::to_owned)
+                .unwrap_or_else(|| HERENOW_API.into());
             let site = herenow_publish(
                 &api,
                 key.as_deref(),
@@ -313,6 +364,7 @@ fn manifest(root: &Path, config: &ProjectConfig, files: &[BuildFile]) -> Result<
         "schema_version": 1,
         "cli_version": env!("CARGO_PKG_VERSION"),
         "built_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "source": "streamling-project",
         "chain": config.chain,
         "chain_id": config.chain_id,
         "contracts": config
@@ -334,11 +386,57 @@ fn manifest(root: &Path, config: &ProjectConfig, files: &[BuildFile]) -> Result<
     }))
 }
 
+/// `release.json` for `--build-dir`: no project to describe, so just what was published.
+fn prebuilt_manifest(files: &[BuildFile]) -> Value {
+    json!({
+        "schema_version": 1,
+        "cli_version": env!("CARGO_PKG_VERSION"),
+        "built_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "source": "prebuilt",
+        "files": files,
+    })
+}
+
+/// The here.now site record path: `--record` if given, otherwise the project-relative default
+/// for a demo directory, or a `.publish/` directory next to the build for `--build-dir`.
+fn record_path(
+    record: Option<&Path>,
+    root: &Path,
+    demo: Option<&Path>,
+    build: &Path,
+) -> Result<PathBuf> {
+    if let Some(record) = record {
+        return Ok(record.to_path_buf());
+    }
+    match demo {
+        Some(demo) => {
+            let name = demo.file_name().context("demo directory has no name")?;
+            Ok(root
+                .join(".streamling-blockchain/publish")
+                .join(format!("{}.json", name.to_string_lossy())))
+        }
+        None => Ok(build
+            .parent()
+            .context("build directory has no parent")?
+            .join(".publish/herenow.json")),
+    }
+}
+
+/// Looks up `name` in a snapshot of the environment, so callers stay testable without touching
+/// the real process environment.
+fn env_value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    env.iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+}
+
 /// Values that must not appear in a published site, each with a label for the error.
-fn secrets(config: &ProjectConfig) -> Vec<(&'static str, String)> {
+/// Only meaningful with a project: the RPC URL, its key-bearing part, and its `rpc_url_env`
+/// override, plus every check `common_secrets` runs regardless of project.
+fn secrets(config: &ProjectConfig, env: &[(String, String)]) -> Vec<(String, String)> {
     let mut urls = vec![config.rpc_url.clone()];
     if let Some(name) = &config.rpc_url_env {
-        urls.extend(std::env::var(name).ok());
+        urls.extend(env_value(env, name).map(str::to_owned));
     }
     let mut secrets = Vec::new();
     for url in urls {
@@ -347,27 +445,53 @@ fn secrets(config: &ProjectConfig) -> Vec<(&'static str, String)> {
             if let Some(host) = parsed.host_str()
                 && parsed.path().len() > 1
             {
-                secrets.push(("part of the RPC URL", format!("{host}{}", parsed.path())));
+                secrets.push((
+                    "part of the RPC URL".to_owned(),
+                    format!("{host}{}", parsed.path()),
+                ));
             }
             secrets.extend(
                 parsed
                     .query_pairs()
-                    .map(|(_, value)| ("part of the RPC URL", value.into_owned()))
+                    .map(|(_, value)| ("part of the RPC URL".to_owned(), value.into_owned()))
                     .filter(|(_, value)| value.len() >= 8),
             );
         }
-        secrets.push(("the RPC URL", url));
+        secrets.push(("the RPC URL".to_owned(), url));
     }
-    secrets.extend(
-        std::env::var("STREAMLING__CLICKHOUSE_SINK__PASSWORD")
-            .ok()
-            .map(|password| ("the ClickHouse password", password)),
-    );
+    secrets.extend(common_secrets(env));
     secrets.retain(|(_, value)| !value.is_empty());
     secrets
 }
 
-fn scan_secrets(build: &Path, files: &[BuildFile], secrets: &[(&str, String)]) -> Result<()> {
+/// Secrets scanned in every mode, project or not: the ClickHouse sink password, the here.now
+/// API key, and any `EVIDENCE_SOURCE__*` override whose name looks credential-shaped and whose
+/// value isn't a short, commonly-repeated one like a host, port, database, or username.
+fn common_secrets(env: &[(String, String)]) -> Vec<(String, String)> {
+    const CREDENTIAL_WORDS: [&str; 5] = ["PASSWORD", "SECRET", "TOKEN", "KEY", "CREDENTIAL"];
+    let mut secrets = Vec::new();
+    secrets.extend(
+        env_value(env, "STREAMLING__CLICKHOUSE_SINK__PASSWORD")
+            .map(|password| ("the ClickHouse password".to_owned(), password.to_owned())),
+    );
+    secrets.extend(
+        env_value(env, HERENOW_KEY_ENV).map(|key| (HERENOW_KEY_ENV.to_owned(), key.to_owned())),
+    );
+    for (name, value) in env {
+        if name.starts_with("EVIDENCE_SOURCE__")
+            && value.len() >= 8
+            && CREDENTIAL_WORDS
+                .iter()
+                .any(|word| name.to_ascii_uppercase().contains(word))
+        {
+            secrets.push((name.clone(), value.clone()));
+        }
+    }
+    secrets.retain(|(_, value)| !value.is_empty());
+    secrets
+}
+
+fn scan_secrets(build: &Path, files: &[BuildFile], secrets: &[(String, String)]) -> Result<()> {
     for file in files {
         let bytes = std::fs::read(build.join(&file.path))?;
         for (label, secret) in secrets {
@@ -759,8 +883,8 @@ mod tests {
             "const rpc = 'wss://rpc.example.invalid/v2/sekret-key-0123';",
         );
         let files = list_files(&build).unwrap();
-        assert!(scan_secrets(&build, &files[..1], &secrets(&config)).is_ok());
-        let error = scan_secrets(&build, &files, &secrets(&config)).unwrap_err();
+        assert!(scan_secrets(&build, &files[..1], &secrets(&config, &[])).is_ok());
+        let error = scan_secrets(&build, &files, &secrets(&config, &[])).unwrap_err();
         assert_eq!(classify(&error).0, ErrorCode::Validation);
         assert_eq!(
             error.to_string(),
@@ -769,7 +893,50 @@ mod tests {
 
         config.rpc_url = "https://rpc.example.invalid/?apikey=abcdef123456".into();
         write(&build, "a.js", "key=abcdef123456");
-        assert!(scan_secrets(&build, &files[..1], &secrets(&config)).is_err());
+        assert!(scan_secrets(&build, &files[..1], &secrets(&config, &[])).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wider_scan_covers_herenow_key_and_credential_shaped_evidence_source_vars() {
+        let root = project("wider-scan");
+        let build = root.join("build");
+
+        // A credential-shaped EVIDENCE_SOURCE__* value is found and labeled by variable name.
+        write(&build, "a.js", "const p = 'clickhouse-secret-1';");
+        let files = list_files(&build).unwrap();
+        let env = [(
+            "EVIDENCE_SOURCE__ch__password".to_owned(),
+            "clickhouse-secret-1".to_owned(),
+        )];
+        let error = scan_secrets(&build, &files, &common_secrets(&env)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "build/a.js contains EVIDENCE_SOURCE__ch__password; nothing was published"
+        );
+
+        // A host/port-shaped EVIDENCE_SOURCE__* value is never scanned, even if it appears.
+        write(&build, "a.js", "const h = 'localhost';");
+        let files = list_files(&build).unwrap();
+        let env = [(
+            "EVIDENCE_SOURCE__ch__host".to_owned(),
+            "localhost".to_owned(),
+        )];
+        assert!(scan_secrets(&build, &files, &common_secrets(&env)).is_ok());
+
+        // HERENOW_API_KEY is scanned in every mode.
+        write(&build, "a.js", "const k = 'herenow-key-12345678';");
+        let files = list_files(&build).unwrap();
+        let env = [(
+            HERENOW_KEY_ENV.to_owned(),
+            "herenow-key-12345678".to_owned(),
+        )];
+        let error = scan_secrets(&build, &files, &common_secrets(&env)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("build/a.js contains {HERENOW_KEY_ENV}; nothing was published")
+        );
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1070,6 +1237,101 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    fn build_dir_args(build_dir: PathBuf, record: Option<PathBuf>) -> PublishArgs {
+        PublishArgs {
+            demo: None,
+            build_dir: Some(build_dir),
+            target: Target::Herenow,
+            out: None,
+            name: None,
+            anonymous: false,
+            yes: true,
+            new_site: false,
+            record,
+        }
+    }
+
+    #[tokio::test]
+    async fn build_dir_publishes_a_prebuilt_site_without_a_project() {
+        let root = std::env::temp_dir().join(format!(
+            "streamling-blockchain-publish-build-dir-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let build = root.join("build");
+        write(&build, "index.html", "<html></html>");
+        write(&build, "data/manifest.json", "{}");
+
+        let (api, _seen) = mock_herenow().await;
+        let env = [
+            (HERENOW_API_ENV.to_owned(), api),
+            (HERENOW_KEY_ENV.to_owned(), "test-key".to_owned()),
+        ];
+        let mut out = Output {
+            json: true,
+            warnings: Vec::new(),
+        };
+
+        let data = run(&root, &mut out, build_dir_args(build.clone(), None), &env)
+            .await
+            .unwrap();
+        assert_eq!(data["url"], "https://calm-otter.here.now/");
+
+        let default_record = root.join(".publish/herenow.json");
+        assert!(default_record.exists(), "default record was not written");
+        let release: Value =
+            serde_json::from_slice(&std::fs::read(build.join("release.json")).unwrap()).unwrap();
+        assert_eq!(release["source"], "prebuilt");
+        assert!(release.get("chain").is_none());
+        assert_eq!(release["files"].as_array().unwrap().len(), 2);
+
+        let custom_record = root.join("custom-record.json");
+        run(
+            &root,
+            &mut out,
+            build_dir_args(build.clone(), Some(custom_record.clone())),
+            &env,
+        )
+        .await
+        .unwrap();
+        assert!(custom_record.exists(), "--record location was not used");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn build_dir_warns_on_an_evidence_build_missing_the_manifest() {
+        let root = std::env::temp_dir().join(format!(
+            "streamling-blockchain-publish-build-dir-warn-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let build = root.join("build");
+        write(&build, "_app/immutable/entry.js", "//");
+        let mut out = Output {
+            json: true,
+            warnings: Vec::new(),
+        };
+        let args = PublishArgs {
+            demo: None,
+            build_dir: Some(build.clone()),
+            target: Target::Dir,
+            out: Some(root.join("site")),
+            name: None,
+            anonymous: false,
+            yes: false,
+            new_site: false,
+            record: None,
+        };
+        run(&root, &mut out, args, &[]).await.unwrap();
+        assert!(
+            out.warnings
+                .iter()
+                .any(|warning| warning.contains("data/manifest.json"))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     async fn publish_json(args: &[&Path]) -> Value {
         let args = ["streamling-blockchain", "--json", "publish"]
             .into_iter()
@@ -1192,5 +1454,41 @@ mod tests {
         assert_eq!(value["data"]["dry_run"], true, "{value}");
         assert_eq!(value["data"]["action"], "create");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn publish_requires_exactly_one_of_demo_or_build_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "streamling-blockchain-publish-source-group-{}",
+            std::process::id()
+        ));
+        let demo = root.join("demo");
+        let common = [
+            Path::new("--project"),
+            &root,
+            Path::new("--target"),
+            Path::new("dir"),
+            Path::new("--out"),
+            &root,
+        ];
+
+        // Neither <demo> nor --build-dir.
+        let value = publish_json(&common).await;
+        assert_eq!(value["error"]["code"], "validation");
+
+        // Both <demo> and --build-dir.
+        let args = [
+            common[0],
+            common[1],
+            &demo,
+            Path::new("--build-dir"),
+            &demo,
+            common[2],
+            common[3],
+            common[4],
+            common[5],
+        ];
+        let value = publish_json(&args).await;
+        assert_eq!(value["error"]["code"], "validation");
     }
 }

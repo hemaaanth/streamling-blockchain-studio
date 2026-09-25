@@ -8,3 +8,4 @@ sources/sqlite/*.sqlite3
 sources/sqlite/*.db-*
 sources/sqlite/*.sqlite-*
 sources/sqlite/*.sqlite3-*
+.publish/

@@ -804,7 +804,9 @@ async fn dispatch(cli: Cli, out: &mut Output) -> Result<Value> {
                 Ok(clickhouse_tables(&config))
             }
         },
-        Commands::Publish(args) => publish::run(&root, out, args).await,
+        Commands::Publish(args) => {
+            publish::run(&root, out, args, &std::env::vars().collect::<Vec<_>>()).await
+        }
         Commands::Doctor { streamling, plugin } => {
             run_streamling(
                 &root,
