@@ -106,6 +106,7 @@ fn payload(
         "discovery_rules": config.discovery_rules,
         "database": database,
         "database_ready": database_ready,
+        "sinks": config.sinks,
         "backfill": {
             "state": state,
             "start_block": config.start_block,

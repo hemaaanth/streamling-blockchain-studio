@@ -49,7 +49,7 @@ npm run preview
 
 ## Run with ClickHouse
 
-The local Compose stack exposes ClickHouse only on loopback and creates `megapot_analytics.events`:
+The local Compose stack exposes ClickHouse only on loopback and creates the empty `megapot_analytics` database. `dev` creates `megapot_analytics.events` from the CLI's ClickHouse DDL before Streamling starts:
 
 ```sh
 npm run clickhouse:up
@@ -70,9 +70,9 @@ npm run build
 npm run preview
 ```
 
-Use `npm run clickhouse:down` to stop the server without deleting data. Use `npm run clickhouse:reset` to remove the local volume, including schemas left by an older demo configuration.
+Use `npm run clickhouse:down` to stop the server without deleting data. Use `npm run clickhouse:reset` to remove the local volume, including schemas left by an older demo configuration. `dev` warns when an existing table uses an older sorting key, such as `ORDER BY event_id`.
 
-For an existing Streamling SQLite project, the one-time importer remains available:
+For an existing Streamling SQLite project, the one-time importer remains available. It creates the table from `streamling-blockchain clickhouse schema`, so build the CLI first:
 
 ```sh
 python3 sync_clickhouse.py /tmp/megapot-sqlite/.streamling-blockchain/events.db

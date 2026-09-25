@@ -1,4 +1,8 @@
-use crate::{config::ProjectConfig, database, rpc, status};
+use crate::{
+    config::ProjectConfig,
+    database::{Backend, BackendKind},
+    rpc, status,
+};
 use anyhow::{Context, Result, bail};
 use ethers_core::{
     abi::{Abi, Event, RawLog, Token},
@@ -26,11 +30,22 @@ struct DecodedEvent {
     data: String,
 }
 
-pub async fn diff(root: &Path, from: u64, to: u64) -> Result<Value> {
+pub async fn diff(root: &Path, from: u64, to: u64, backend: Option<BackendKind>) -> Result<Value> {
+    let config = ProjectConfig::load(root)?;
+    let backend = Backend::open(root, &config, backend)?;
+    diff_with(root, &config, &backend, from, to).await
+}
+
+async fn diff_with(
+    root: &Path,
+    config: &ProjectConfig,
+    backend: &Backend,
+    from: u64,
+    to: u64,
+) -> Result<Value> {
     if from > to {
         bail!("--from must be less than or equal to --to")
     }
-    let config = ProjectConfig::load(root)?;
     let rpc_url = config.rpc_url_value()?;
     let mut events = HashMap::new();
     let mut direct = HashMap::new();
@@ -69,11 +84,17 @@ pub async fn diff(root: &Path, from: u64, to: u64) -> Result<Value> {
         .iter()
         .filter_map(|log| decode_log(config.chain_id, log, &events, &direct).transpose())
         .collect::<Result<Vec<_>>>()?;
-    let conn = database::open(&config.absolute_database(root))?;
-    compare(&conn, from, to, decoded)
+    let stored = stored_events(backend, config.chain_id, from, to).await?;
+    Ok(compare(stored, from, to, decoded))
 }
 
-pub async fn audit_once(root: &Path, window_blocks: u64) -> Result<Value> {
+pub async fn audit_once(
+    root: &Path,
+    window_blocks: u64,
+    backend: Option<BackendKind>,
+) -> Result<Value> {
+    let config = ProjectConfig::load(root)?;
+    let backend = Backend::open(root, &config, backend)?;
     let snapshot = status::live(root).await?;
     let indexed = snapshot["backfill"]["indexed_through"]
         .as_u64()
@@ -82,7 +103,8 @@ pub async fn audit_once(root: &Path, window_blocks: u64) -> Result<Value> {
     let window = window_blocks.max(1);
     let recent_to = indexed;
     let recent_from = recent_to.saturating_sub(window - 1).max(start);
-    let mut checks = vec![audit_range(root, "recent", recent_from, recent_to).await?];
+    let mut checks =
+        vec![audit_range(root, &config, &backend, "recent", recent_from, recent_to).await?];
     if recent_to > start + window {
         let span = recent_to - start - window;
         let seed = std::time::SystemTime::now()
@@ -90,7 +112,17 @@ pub async fn audit_once(root: &Path, window_blocks: u64) -> Result<Value> {
             .unwrap_or_default()
             .as_secs();
         let random_from = start + seed.wrapping_mul(1_103_515_245).wrapping_add(12_345) % span;
-        checks.push(audit_range(root, "sample", random_from, random_from + window - 1).await?);
+        checks.push(
+            audit_range(
+                root,
+                &config,
+                &backend,
+                "sample",
+                random_from,
+                random_from + window - 1,
+            )
+            .await?,
+        );
     }
     Ok(
         json!({"ok": checks.iter().all(|check| check["ok"].as_bool() == Some(true)), "checks": checks}),
@@ -101,23 +133,31 @@ pub async fn audit_continuous(
     root: &Path,
     interval: std::time::Duration,
     window_blocks: u64,
+    backend: Option<BackendKind>,
 ) -> Result<()> {
     loop {
-        let value = audit_once(root, window_blocks).await?;
+        let value = audit_once(root, window_blocks, backend).await?;
         println!("{}", serde_json::to_string(&value)?);
         tokio::time::sleep(interval).await;
     }
 }
 
-async fn audit_range(root: &Path, label: &str, from: u64, to: u64) -> Result<Value> {
-    let mut result = diff(root, from, to).await?;
+async fn audit_range(
+    root: &Path,
+    config: &ProjectConfig,
+    backend: &Backend,
+    label: &str,
+    from: u64,
+    to: u64,
+) -> Result<Value> {
+    let mut result = diff_with(root, config, backend, from, to).await?;
     if let Value::Object(object) = &mut result {
         object.insert(
             "indexed_tables".into(),
-            compare_optional_indexed_tables(root, from, to).await?,
+            compare_optional_indexed_tables(config, backend, from, to).await?,
         );
     }
-    record_audit(root, label, &result)?;
+    record_audit(root, config, backend, label, &result).await?;
     Ok(json!({
         "label": label,
         "from_block": from,
@@ -132,43 +172,102 @@ async fn audit_range(root: &Path, label: &str, from: u64, to: u64) -> Result<Val
     }))
 }
 
-fn record_audit(root: &Path, label: &str, result: &Value) -> Result<()> {
-    let config = ProjectConfig::load(root)?;
-    let conn = Connection::open(config.absolute_database(root))?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS quality_replay_checks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            checked_at INTEGER NOT NULL,
-            label TEXT NOT NULL,
-            from_block INTEGER NOT NULL,
-            to_block INTEGER NOT NULL,
-            ok INTEGER NOT NULL,
-            chain_events INTEGER NOT NULL,
-            stored_events INTEGER NOT NULL,
-            missing_count INTEGER NOT NULL,
-            extra_count INTEGER NOT NULL,
-            changed_count INTEGER NOT NULL,
-            detail_json TEXT NOT NULL
-        );",
-    )?;
-    conn.execute(
-        "INSERT INTO quality_replay_checks (
-            checked_at, label, from_block, to_block, ok, chain_events, stored_events,
-            missing_count, extra_count, changed_count, detail_json
-        ) VALUES (unixepoch(), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![
-            label,
-            result["from_block"].as_u64().unwrap_or_default(),
-            result["to_block"].as_u64().unwrap_or_default(),
-            result["ok"].as_bool() == Some(true),
-            result["chain_events"].as_u64().unwrap_or_default(),
-            result["stored_events"].as_u64().unwrap_or_default(),
-            result["missing"].as_array().map_or(0, Vec::len) as u64,
-            result["extra"].as_array().map_or(0, Vec::len) as u64,
-            result["changed"].as_array().map_or(0, Vec::len) as u64,
-            serde_json::to_string(result)?,
-        ],
-    )?;
+/// Stores the audit summary next to the data it checked: `quality_replay_checks` in SQLite,
+/// or `<events table>_quality_replay_checks` in ClickHouse.
+async fn record_audit(
+    root: &Path,
+    config: &ProjectConfig,
+    backend: &Backend,
+    label: &str,
+    result: &Value,
+) -> Result<()> {
+    let count = |key: &str| result[key].as_array().map_or(0, Vec::len) as u64;
+    let ok = result["ok"].as_bool() == Some(true);
+    let from_block = result["from_block"].as_u64().unwrap_or_default();
+    let to_block = result["to_block"].as_u64().unwrap_or_default();
+    let chain_events = result["chain_events"].as_u64().unwrap_or_default();
+    let stored_events = result["stored_events"].as_u64().unwrap_or_default();
+    let detail_json = serde_json::to_string(result)?;
+    match backend {
+        Backend::Sqlite(_) => {
+            let conn = Connection::open(config.absolute_database(root))?;
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS quality_replay_checks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    checked_at INTEGER NOT NULL,
+                    label TEXT NOT NULL,
+                    from_block INTEGER NOT NULL,
+                    to_block INTEGER NOT NULL,
+                    ok INTEGER NOT NULL,
+                    chain_events INTEGER NOT NULL,
+                    stored_events INTEGER NOT NULL,
+                    missing_count INTEGER NOT NULL,
+                    extra_count INTEGER NOT NULL,
+                    changed_count INTEGER NOT NULL,
+                    detail_json TEXT NOT NULL
+                );",
+            )?;
+            conn.execute(
+                "INSERT INTO quality_replay_checks (
+                    checked_at, label, from_block, to_block, ok, chain_events, stored_events,
+                    missing_count, extra_count, changed_count, detail_json
+                ) VALUES (unixepoch(), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    label,
+                    from_block,
+                    to_block,
+                    ok,
+                    chain_events,
+                    stored_events,
+                    count("missing"),
+                    count("extra"),
+                    count("changed"),
+                    detail_json,
+                ],
+            )?;
+        }
+        Backend::ClickHouse { client, table } => {
+            let audit_table = format!("{table}_quality_replay_checks");
+            client
+                .execute(&format!(
+                    "CREATE TABLE IF NOT EXISTS {} (
+                        id UUID DEFAULT generateUUIDv4(),
+                        checked_at DateTime DEFAULT now(),
+                        label LowCardinality(String),
+                        from_block UInt64,
+                        to_block UInt64,
+                        ok UInt8,
+                        chain_events UInt64,
+                        stored_events UInt64,
+                        missing_count UInt64,
+                        extra_count UInt64,
+                        changed_count UInt64,
+                        detail_json String
+                    )
+                    ENGINE = MergeTree
+                    ORDER BY (checked_at, label)",
+                    client.qualified(&audit_table)
+                ))
+                .await?;
+            client
+                .insert_json_rows(
+                    &audit_table,
+                    &[json!({
+                        "label": label,
+                        "from_block": from_block,
+                        "to_block": to_block,
+                        "ok": u8::from(ok),
+                        "chain_events": chain_events,
+                        "stored_events": stored_events,
+                        "missing_count": count("missing"),
+                        "extra_count": count("extra"),
+                        "changed_count": count("changed"),
+                        "detail_json": detail_json,
+                    })],
+                )
+                .await?;
+        }
+    }
     Ok(())
 }
 
@@ -189,7 +288,52 @@ async fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value> {
     Ok(payload.get("result").cloned().unwrap_or(Value::Null))
 }
 
-fn compare(conn: &Connection, from: u64, to: u64, decoded: Vec<DecodedEvent>) -> Result<Value> {
+/// Stored events in the block range, keyed by event ID, in the shape `compare` expects.
+async fn stored_events(
+    backend: &Backend,
+    chain_id: u64,
+    from: u64,
+    to: u64,
+) -> Result<HashMap<String, Value>> {
+    match backend {
+        Backend::Sqlite(conn) => sqlite_stored_events(conn, from, to),
+        Backend::ClickHouse { client, table } => {
+            let rows = client
+                .query(
+                    &format!(
+                        "SELECT event_id, contract_alias, event_name, block_number, block_hash, fields_json
+                         FROM {} FINAL
+                         WHERE is_deleted = 0 AND chain_id = {chain_id} AND block_number BETWEEN {from} AND {to}",
+                        client.qualified(table)
+                    ),
+                    usize::MAX,
+                )
+                .await?;
+            rows["rows"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|row| {
+                    let event_id = row["event_id"]
+                        .as_str()
+                        .context("ClickHouse event row has no event_id")?;
+                    Ok((
+                        event_id.to_owned(),
+                        json!({
+                            "contract_alias": row["contract_alias"],
+                            "event_name": row["event_name"],
+                            "block_number": row["block_number"],
+                            "block_hash": row["block_hash"],
+                            "data": row["fields_json"],
+                        }),
+                    ))
+                })
+                .collect()
+        }
+    }
+}
+
+fn sqlite_stored_events(conn: &Connection, from: u64, to: u64) -> Result<HashMap<String, Value>> {
     let mut statement = conn.prepare(
         "SELECT event_id, contract_alias, event_name, block_number, block_hash, data FROM events WHERE block_number BETWEEN ?1 AND ?2",
     )?;
@@ -207,6 +351,15 @@ fn compare(conn: &Connection, from: u64, to: u64, decoded: Vec<DecodedEvent>) ->
             }),
         );
     }
+    Ok(stored)
+}
+
+fn compare(
+    stored: HashMap<String, Value>,
+    from: u64,
+    to: u64,
+    decoded: Vec<DecodedEvent>,
+) -> Value {
     let mut chain_ids = HashSet::new();
     let mut missing = Vec::new();
     let mut changed = Vec::new();
@@ -231,7 +384,7 @@ fn compare(conn: &Connection, from: u64, to: u64, decoded: Vec<DecodedEvent>) ->
         .filter(|event_id| !chain_ids.contains(*event_id))
         .cloned()
         .collect::<Vec<_>>();
-    Ok(json!({
+    json!({
         "from_block": from,
         "to_block": to,
         "chain_events": chain_ids.len(),
@@ -240,14 +393,23 @@ fn compare(conn: &Connection, from: u64, to: u64, decoded: Vec<DecodedEvent>) ->
         "extra": extra,
         "changed": changed,
         "ok": missing.is_empty() && extra.is_empty() && changed.is_empty(),
-    }))
+    })
 }
 
-async fn compare_optional_indexed_tables(root: &Path, from: u64, to: u64) -> Result<Value> {
-    let config = ProjectConfig::load(root)?;
-    let conn = database::open(&config.absolute_database(root))?;
-    let has_blocks = table_exists(&conn, "evm_blocks")?;
-    let has_transactions = table_exists(&conn, "evm_transactions")?;
+async fn compare_optional_indexed_tables(
+    config: &ProjectConfig,
+    backend: &Backend,
+    from: u64,
+    to: u64,
+) -> Result<Value> {
+    let (blocks_table, transactions_table) = match backend {
+        Backend::Sqlite(_) => ("evm_blocks".to_owned(), "evm_transactions".to_owned()),
+        Backend::ClickHouse { table, .. } => {
+            (format!("{table}_blocks"), format!("{table}_transactions"))
+        }
+    };
+    let has_blocks = table_exists(backend, &blocks_table).await?;
+    let has_transactions = table_exists(backend, &transactions_table).await?;
     if !has_blocks && !has_transactions {
         return Ok(Value::Null);
     }
@@ -271,18 +433,12 @@ async fn compare_optional_indexed_tables(root: &Path, from: u64, to: u64) -> Res
             .map_or(0, |items| items.len() as u64);
     }
     let stored_blocks = if has_blocks {
-        Some(count_rows(&conn, "evm_blocks", config.chain_id, from, to)?)
+        Some(count_rows(backend, &blocks_table, config.chain_id, from, to).await?)
     } else {
         None
     };
     let stored_transactions = if has_transactions {
-        Some(count_rows(
-            &conn,
-            "evm_transactions",
-            config.chain_id,
-            from,
-            to,
-        )?)
+        Some(count_rows(backend, &transactions_table, config.chain_id, from, to).await?)
     } else {
         None
     };
@@ -300,7 +456,40 @@ async fn compare_optional_indexed_tables(root: &Path, from: u64, to: u64) -> Res
     }))
 }
 
-fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+async fn table_exists(backend: &Backend, table: &str) -> Result<bool> {
+    match backend {
+        Backend::Sqlite(conn) => sqlite_table_exists(conn, table),
+        Backend::ClickHouse { client, .. } => client.table_exists(table).await,
+    }
+}
+
+async fn count_rows(
+    backend: &Backend,
+    table: &str,
+    chain_id: u64,
+    from: u64,
+    to: u64,
+) -> Result<u64> {
+    match backend {
+        Backend::Sqlite(conn) => sqlite_count_rows(conn, table, chain_id, from, to),
+        Backend::ClickHouse { client, .. } => {
+            let rows = client
+                .query(
+                    &format!(
+                        "SELECT count() AS stored FROM {} FINAL WHERE is_deleted = 0 AND chain_id = {chain_id} AND block_number BETWEEN {from} AND {to}",
+                        client.qualified(table)
+                    ),
+                    1,
+                )
+                .await?;
+            rows["rows"][0]["stored"]
+                .as_u64()
+                .context("ClickHouse count returned no number")
+        }
+    }
+}
+
+fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
         [table],
@@ -308,7 +497,13 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     )?)
 }
 
-fn count_rows(conn: &Connection, table: &str, chain_id: u64, from: u64, to: u64) -> Result<u64> {
+fn sqlite_count_rows(
+    conn: &Connection,
+    table: &str,
+    chain_id: u64,
+    from: u64,
+    to: u64,
+) -> Result<u64> {
     let sql = format!(
         "SELECT count(*) FROM {table} WHERE chain_id = ?1 AND block_number BETWEEN ?2 AND ?3"
     );
@@ -450,7 +645,7 @@ mod tests {
         )
         .unwrap();
         let result = compare(
-            &conn,
+            sqlite_stored_events(&conn, 1, 1).unwrap(),
             1,
             1,
             vec![DecodedEvent {
@@ -461,11 +656,100 @@ mod tests {
                 block_hash: "0xaaa".into(),
                 data: "{\"value\":\"2\"}".into(),
             }],
-        )
-        .unwrap();
+        );
         assert_eq!(result["ok"], false);
         assert_eq!(result["changed"].as_array().unwrap().len(), 1);
         assert_eq!(result["extra"].as_array().unwrap(), &[json!("extra")]);
+    }
+
+    #[tokio::test]
+    async fn clickhouse_backend_reads_current_rows_and_records_audits() {
+        use crate::clickhouse::{
+            apply_schema_with,
+            tests::{clickhouse_config, event_row, test_client},
+        };
+        let database = format!("sbs_test_replay_{}", std::process::id());
+        let Some(client) = test_client(&database) else {
+            eprintln!("skipped: STREAMLING_BLOCKCHAIN_TEST_CLICKHOUSE_URL is not set");
+            return;
+        };
+        let config = clickhouse_config(&database, "events");
+        apply_schema_with(&client, &config).await.unwrap();
+        let mut other_chain = event_row("5:0xccc:0", 10);
+        other_chain["chain_id"] = json!(5);
+        let mut deleted = event_row("1:0xddd:0", 10);
+        deleted["is_deleted"] = json!(1);
+        client
+            .insert_json_rows(
+                "events",
+                &[
+                    event_row("1:0xaaa:0", 10),
+                    event_row("1:0xaaa:0", 10),
+                    event_row("1:0xaaa:1", 12),
+                    other_chain,
+                    deleted,
+                ],
+            )
+            .await
+            .unwrap();
+        client
+            .insert_json_rows(
+                "events_blocks",
+                &[json!({
+                    "block_id": "1:10", "chain_id": 1, "block_number": 10, "block_hash": "0xaaa",
+                    "parent_hash": "0x999", "block_timestamp": 1_700_000_000, "miner": null,
+                    "gas_limit": 1, "gas_used": 1, "base_fee_per_gas": null,
+                    "transaction_count": 1, "is_deleted": 0,
+                })],
+            )
+            .await
+            .unwrap();
+        let backend = Backend::ClickHouse {
+            client: client.clone(),
+            table: "events".into(),
+        };
+
+        let stored = stored_events(&backend, 1, 10, 11).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored["1:0xaaa:0"],
+            json!({
+                "contract_alias": "token",
+                "event_name": "Transfer",
+                "block_number": 10,
+                "block_hash": "0xaaa",
+                "data": "{\"value\":\"1\"}",
+            })
+        );
+        assert!(table_exists(&backend, "events_blocks").await.unwrap());
+        assert!(!table_exists(&backend, "events_transactions").await.unwrap());
+        assert_eq!(
+            count_rows(&backend, "events_blocks", 1, 10, 10)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let result = compare(stored, 10, 11, vec![]);
+        record_audit(Path::new("."), &config, &backend, "recent", &result)
+            .await
+            .unwrap();
+        let audits = client
+            .query(
+                "SELECT label, ok, stored_events, extra_count FROM events_quality_replay_checks",
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            audits["rows"],
+            json!([{"label": "recent", "ok": 0, "stored_events": 1, "extra_count": 1}])
+        );
+
+        client
+            .execute(&format!("DROP DATABASE {database}"))
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -484,7 +768,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(table_exists(&conn, "evm_transactions").unwrap());
-        assert_eq!(count_rows(&conn, "evm_transactions", 1, 10, 11).unwrap(), 2);
+        assert!(sqlite_table_exists(&conn, "evm_transactions").unwrap());
+        assert_eq!(
+            sqlite_count_rows(&conn, "evm_transactions", 1, 10, 11).unwrap(),
+            2
+        );
     }
 }

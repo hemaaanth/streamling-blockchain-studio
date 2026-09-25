@@ -1,5 +1,6 @@
 import hashlib
 import importlib.util
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,6 +44,28 @@ class InitializerTests(unittest.TestCase):
 
 
 class ClickHouseSyncTests(unittest.TestCase):
+    def test_selects_only_columns_the_sqlite_sink_writes(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        # Mirrors the events table created by the Streamling SQLite sink.
+        connection.execute(
+            "CREATE TABLE events (event_id TEXT PRIMARY KEY, chain_id INTEGER NOT NULL, "
+            "contract_alias TEXT NOT NULL, event_name TEXT NOT NULL, address TEXT NOT NULL, "
+            "block_number INTEGER NOT NULL, block_hash TEXT NOT NULL, block_timestamp INTEGER NOT NULL, "
+            "tx_hash TEXT NOT NULL, log_index INTEGER NOT NULL, topic0 TEXT NOT NULL, data TEXT NOT NULL)"
+        )
+        cursor = connection.execute(f"SELECT {', '.join(sync.COLUMNS)} FROM events")
+        self.assertIn("discovered_address", [column[0] for column in cursor.description])
+
+    def test_schema_comes_from_the_cli(self) -> None:
+        completed = mock.MagicMock(stdout='["CREATE DATABASE IF NOT EXISTS megapot_analytics"]')
+        with mock.patch.object(sync.subprocess, "run", return_value=completed) as run:
+            statements = sync.schema_statements(Path("/bin/streamling-blockchain"))
+        self.assertEqual(statements, ["CREATE DATABASE IF NOT EXISTS megapot_analytics"])
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/bin/streamling-blockchain", "clickhouse", "schema", "--database", "megapot_analytics", "--table", "events", "--json"],
+        )
+
     def test_password_is_sent_in_authorization_header_not_url(self) -> None:
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = b"ok"
