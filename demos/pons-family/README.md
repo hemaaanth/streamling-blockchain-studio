@@ -32,6 +32,8 @@ Without `--end-block`, the initializer fixes the end to the current head minus 1
 
 The dashboard shows the latest indexed block and does not refresh automatically.
 
+To build and publish this dashboard in one step, see "Publish a dashboard" in the repository README.
+
 Generated project state lives under `.local/demos/pons-family/` and is not committed.
 
 The dashboard reports native-quote volume only when `pairToken` is the zero address. ERC-20 quote assets remain separate so incompatible units are never summed.

@@ -55,7 +55,7 @@ pub async fn wait(root: &Path, poll: Duration) -> Result<Value> {
     }
 }
 
-fn read_progress(root: &Path) -> Result<Option<BackfillProgress>> {
+pub fn read_progress(root: &Path) -> Result<Option<BackfillProgress>> {
     let path = root.join(PROGRESS_FILE);
     if !path.exists() {
         return Ok(None);
