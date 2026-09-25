@@ -5020,6 +5020,7 @@ name = "streamling-blockchain"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "ethers-core",
  "hex",
@@ -5029,6 +5030,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "sha3",
  "tokio",
  "toml",

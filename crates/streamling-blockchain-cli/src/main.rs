@@ -6,6 +6,7 @@ mod goldsky;
 mod mcp;
 mod output;
 mod project;
+mod publish;
 mod replay;
 mod rpc;
 mod status;
@@ -208,6 +209,8 @@ enum Commands {
         #[command(subcommand)]
         command: ClickhouseCommand,
     },
+    /// Build a demo's Evidence site from this project's SQLite data and publish it.
+    Publish(publish::PublishArgs),
 }
 
 #[derive(Subcommand)]
@@ -801,6 +804,7 @@ async fn dispatch(cli: Cli, out: &mut Output) -> Result<Value> {
                 Ok(clickhouse_tables(&config))
             }
         },
+        Commands::Publish(args) => publish::run(&root, out, args).await,
         Commands::Doctor { streamling, plugin } => {
             run_streamling(
                 &root,

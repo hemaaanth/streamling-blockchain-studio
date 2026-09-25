@@ -52,6 +52,8 @@ npm --prefix demos/robinhood-stock-tokens run build
 npm --prefix demos/robinhood-stock-tokens run preview
 ```
 
+To build and publish this dashboard in one step, see "Publish a dashboard" in the repository README.
+
 ## Committed vs generated
 
 Committed:

@@ -192,6 +192,26 @@ npm --prefix demos/robinhood-stock-tokens run build
 
 MCP is available over stdio with the tools `streamling_blockchain_schema`, `streamling_blockchain_query`, and `streamling_blockchain_status`. `replay` refetches a closed block range and reports missing, extra, or changed local events without mutating the database. `audit` continuously replays the latest closed window and one older sampled window, then stores summaries in `quality_replay_checks`. `rpc-doctor --apply` writes a lower working `window` when the configured `eth_getLogs` range is too wide for the RPC provider.
 
+## Publish a dashboard
+
+`publish` builds a SQLite-backed demo's Evidence site from a project's database, writes `build/release.json`, checks the build, and ships it:
+
+```sh
+streamling-blockchain --project ./my-project publish demos/pons-family --target dir --out ./site
+streamling-blockchain --project ./my-project publish demos/pons-family --target herenow --name "Pons Family"
+streamling-blockchain --project ./my-project publish demos/pons-family --target herenow --name "Pons Family" --yes
+```
+
+The build runs `npm ci` when `node_modules/` is missing, then `npm run sources:sqlite` with `STREAMLING_BLOCKCHAIN_DB` set to the project database, then `npm run build`. `release.json` records the CLI version, build time, chain, contracts, discovery rules, block range, indexed height, event counts per contract and event, and the size and SHA-256 of every other file. It never contains the RPC URL or credentials.
+
+Before anything leaves the machine, `publish` searches every built file for the project's RPC URL (and the key-bearing part of it), the value of `rpc_url_env`, and `STREAMLING__CLICKHOUSE_SINK__PASSWORD`, and refuses on any match. It then reports the total size, file count, and five largest files. here.now allows 2,500 files and 10 GB per site, and 5 GB per file (250 MB for anonymous sites).
+
+`--target dir` copies the site to `--out`. It refuses a non-empty directory unless that directory holds an earlier `release.json`.
+
+`--target herenow` is a dry run until you pass `--yes`: it reports the file count, size, and whether it would create or update a site. Publishing uses `HERENOW_API_KEY` (create one at [here.now](https://here.now)). `--anonymous` publishes without a key; the site expires after 24 hours, and the output includes the expiry time and a claim URL. The CLI saves the site in `<project>/.streamling-blockchain/publish/<demo>.json` (mode `0600`; it may hold the claim token) and updates that site on the next publish, so the URL stays the same. `--new-site` creates a new site instead.
+
+A published site includes every row that the demo's source queries select. Aggregate large sources before publishing. The site is public unless you restrict access in here.now. We don't target Cloudflare Pages because each Evidence build bundles DuckDB WASM files of 34 MB and 39 MB, and Pages rejects files over 25 MiB.
+
 ## JSON output
 
 Every command accepts `--json` in any position. stdout then carries exactly one JSON object, and the exit code is non-zero on failure:
