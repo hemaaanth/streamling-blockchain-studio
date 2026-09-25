@@ -6,3 +6,4 @@ build/
 .env.*
 !.env.example
 sources/sqlite/events.db
+.publish/

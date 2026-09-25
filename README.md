@@ -208,13 +208,24 @@ streamling-blockchain --project ./my-project publish demos/pons-family --target 
 
 The build runs `npm ci` when `node_modules/` is missing, then `npm run sources:sqlite` with `STREAMLING_BLOCKCHAIN_DB` set to the project database, then `npm run build`. `release.json` records the CLI version, build time, chain, contracts, discovery rules, block range, indexed height, event counts per contract and event, and the size and SHA-256 of every other file. It never contains the RPC URL or credentials.
 
-Before anything leaves the machine, `publish` searches every built file for the project's RPC URL (and the key-bearing part of it), the value of `rpc_url_env`, and `STREAMLING__CLICKHOUSE_SINK__PASSWORD`, and refuses on any match. It then reports the total size, file count, and five largest files. here.now allows 2,500 files and 10 GB per site, and 5 GB per file (250 MB for anonymous sites).
+`--build-dir <dir>` publishes an already-built site instead, skipping the Streamling build entirely — for example an Evidence site backed by ClickHouse, which `publish` cannot build itself:
 
-`--target dir` copies the site to `--out`. It refuses a non-empty directory unless that directory holds an earlier `release.json`.
+```sh
+npm run sources && npm run build
+streamling-blockchain publish --build-dir build --target herenow --yes
+```
 
-`--target herenow` is a dry run until you pass `--yes`: it reports the file count, size, and whether it would create or update a site. Publishing uses `HERENOW_API_KEY` (create one at [here.now](https://here.now)). `--anonymous` publishes without a key; the site expires after 24 hours, and the output includes the expiry time and a claim URL. The CLI saves the site in `<project>/.streamling-blockchain/publish/<demo>.json` (mode `0600`; it may hold the claim token) and updates that site on the next publish, so the URL stays the same. `--new-site` creates a new site instead.
+`<demo>` and `--build-dir` are mutually exclusive; exactly one is required. With `--build-dir`, `--project` is ignored and the project need not exist, and `release.json` records only the CLI version, build time, `"source": "prebuilt"`, and the file list — there is no project to describe chain, contracts, or block range from.
+
+Before anything leaves the machine, `publish` searches every built file for `HERENOW_API_KEY` and for any `EVIDENCE_SOURCE__*` environment variable whose name contains `PASSWORD`, `SECRET`, `TOKEN`, `KEY`, or `CREDENTIAL` and whose value is at least 8 characters (short values like host, port, database, and username are not scanned). With a project (no `--build-dir`), it also searches for the project's RPC URL (and the key-bearing part of it), the value of `rpc_url_env`, and `STREAMLING__CLICKHOUSE_SINK__PASSWORD`. It refuses on any match, and reports the total size, file count, and five largest files. here.now allows 2,500 files and 10 GB per site, and 5 GB per file (250 MB for anonymous sites).
+
+`--target dir` copies the site to `--out`. It refuses a non-empty directory unless that directory holds an earlier `release.json`. This works with `--build-dir` too.
+
+`--target herenow` is a dry run until you pass `--yes`: it reports the file count, size, and whether it would create or update a site. Publishing uses `HERENOW_API_KEY` (create one at [here.now](https://here.now)). `--anonymous` publishes without a key; the site expires after 24 hours, and the output includes the expiry time and a claim URL. The CLI saves the site record (mode `0600`; it may hold the claim token) at `<project>/.streamling-blockchain/publish/<demo>.json` for a demo directory, or `<build-dir>/../.publish/herenow.json` for `--build-dir`, and updates that site on the next publish, so the URL stays the same. `--record <path>` overrides the location in either mode; gitignore it. `--new-site` creates a new site instead.
 
 A published site includes every row that the demo's source queries select. Aggregate large sources before publishing. The site is public unless you restrict access in here.now. We don't target Cloudflare Pages because each Evidence build bundles DuckDB WASM files of 34 MB and 39 MB, and Pages rejects files over 25 MiB.
+
+For a ClickHouse-backed Evidence source built with `evidence-connector-clickhouse`: the connector has a fixed 30 second request timeout, so pre-aggregate large sources rather than relying on Evidence to page through them; and ClickHouse `Date` columns arrive in Evidence as `VARCHAR`, not a date type.
 
 ## JSON output
 

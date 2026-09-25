@@ -7,3 +7,4 @@ build/
 .vercel
 .env*
 !.env.example
+.publish/
