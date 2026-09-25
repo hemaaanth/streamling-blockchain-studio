@@ -483,7 +483,7 @@ fn write_agent_files(root: &Path, config: &ProjectConfig) -> Result<()> {
 fn backend_guidance(config: &ProjectConfig) -> String {
     let mut out = String::new();
     if config.sinks.sqlite {
-        out.push_str("SQLite sink: `events` holds every decoded event with fields as JSON in `data`, and `<alias>__<event>` tables hold one column per event field. Use SQLite SQL, for example `json_extract(data, '$.from')`.\n");
+        out.push_str("SQLite sink: `events` holds every decoded event with fields as JSON in `data`, and `<alias>__<event>` tables hold one column per event field. Use SQLite SQL, for example `json_extract(data, '$.from')`. Integer fields are decimal strings; sort or compare them with `int_sortkey(value)`, not `CAST(value AS INTEGER)` or `CAST(value AS REAL)`, which silently break above i64 or lose precision on int256/uint256.\n");
     }
     if let Some(clickhouse) = &config.sinks.clickhouse {
         let table = clickhouse.database.as_deref().map_or_else(
@@ -491,7 +491,7 @@ fn backend_guidance(config: &ProjectConfig) -> String {
             |db| format!("{db}.{}", clickhouse.table),
         );
         out.push_str(&format!(
-            "ClickHouse sink: `{table}` holds every decoded event with fields as JSON in `fields_json`; there are no per-event tables. Use ClickHouse SQL, for example `JSONExtractString(fields_json, 'from')`, and read current rows with `FROM {table} FINAL WHERE is_deleted = 0`. Connection settings come from the `STREAMLING__CLICKHOUSE_SINK__*` environment variables.\n"
+            "ClickHouse sink: `{table}` holds every decoded event with fields as JSON in `fields_json`; there are no per-event tables. Use ClickHouse SQL, for example `JSONExtractString(fields_json, 'from')`, and read current rows with `FROM {table} FINAL WHERE is_deleted = 0`. Connection settings come from the `STREAMLING__CLICKHOUSE_SINK__*` environment variables. Sort or do arithmetic on integer fields with `toUInt256(JSONExtractString(fields_json, 'value'))` or `toInt256(...)`, not a plain string or float comparison.\n"
         ));
     }
     if config.sinks.sqlite && config.sinks.clickhouse.is_some() {

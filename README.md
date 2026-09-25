@@ -156,6 +156,8 @@ streamling-blockchain --project ./my-project sql \
 streamling-blockchain --project ./my-project sql \
   'SELECT chain_id, block_number, block_timestamp, transaction_count FROM evm_blocks ORDER BY block_number DESC LIMIT 20'
 streamling-blockchain --project ./my-project sql \
+  "SELECT json_extract(data, '$.value') AS value FROM events ORDER BY int_sortkey(json_extract(data, '$.value')) DESC LIMIT 20"
+streamling-blockchain --project ./my-project sql \
   'SELECT chain_id, block_number, transaction_index, from_address, to_address, receipt_status, receipt_gas_used FROM evm_transactions ORDER BY block_number DESC, transaction_index DESC LIMIT 20'
 streamling-blockchain --project ./my-project sql \
   --attach base=../base/.streamling-blockchain/events.db \
@@ -172,6 +174,8 @@ streamling-blockchain --project ./my-project mcp
 ```
 
 `sql`, `schema`, `replay`, `audit`, and `mcp` read the SQLite sink by default and the ClickHouse sink when SQLite is disabled. Pass `--backend sqlite` or `--backend clickhouse` to choose when both sinks are enabled. ClickHouse commands use the `STREAMLING__CLICKHOUSE_SINK__*` connection settings. Every `sql` and MCP query runs with ClickHouse's `readonly=1` setting, so the server rejects writes; this also works for users whose profile is already read-only. SQL uses the backend's dialect: `json_extract(data, '$.from')` in SQLite and `JSONExtractString(fields_json, 'from')` in ClickHouse. The per-event `<alias>__<event>` tables exist only in SQLite. On ClickHouse, `audit` stores its summaries in `<table>_quality_replay_checks`, and `--attach` is SQLite-only.
+
+Decoded `uint256`/`int256` event fields are stored as decimal strings, so a plain `ORDER BY` sorts them as text (`"9"` after `"10"`) and `CAST(... AS INTEGER)` silently breaks above `i64`. On SQLite, sort or compare them with the built-in `int_sortkey(value)` scalar function instead, as in the `sql` example above; on ClickHouse, use `toUInt256(JSONExtractString(fields_json, 'value'))` or `toInt256(...)`.
 
 ```sh
 streamling-blockchain --project ./my-project schema --backend clickhouse
