@@ -1,4 +1,8 @@
-use crate::{config::ProjectConfig, project};
+use crate::{
+    config::ProjectConfig,
+    output::{CodedError, ErrorCode},
+    project,
+};
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json, value::RawValue};
 
@@ -151,7 +155,10 @@ impl ClickHouse {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            bail!("ClickHouse returned {status}: {}", text.trim());
+            bail!(CodedError::new(
+                response_code(status.as_u16(), &text),
+                format!("ClickHouse returned {status}: {}", text.trim())
+            ));
         }
         Ok(response)
     }
@@ -218,6 +225,20 @@ pub(crate) async fn apply_schema_with(
         }
     }
     Ok(warnings)
+}
+
+/// Maps a failed ClickHouse HTTP response to an error code by status and exception name.
+fn response_code(status: u16, text: &str) -> ErrorCode {
+    match status {
+        _ if text.contains("AUTHENTICATION_FAILED") || text.contains("REQUIRED_PASSWORD") => {
+            ErrorCode::MissingCredentials
+        }
+        401 => ErrorCode::MissingCredentials,
+        408 | 429 | 502..=504 => ErrorCode::TransientDependency,
+        400..=499 => ErrorCode::Validation,
+        _ if text.contains("(READONLY)") => ErrorCode::Validation,
+        _ => ErrorCode::Internal,
+    }
 }
 
 pub fn quote_string(value: &str) -> String {

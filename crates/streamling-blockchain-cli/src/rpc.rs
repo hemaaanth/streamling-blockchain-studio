@@ -1,3 +1,4 @@
+use crate::output::{CodedError, ErrorCode};
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -45,10 +46,18 @@ pub async fn rpc(client: &Client, url: &str, method: &str, params: Value) -> Res
             continue;
         }
         if !status.is_success() {
-            bail!("{method} returned HTTP {status}: {body}")
+            let message = format!("{method} returned HTTP {status}: {body}");
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                bail!(CodedError::new(ErrorCode::TransientDependency, message))
+            }
+            bail!(message)
         }
         if let Some(error) = body.get("error") {
-            bail!("{method} failed: {error}")
+            bail!(call_error(
+                method,
+                &body,
+                format!("{method} failed: {error}")
+            ))
         }
         return body
             .get("result")
@@ -56,6 +65,20 @@ pub async fn rpc(client: &Client, url: &str, method: &str, params: Value) -> Res
             .context("JSON-RPC response omitted result");
     }
     unreachable!("bounded retry loop returns on final attempt")
+}
+
+/// A JSON-RPC error: rate limits are transient; a refused `eth_getLogs` range is usually
+/// wider than the provider allows, which `rpc-doctor` measures.
+pub fn call_error(method: &str, body: &Value, message: String) -> anyhow::Error {
+    if is_rate_limited(reqwest::StatusCode::OK, body) {
+        CodedError::new(ErrorCode::TransientDependency, message).into()
+    } else if method == "eth_getLogs" {
+        CodedError::new(ErrorCode::Validation, message)
+            .next("streamling-blockchain rpc-doctor")
+            .into()
+    } else {
+        anyhow::Error::msg(message)
+    }
 }
 
 fn is_rate_limited(status: reqwest::StatusCode, body: &Value) -> bool {
@@ -86,7 +109,10 @@ pub async fn detect_chain(
             return Ok(((*name).to_owned(), *id, (*url).to_owned()));
         }
     }
-    bail!("contract bytecode was not found on Ethereum, Arbitrum One, or Base; pass --rpc")
+    bail!(CodedError::new(
+        ErrorCode::NotFound,
+        "contract bytecode was not found on Ethereum, Arbitrum One, or Base; pass --rpc"
+    ))
 }
 
 async fn ensure_contract(client: &Client, url: &str, address: &str) -> Result<()> {
@@ -134,7 +160,15 @@ pub async fn fetch_sourcify_abi(client: &Client, chain_id: u64, address: &str) -
             }
         }
     }
-    bail!("ABI not found on Sourcify; pass --abi <file>")
+    bail!(
+        CodedError::new(
+            ErrorCode::NotFound,
+            "ABI not found on Sourcify; pass --abi <file>"
+        )
+        .next(format!(
+            "streamling-blockchain abi fetch {address} --chain-id {chain_id} --source etherscan --out <file>"
+        ))
+    )
 }
 
 pub async fn fetch_etherscan_v2_abi(
@@ -155,7 +189,9 @@ pub async fn fetch_etherscan_v2_abi(
         request = request.query(&[("apikey", key)]);
     }
     let payload: Value = request.send().await?.json().await?;
-    explorer_abi(&payload).with_context(|| format!("ABI not found through {base}"))
+    explorer_abi(&payload).ok_or_else(|| {
+        CodedError::new(ErrorCode::NotFound, format!("ABI not found through {base}")).into()
+    })
 }
 
 pub async fn fetch_etherscan_compatible_abi(
@@ -177,7 +213,9 @@ pub async fn fetch_etherscan_compatible_abi(
         request = request.query(&[("apikey", key)]);
     }
     let payload: Value = request.send().await?.json().await?;
-    explorer_abi(&payload).with_context(|| format!("ABI not found through {base}"))
+    explorer_abi(&payload).ok_or_else(|| {
+        CodedError::new(ErrorCode::NotFound, format!("ABI not found through {base}")).into()
+    })
 }
 
 pub async fn fetch_blockscout_abi(client: &Client, address: &str, base_url: &str) -> Result<Value> {
@@ -192,7 +230,13 @@ pub async fn fetch_blockscout_abi(client: &Client, address: &str, base_url: &str
         .await?
         .json()
         .await?;
-    explorer_abi(&payload).with_context(|| format!("ABI not found through {base_url}"))
+    explorer_abi(&payload).ok_or_else(|| {
+        CodedError::new(
+            ErrorCode::NotFound,
+            format!("ABI not found through {base_url}"),
+        )
+        .into()
+    })
 }
 
 pub fn default_etherscan_base_url(chain_id: u64) -> &'static str {

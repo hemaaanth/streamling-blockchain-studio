@@ -467,14 +467,14 @@ fn write_agent_files(root: &Path, config: &ProjectConfig) -> Result<()> {
     std::fs::write(
         root.join("llms.txt"),
         format!(
-            "# Streamling Blockchain Studio project\n\nContracts: {aliases}\n\nKeep this project on persistent storage. Streamling checkpoints live inside the project directory; restarting `streamling-blockchain dev` with the same project resumes from the last committed checkpoint. Use `streamling-blockchain status --json` to inspect backfill progress and `streamling-blockchain status --wait` to block until the safe chain head is indexed. Use `streamling-blockchain schema` before writing SQL. Query with `streamling-blockchain sql --json <QUERY>`. Quote Solidity names such as `from`. Discovered child contracts are filtered by Streamling dynamic tables before persistence.\n\n{backends}"
+            "# Streamling Blockchain Studio project\n\nContracts: {aliases}\n\nKeep this project on persistent storage. Streamling checkpoints live inside the project directory; restarting `streamling-blockchain dev` with the same project resumes from the last committed checkpoint. Use `streamling-blockchain status --json` to inspect backfill progress and `streamling-blockchain status --wait` to block until the safe chain head is indexed. Use `streamling-blockchain schema` before writing SQL. Query with `streamling-blockchain sql --json <QUERY>`. With `--json`, every command prints one JSON envelope with `ok`, `data`, `warnings`, and `error` (`code`, `message`, `retryable`, `suggested_next`); read results from `data` and branch on `error.code`. Quote Solidity names such as `from`. Discovered child contracts are filtered by Streamling dynamic tables before persistence.\n\n{backends}"
         ),
     )?;
     std::fs::create_dir_all(root.join("skills/streamling-blockchain-query"))?;
     std::fs::write(
         root.join("skills/streamling-blockchain-query/SKILL.md"),
         format!(
-            "---\nname: streamling-blockchain-query\ndescription: Query a Streamling Blockchain Studio event database.\n---\n\nKeep the project on persistent storage and reuse it after restarts so Streamling resumes its checkpoint. Run `streamling-blockchain status --json` to inspect backfill progress or `streamling-blockchain status --wait` when work must begin only after catch-up. Run `streamling-blockchain schema` before querying, then use `streamling-blockchain sql --json '<SQL>'`. Prefer explicit columns, quote Solidity identifiers, and include LIMIT for exploratory queries.\n\n{backends}"
+            "---\nname: streamling-blockchain-query\ndescription: Query a Streamling Blockchain Studio event database.\n---\n\nKeep the project on persistent storage and reuse it after restarts so Streamling resumes its checkpoint. Run `streamling-blockchain status --json` to inspect backfill progress or `streamling-blockchain status --wait` when work must begin only after catch-up. Run `streamling-blockchain schema` before querying, then use `streamling-blockchain sql --json '<SQL>'`. With `--json`, every command prints one JSON envelope with `ok`, `data`, `warnings`, and `error` (`code`, `message`, `retryable`, `suggested_next`); read results from `data` and branch on `error.code`. Prefer explicit columns, quote Solidity identifiers, and include LIMIT for exploratory queries.\n\n{backends}"
         ),
     )?;
     Ok(())
@@ -682,6 +682,7 @@ mod tests {
         assert!(llms.contains("`<alias>__<event>` tables"));
         assert!(llms.contains("FROM analytics.events FINAL WHERE is_deleted = 0"));
         assert!(llms.contains("--backend clickhouse"));
+        assert!(llms.contains("branch on `error.code`"));
         let semantics = std::fs::read_to_string(root.join("semantic.toml")).unwrap();
         assert!(semantics.contains("signature = \"Transfer(address,address,uint256)\""));
         assert!(semantics.contains("topic0 = \"0xddf252ad"));

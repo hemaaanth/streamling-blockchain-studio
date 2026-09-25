@@ -1,3 +1,4 @@
+use crate::output::{CodedError, ErrorCode};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -119,6 +120,11 @@ impl ProjectConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.check()
+            .map_err(|error| CodedError::wrap(ErrorCode::Validation, error).into())
+    }
+
+    fn check(&self) -> Result<()> {
         if self.rpc_url.is_empty() == self.rpc_url_env.is_none() {
             bail!("exactly one of rpc_url or rpc_url_env is required")
         }
@@ -187,7 +193,10 @@ impl ProjectConfig {
 
 pub fn validate_alias(alias: &str) -> Result<()> {
     if alias.is_empty() || !alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        bail!("alias must contain only ASCII letters, digits, and underscores")
+        bail!(CodedError::new(
+            ErrorCode::Validation,
+            "alias must contain only ASCII letters, digits, and underscores"
+        ))
     }
     Ok(())
 }
@@ -195,7 +204,10 @@ pub fn validate_alias(alias: &str) -> Result<()> {
 pub fn validate_address(address: &str) -> Result<()> {
     let raw = address.strip_prefix("0x").unwrap_or(address);
     if raw.len() != 40 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("invalid EVM address: {address}")
+        bail!(CodedError::new(
+            ErrorCode::Validation,
+            format!("invalid EVM address: {address}")
+        ))
     }
     Ok(())
 }

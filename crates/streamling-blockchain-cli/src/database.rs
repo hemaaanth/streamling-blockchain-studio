@@ -1,4 +1,8 @@
-use crate::{clickhouse::ClickHouse, config::ProjectConfig};
+use crate::{
+    clickhouse::ClickHouse,
+    config::ProjectConfig,
+    output::{CodedError, ErrorCode},
+};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
 use serde_json::{Map, Value, json};
@@ -13,12 +17,20 @@ pub enum BackendKind {
 /// The configured sink that read commands query. SQLite wins when both sinks are enabled.
 pub fn resolve(config: &ProjectConfig, requested: Option<BackendKind>) -> Result<BackendKind> {
     match requested {
-        Some(BackendKind::Sqlite) if !config.sinks.sqlite => {
-            bail!("this project has no SQLite sink; use --backend clickhouse")
-        }
-        Some(BackendKind::Clickhouse) if config.sinks.clickhouse.is_none() => {
-            bail!("this project has no ClickHouse sink; use --backend sqlite")
-        }
+        Some(BackendKind::Sqlite) if !config.sinks.sqlite => bail!(
+            CodedError::new(
+                ErrorCode::Validation,
+                "this project has no SQLite sink; use --backend clickhouse"
+            )
+            .next("streamling-blockchain schema --backend clickhouse")
+        ),
+        Some(BackendKind::Clickhouse) if config.sinks.clickhouse.is_none() => bail!(
+            CodedError::new(
+                ErrorCode::Validation,
+                "this project has no ClickHouse sink; use --backend sqlite"
+            )
+            .next("streamling-blockchain schema --backend sqlite")
+        ),
         Some(kind) => Ok(kind),
         None if config.sinks.sqlite => Ok(BackendKind::Sqlite),
         None => Ok(BackendKind::Clickhouse),
@@ -78,7 +90,13 @@ impl Backend {
 
 pub fn open(path: &Path) -> Result<Connection> {
     if !path.exists() {
-        bail!("database does not exist yet: run `streamling-blockchain dev`");
+        bail!(
+            CodedError::new(
+                ErrorCode::NotFound,
+                "database does not exist yet: run `streamling-blockchain dev`"
+            )
+            .next("streamling-blockchain dev")
+        );
     }
     Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("open {} read-only", path.display()))
