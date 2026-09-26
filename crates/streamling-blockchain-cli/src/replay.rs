@@ -290,10 +290,12 @@ async fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value> {
         .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
         .send()
         .await
+        .map_err(reqwest::Error::without_url)
         .with_context(|| format!("call {method}"))?;
     let payload: Value = response
         .json()
         .await
+        .map_err(reqwest::Error::without_url)
         .with_context(|| format!("decode {method}"))?;
     if let Some(error) = payload.get("error") {
         bail!(rpc::call_error(
