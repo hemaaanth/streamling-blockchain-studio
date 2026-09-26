@@ -47,10 +47,13 @@ async fn rpc_request(
             .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
             .send()
             .await
-            .map_err(|e| PluginError::Execution(format!("{method}: {e}")))?
+            // The RPC URL often carries an API key; keep it out of error messages and logs.
+            .map_err(|e| PluginError::Execution(format!("{method}: {}", e.without_url())))?
             .json()
             .await
-            .map_err(|e| PluginError::Execution(format!("{method} response: {e}")))?;
+            .map_err(|e| {
+                PluginError::Execution(format!("{method} response: {}", e.without_url()))
+            })?;
         if let Some(error) = body.get("error") {
             if is_rate_limited(error) && attempt < 5 {
                 rt.sleep(RDuration::from_millis(1_000 << attempt)).await;
@@ -873,6 +876,7 @@ impl SourcePlugin for EvmEventSource {
             self.window.store(current_window, Ordering::Relaxed);
             break (to, logs, child_contracts);
         };
+        let mut timestamps = log_block_timestamps(&logs);
         let mut rows = Vec::new();
         for log in logs {
             if let Some(row) = decode_row(
@@ -886,9 +890,11 @@ impl SourcePlugin for EvmEventSource {
                 rows.push(row);
             }
         }
+        // Only blocks whose logs lacked `blockTimestamp` cost an extra RPC call.
         let blocks = rows
             .iter()
             .map(|row| row.block_number)
+            .filter(|block| !timestamps.contains_key(block))
             .collect::<HashSet<_>>();
         let timestamp_results = stream::iter(blocks.into_iter().map(|block| async move {
             self.block_timestamp(block)
@@ -898,7 +904,6 @@ impl SourcePlugin for EvmEventSource {
         .buffer_unordered(8)
         .collect::<Vec<_>>()
         .await;
-        let mut timestamps = HashMap::new();
         for result in timestamp_results {
             let (block, timestamp) = result?;
             timestamps.insert(block, timestamp);
@@ -1583,6 +1588,17 @@ fn is_get_logs_range_error(error: &PluginError) -> bool {
             || text.contains("range too large")
             || text.contains("log query timed out"))
 }
+/// Block timestamps carried on the logs themselves. Many providers add the
+/// non-standard `blockTimestamp` field to `eth_getLogs` results.
+fn log_block_timestamps(logs: &[Value]) -> HashMap<u64, u64> {
+    logs.iter()
+        .filter_map(|log| {
+            let block = parse_hex(log.get("blockNumber")?.as_str()?).ok()?;
+            let timestamp = parse_hex(log.get("blockTimestamp")?.as_str()?).ok()?;
+            Some((block, timestamp))
+        })
+        .collect()
+}
 fn parse_hex(text: &str) -> Result<u64, PluginError> {
     u64::from_str_radix(text.trim_start_matches("0x"), 16).map_err(internal)
 }
@@ -1724,6 +1740,17 @@ mod tests {
             row.contract_address.as_deref(),
             Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
         );
+    }
+
+    #[test]
+    fn log_block_timestamps_skip_logs_without_the_field() {
+        let timestamps = log_block_timestamps(&[
+            json!({"blockNumber": "0x7b", "blockTimestamp": "0x65"}),
+            json!({"blockNumber": "0x7c"}),
+            json!({"blockNumber": "0x7d", "blockTimestamp": null}),
+        ]);
+
+        assert_eq!(timestamps, HashMap::from([(123, 101)]));
     }
 
     #[test]

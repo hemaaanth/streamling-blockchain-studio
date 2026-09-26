@@ -38,9 +38,15 @@ pub async fn rpc(client: &Client, url: &str, method: &str, params: Value) -> Res
             }))
             .send()
             .await
-            .with_context(|| format!("{method} request to {url}"))?;
+            // The URL often carries an API key; keep it out of error messages.
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("{method} request failed"))?;
         let status = response.status();
-        let body: Value = response.json().await.context("decode JSON-RPC response")?;
+        let body: Value = response
+            .json()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("decode JSON-RPC response")?;
         if is_rate_limited(status, &body) && attempt + 1 < RATE_LIMIT_ATTEMPTS {
             tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
             continue;
@@ -188,7 +194,13 @@ pub async fn fetch_etherscan_v2_abi(
     if let Some(key) = api_key {
         request = request.query(&[("apikey", key)]);
     }
-    let payload: Value = request.send().await?.json().await?;
+    let payload: Value = request
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?
+        .json()
+        .await
+        .map_err(reqwest::Error::without_url)?;
     explorer_abi(&payload).ok_or_else(|| {
         CodedError::new(ErrorCode::NotFound, format!("ABI not found through {base}")).into()
     })
@@ -212,7 +224,13 @@ pub async fn fetch_etherscan_compatible_abi(
     if let Some(key) = api_key {
         request = request.query(&[("apikey", key)]);
     }
-    let payload: Value = request.send().await?.json().await?;
+    let payload: Value = request
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?
+        .json()
+        .await
+        .map_err(reqwest::Error::without_url)?;
     explorer_abi(&payload).ok_or_else(|| {
         CodedError::new(ErrorCode::NotFound, format!("ABI not found through {base}")).into()
     })
