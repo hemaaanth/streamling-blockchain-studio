@@ -174,7 +174,7 @@ fn write_pipeline(root: &Path, config: &ProjectConfig) -> Result<()> {
         "confirmations": config.confirmations.to_string(),
         "window": config.window.to_string(),
         "chain_id": config.chain_id.to_string(),
-        "progress_path": root.join("backfill-progress.json").to_string_lossy(),
+        "progress_path": root.join(crate::status::PROGRESS_FILE).to_string_lossy(),
         "spec": plugin_options
     });
     if let Some(end_block) = config.end_block {
@@ -199,8 +199,10 @@ fn write_pipeline(root: &Path, config: &ProjectConfig) -> Result<()> {
             "start_block": config.start_block.to_string(),
             "confirmations": config.confirmations.to_string(),
             "window": config.window.to_string(),
+            "concurrency": config.block_concurrency.to_string(),
+            "rpc_batch_size": config.block_batch_size.to_string(),
             "chain_id": config.chain_id.to_string(),
-            "progress_path": root.join("blocks-progress.json").to_string_lossy(),
+            "progress_path": root.join(crate::status::BLOCKS_PROGRESS_FILE).to_string_lossy(),
         });
         if let Some(end_block) = config.end_block {
             block_options["end_block"] = end_block.to_string().into();
@@ -224,11 +226,16 @@ fn write_pipeline(root: &Path, config: &ProjectConfig) -> Result<()> {
             "start_block": config.start_block.to_string(),
             "confirmations": config.confirmations.to_string(),
             "window": config.window.to_string(),
+            "concurrency": config.block_concurrency.to_string(),
+            "rpc_batch_size": config.block_batch_size.to_string(),
             "chain_id": config.chain_id.to_string(),
-            "progress_path": root.join("transactions-progress.json").to_string_lossy(),
+            "progress_path": root.join(crate::status::TRANSACTIONS_PROGRESS_FILE).to_string_lossy(),
         });
         if let Some(end_block) = config.end_block {
             transaction_options["end_block"] = end_block.to_string().into();
+        }
+        if config.skip_calldata {
+            transaction_options["store_input"] = "false".into();
         }
         if let Some(name) = &config.rpc_url_env {
             transaction_options["rpc_url_env"] = name.clone().into();
@@ -551,8 +558,11 @@ mod tests {
             confirmations: 12,
             end_block: Some(25),
             window: 2_000,
+            block_concurrency: 8,
+            block_batch_size: 1,
             index_blocks: true,
             index_transactions: true,
+            skip_calldata: false,
             contracts: vec![ContractConfig {
                 alias: "token".into(),
                 address: "0x1111111111111111111111111111111111111111".into(),
@@ -613,6 +623,42 @@ mod tests {
             "8453"
         );
         assert_eq!(pipeline["sources"]["evm_blocks"]["primary_key"], "block_id");
+        assert_eq!(
+            pipeline["sources"]["evm_blocks"]["options"]["concurrency"],
+            "8"
+        );
+        assert_eq!(
+            pipeline["sources"]["evm_transactions"]["options"]["concurrency"],
+            "8"
+        );
+        // The Streamling host does not pass a source option named `batch_size` to plugins.
+        assert_eq!(
+            pipeline["sources"]["evm_blocks"]["options"]["rpc_batch_size"],
+            "1"
+        );
+        assert!(
+            pipeline["sources"]["evm_blocks"]["options"]
+                .get("batch_size")
+                .is_none()
+        );
+        assert!(
+            pipeline["sources"]["evm_transactions"]["options"]
+                .get("store_input")
+                .is_none()
+        );
+        let skipping = ProjectConfig {
+            skip_calldata: true,
+            ..config.clone()
+        };
+        write_generated_files(&root, &skipping).unwrap();
+        let skipped: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(root.join("pipeline.yaml")).unwrap())
+                .unwrap();
+        assert_eq!(
+            skipped["sources"]["evm_transactions"]["options"]["store_input"],
+            "false"
+        );
+        write_generated_files(&root, &config).unwrap();
         assert_eq!(
             pipeline["sources"]["evm_blocks"]["options"]["chain_id"],
             "8453"

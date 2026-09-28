@@ -95,13 +95,39 @@ fn is_rate_limited(status: reqwest::StatusCode, body: &Value) -> bool {
             .is_some_and(|code| code == 429)
 }
 
+/// `rpc_url` may list several endpoints for one chain, separated by commas; the plugin
+/// balances across them.
+pub fn split_urls(urls: &str) -> impl Iterator<Item = &str> {
+    urls.split(',').map(str::trim).filter(|url| !url.is_empty())
+}
+
+/// The endpoint the CLI uses for its own single-endpoint checks.
+pub fn primary_url(urls: &str) -> &str {
+    split_urls(urls).next().unwrap_or_default()
+}
+
+/// Returns the chain name, chain ID, and the first endpoint.
 pub async fn detect_chain(
     client: &Client,
     address: &str,
     explicit_rpc: Option<&str>,
 ) -> Result<(String, u64, String)> {
-    if let Some(url) = explicit_rpc {
+    if let Some(urls) = explicit_rpc {
+        let url = primary_url(urls);
         let id = hex_u64(&rpc(client, url, "eth_chainId", json!([])).await?)?;
+        // Name endpoints by position: the URLs often carry API keys.
+        for (index, other) in split_urls(urls).enumerate().skip(1) {
+            let other_id = hex_u64(&rpc(client, other, "eth_chainId", json!([])).await?)?;
+            if other_id != id {
+                bail!(CodedError::new(
+                    ErrorCode::Validation,
+                    format!(
+                        "RPC endpoints disagree on chain: endpoint 1 is {id}, endpoint {} is {other_id}",
+                        index + 1
+                    )
+                ))
+            }
+        }
         let name = BUILTIN_CHAINS
             .iter()
             .find(|(_, chain_id, _)| *chain_id == id)

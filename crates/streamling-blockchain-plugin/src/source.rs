@@ -1,3 +1,4 @@
+use crate::rpc::RpcPool;
 use abi_stable::std_types::RDuration;
 use arrow::{
     array::{RecordBatch, StringBuilder, UInt64Builder},
@@ -8,11 +9,11 @@ use ethers_core::{
     abi::{Abi, Event, RawLog, Token},
     types::H256,
 };
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     str::FromStr,
@@ -20,61 +21,50 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
 };
-const USER_AGENT: &str = "streamling-blockchain/0.1";
 const MAX_ADDRESSES_PER_LOG_FILTER: usize = 500;
 const MAX_CONCURRENT_LOG_REQUESTS: usize = 4;
+const DEFAULT_BLOCK_CONCURRENCY: u64 = 8;
+const DEFAULT_BATCH_SIZE: u64 = 1;
 
-fn rpc_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .expect("static HTTP client configuration builds")
-}
-async fn rpc_request(
+/// Fetch blocks at or below the safe head, in order. A load-balanced RPC can answer `null`
+/// from a lagging node, so retry those instead of silently skipping the block.
+async fn fetch_blocks(
     rt: &PluginAsyncRuntimeObj,
-    client: &reqwest::Client,
-    rpc_url: &str,
-    method: &str,
-    params: Value,
-) -> Result<Value, PluginError> {
-    for attempt in 0..6 {
-        let body: Value = client
-            .post(rpc_url)
-            .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
-            .send()
-            .await
-            // The RPC URL often carries an API key; keep it out of error messages and logs.
-            .map_err(|e| PluginError::Execution(format!("{method}: {}", e.without_url())))?
-            .json()
-            .await
-            .map_err(|e| {
-                PluginError::Execution(format!("{method} response: {}", e.without_url()))
-            })?;
-        if let Some(error) = body.get("error") {
-            if is_rate_limited(error) && attempt < 5 {
-                rt.sleep(RDuration::from_millis(1_000 << attempt)).await;
-                continue;
-            }
-            return Err(PluginError::Execution(format!("{method}: {error}")));
+    rpc: &RpcPool,
+    numbers: &[u64],
+    full_transactions: bool,
+) -> Result<Vec<Value>, PluginError> {
+    let mut blocks = vec![Value::Null; numbers.len()];
+    for attempt in 0..5 {
+        let missing = (0..numbers.len())
+            .filter(|&index| blocks[index].is_null())
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(blocks);
         }
-        return body
-            .get("result")
-            .cloned()
-            .ok_or_else(|| PluginError::Execution(format!("{method}: missing result")));
+        if attempt > 0 {
+            rt.sleep(RDuration::from_millis(500 << attempt)).await;
+        }
+        let params = missing
+            .iter()
+            .map(|&index| json!([format!("0x{:x}", numbers[index]), full_transactions]))
+            .collect();
+        let values = rpc.batch(rt, "eth_getBlockByNumber", params).await?;
+        for (index, value) in missing.into_iter().zip(values) {
+            blocks[index] = value;
+        }
     }
-    unreachable!("bounded retry loop returns on final attempt")
-}
-
-fn is_rate_limited(error: &Value) -> bool {
-    error.get("code").and_then(Value::as_i64) == Some(429)
-        || error
-            .get("message")
-            .and_then(Value::as_str)
-            .is_some_and(|message| message.contains("Too Many Requests"))
+    match numbers
+        .iter()
+        .zip(&blocks)
+        .find(|(_, block)| block.is_null())
+    {
+        Some((number, _)) => Err(PluginError::Execution(format!(
+            "eth_getBlockByNumber: block {number} is unavailable below the safe head"
+        ))),
+        None => Ok(blocks),
+    }
 }
 
 use streamling_plugin::api::{
@@ -114,14 +104,12 @@ struct EventDescriptor {
 pub struct EvmEventSource {
     rt: PluginAsyncRuntimeObj,
     metrics: PluginMetricsRecorder,
-    client: reqwest::Client,
-    rpc_url: String,
+    rpc: RpcPool,
     chain_id: u64,
     confirmations: u64,
     window: AtomicU64,
-    next_block: AtomicU64,
+    cursor: Cursor,
     progress_path: Option<PathBuf>,
-    latest_progress: Mutex<(u64, u64)>,
     end_block: Option<u64>,
     state: Arc<PluginStateBackend<SourceState>>,
     schema: SchemaRef,
@@ -147,17 +135,7 @@ impl EvmEventSource {
                 PluginInitializationError::Configuration(format!("missing option {name}").into())
             })
         };
-        let rpc_url = if let Some(url) = options.get("rpc_url") {
-            url.clone()
-        } else if let Some(name) = options.get("rpc_url_env") {
-            std::env::var(name).map_err(|_| {
-                PluginInitializationError::Configuration(format!("read ${name}").into())
-            })?
-        } else {
-            return Err(PluginInitializationError::Configuration(
-                "missing option rpc_url or rpc_url_env".into(),
-            ));
-        };
+        let rpc = RpcPool::from_options(&options, 1)?;
         let start_block = parse_option(&options, "start_block", 0)?;
         let confirmations = parse_option(&options, "confirmations", 12)?;
         let window = parse_option(&options, "window", 2_000)?;
@@ -221,15 +199,13 @@ impl EvmEventSource {
         Ok(Self {
             rt,
             metrics,
-            client: rpc_client(),
-            rpc_url,
+            rpc,
             chain_id,
             confirmations,
             window: AtomicU64::new(window),
             end_block,
-            next_block: AtomicU64::new(start_block),
+            cursor: Cursor::new(start_block),
             progress_path: options.get("progress_path").map(PathBuf::from),
-            latest_progress: Mutex::new((start_block.saturating_sub(1), 0)),
             state: state_factory.create(),
             schema,
             events,
@@ -243,39 +219,8 @@ impl EvmEventSource {
         })
     }
 
-    fn write_progress(
-        &self,
-        indexed_through: u64,
-        observed_head: u64,
-        safe_head: u64,
-    ) -> Result<(), PluginError> {
-        let Some(path) = &self.progress_path else {
-            return Ok(());
-        };
-        let progress = BackfillProgress {
-            indexed_through,
-            observed_head,
-            safe_head,
-            confirmations: self.confirmations,
-            caught_up: indexed_through >= safe_head,
-            updated_at_unix: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        };
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).map_err(progress_error)?;
-        let temporary = path.with_extension("json.tmp");
-        fs::write(
-            &temporary,
-            serde_json::to_vec(&progress).map_err(progress_error)?,
-        )
-        .map_err(progress_error)?;
-        fs::rename(&temporary, path).map_err(progress_error)
-    }
-
     async fn rpc(&self, method: &str, params: Value) -> Result<Value, PluginError> {
-        rpc_request(&self.rt, &self.client, &self.rpc_url, method, params).await
+        self.rpc.request(&self.rt, method, params).await
     }
 
     async fn block_timestamp(&self, block: u64) -> Result<u64, PluginError> {
@@ -297,11 +242,12 @@ impl EvmEventSource {
 pub struct EvmBlockSource {
     rt: PluginAsyncRuntimeObj,
     metrics: PluginMetricsRecorder,
-    client: reqwest::Client,
-    rpc_url: String,
+    rpc: RpcPool,
     confirmations: u64,
     window: u64,
-    next_block: AtomicU64,
+    concurrency: usize,
+    batch_size: usize,
+    cursor: Cursor,
     progress_path: Option<PathBuf>,
     end_block: Option<u64>,
     chain_id: u64,
@@ -317,17 +263,7 @@ impl EvmBlockSource {
         metrics: PluginMetricsRecorder,
         options: HashMap<String, String>,
     ) -> Result<Self, PluginInitializationError> {
-        let rpc_url = if let Some(url) = options.get("rpc_url") {
-            url.clone()
-        } else if let Some(name) = options.get("rpc_url_env") {
-            std::env::var(name).map_err(|_| {
-                PluginInitializationError::Configuration(format!("read ${name}").into())
-            })?
-        } else {
-            return Err(PluginInitializationError::Configuration(
-                "missing option rpc_url or rpc_url_env".into(),
-            ));
-        };
+        let rpc = RpcPool::from_options(&options, parse_batch_size(&options)?)?;
         let window = parse_option(&options, "window", 2_000)?;
         let chain_id = parse_option(&options, "chain_id", 0)?;
         let end_block = parse_optional(&options, "end_block")?;
@@ -353,12 +289,13 @@ impl EvmBlockSource {
         Ok(Self {
             rt,
             metrics,
-            client: rpc_client(),
-            rpc_url,
+            rpc,
             chain_id,
             confirmations: parse_option(&options, "confirmations", 12)?,
             window,
-            next_block: AtomicU64::new(parse_option(&options, "start_block", 0)?),
+            concurrency: parse_concurrency(&options)?,
+            batch_size: parse_batch_size(&options)?,
+            cursor: Cursor::new(parse_option(&options, "start_block", 0)?),
             progress_path: options.get("progress_path").map(PathBuf::from),
             end_block,
             state: state_factory.create(),
@@ -368,38 +305,7 @@ impl EvmBlockSource {
     }
 
     async fn rpc(&self, method: &str, params: Value) -> Result<Value, PluginError> {
-        rpc_request(&self.rt, &self.client, &self.rpc_url, method, params).await
-    }
-
-    fn write_progress(
-        &self,
-        indexed_through: u64,
-        observed_head: u64,
-        safe_head: u64,
-    ) -> Result<(), PluginError> {
-        let Some(path) = &self.progress_path else {
-            return Ok(());
-        };
-        let progress = BackfillProgress {
-            indexed_through,
-            observed_head,
-            safe_head,
-            confirmations: self.confirmations,
-            caught_up: indexed_through >= safe_head,
-            updated_at_unix: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        };
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).map_err(progress_error)?;
-        let temporary = path.with_extension("json.tmp");
-        fs::write(
-            &temporary,
-            serde_json::to_vec(&progress).map_err(progress_error)?,
-        )
-        .map_err(progress_error)?;
-        fs::rename(&temporary, path).map_err(progress_error)
+        self.rpc.request(&self.rt, method, params).await
     }
 }
 
@@ -418,7 +324,7 @@ impl SupportsGracefulShutdown for EvmBlockSource {
 impl SourcePlugin for EvmBlockSource {
     async fn initialize(&self) -> Result<(), PluginError> {
         if let Some(saved) = self.state.get().await.map_err(PluginError::State)? {
-            self.next_block.store(saved.next_block, Ordering::Relaxed);
+            self.cursor.restore(saved.next_block);
         }
         Ok(())
     }
@@ -433,56 +339,62 @@ impl SourcePlugin for EvmBlockSource {
                 .unwrap_or("0x0"),
         )?;
         let safe_head = capped_safe_head(head, self.confirmations, self.end_block);
-        let from = self.next_block.load(Ordering::Relaxed);
-        self.write_progress(from.saturating_sub(1), head, safe_head)?;
+        let from = self.cursor.begin(head, safe_head)?;
         if from > safe_head {
             self.rt.sleep(RDuration::from_millis(1_000)).await;
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
         let to = safe_head.min(from.saturating_add(self.window - 1));
-        let mut rows = Vec::new();
-        for block in from..=to {
-            let value = self
-                .rpc(
-                    "eth_getBlockByNumber",
-                    json!([format!("0x{block:x}"), false]),
-                )
-                .await?;
-            if !value.is_null() {
-                rows.push(block_row(self.chain_id, &value)?);
-            }
-        }
-        let next_block = to.saturating_add(1);
-        self.next_block.store(next_block, Ordering::Relaxed);
-        self.write_progress(next_block.saturating_sub(1), head, safe_head)?;
+        let rows = stream::iter(block_chunks(from, to, self.batch_size))
+            .map(|chunk| async move {
+                fetch_blocks(&self.rt, &self.rpc, &chunk, false)
+                    .await?
+                    .iter()
+                    .map(|block| block_row(self.chain_id, block))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .buffered(self.concurrency)
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        self.cursor.advance(to.saturating_add(1));
         self.metrics
             .record_count("streamling_blockchain_blocks", rows.len() as u64);
         block_rows_to_batch(self.schema.clone(), rows)
     }
-    async fn process_checkpoint_marker(&self, _epoch: CheckpointEpoch) -> Result<(), PluginError> {
-        Ok(())
+    async fn process_checkpoint_marker(&self, epoch: CheckpointEpoch) -> Result<(), PluginError> {
+        self.cursor.mark(&epoch)
     }
     async fn process_checkpoint_finalizer(
         &self,
-        _epoch: CheckpointEpoch,
+        epoch: CheckpointEpoch,
     ) -> Result<(), PluginError> {
+        let Some(mark) = self.cursor.finalize(&epoch)? else {
+            return Ok(());
+        };
         self.state
             .put(BlockSourceState {
-                next_block: self.next_block.load(Ordering::Relaxed),
+                next_block: mark.next_block,
             })
             .await
-            .map_err(PluginError::State)
+            .map_err(PluginError::State)?;
+        write_progress(self.progress_path.as_deref(), self.confirmations, mark)
     }
 }
 
 pub struct EvmTransactionSource {
     rt: PluginAsyncRuntimeObj,
     metrics: PluginMetricsRecorder,
-    client: reqwest::Client,
-    rpc_url: String,
+    rpc: RpcPool,
     confirmations: u64,
     window: u64,
-    next_block: AtomicU64,
+    concurrency: usize,
+    batch_size: usize,
+    /// When false, `input` is written empty; `method_id` still holds the selector.
+    store_input: bool,
+    cursor: Cursor,
     progress_path: Option<PathBuf>,
     end_block: Option<u64>,
     chain_id: u64,
@@ -498,17 +410,7 @@ impl EvmTransactionSource {
         metrics: PluginMetricsRecorder,
         options: HashMap<String, String>,
     ) -> Result<Self, PluginInitializationError> {
-        let rpc_url = if let Some(url) = options.get("rpc_url") {
-            url.clone()
-        } else if let Some(name) = options.get("rpc_url_env") {
-            std::env::var(name).map_err(|_| {
-                PluginInitializationError::Configuration(format!("read ${name}").into())
-            })?
-        } else {
-            return Err(PluginInitializationError::Configuration(
-                "missing option rpc_url or rpc_url_env".into(),
-            ));
-        };
+        let rpc = RpcPool::from_options(&options, parse_batch_size(&options)?)?;
         let window = parse_option(&options, "window", 2_000)?;
         let end_block = parse_optional(&options, "end_block")?;
         if window == 0 {
@@ -544,11 +446,20 @@ impl EvmTransactionSource {
         Ok(Self {
             rt,
             metrics,
-            client: rpc_client(),
-            rpc_url,
+            rpc,
             confirmations: parse_option(&options, "confirmations", 12)?,
             window,
-            next_block: AtomicU64::new(parse_option(&options, "start_block", 0)?),
+            concurrency: parse_concurrency(&options)?,
+            batch_size: parse_batch_size(&options)?,
+            store_input: options
+                .get("store_input")
+                .map(|v| {
+                    v.parse().map_err(|_| {
+                        PluginInitializationError::Configuration("invalid store_input".into())
+                    })
+                })
+                .unwrap_or(Ok(true))?,
+            cursor: Cursor::new(parse_option(&options, "start_block", 0)?),
             progress_path: options.get("progress_path").map(PathBuf::from),
             end_block,
             chain_id: parse_option(&options, "chain_id", 0)?,
@@ -559,7 +470,58 @@ impl EvmTransactionSource {
     }
 
     async fn rpc(&self, method: &str, params: Value) -> Result<Value, PluginError> {
-        rpc_request(&self.rt, &self.client, &self.rpc_url, method, params).await
+        self.rpc.request(&self.rt, method, params).await
+    }
+
+    async fn transaction_rows(&self, numbers: &[u64]) -> Result<Vec<TransactionRow>, PluginError> {
+        let blocks = fetch_blocks(&self.rt, &self.rpc, numbers, true).await?;
+        let transactions = |block: &Value| {
+            block
+                .get("transactions")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        };
+        // Most blocks on fast chains are empty; fetch receipts only for the others.
+        let busy = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| !transactions(block).is_empty())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let batched = self
+            .rpc
+            .batch(
+                &self.rt,
+                "eth_getBlockReceipts",
+                busy.iter()
+                    .map(|&index| json!([format!("0x{:x}", numbers[index])]))
+                    .collect(),
+            )
+            .await
+            .unwrap_or_default();
+        let mut rows = Vec::new();
+        for (position, &index) in busy.iter().enumerate() {
+            let block = &blocks[index];
+            let txs = transactions(block);
+            let receipts = match batched.get(position).and_then(Value::as_array) {
+                Some(items) if items.len() == txs.len() => receipts_by_hash(items),
+                // Unsupported method or a lagging node: fall back to the slower path.
+                _ => self.receipts_by_tx(numbers[index], &txs).await?,
+            };
+            for (tx_index, tx) in txs.iter().enumerate() {
+                let receipt = tx
+                    .get("hash")
+                    .and_then(Value::as_str)
+                    .and_then(|hash| receipts.get(hash));
+                let mut row = transaction_row(self.chain_id, block, tx, receipt, tx_index as u64)?;
+                if !self.store_input {
+                    row.input.clear();
+                }
+                rows.push(row);
+            }
+        }
+        Ok(rows)
     }
 
     async fn receipts_by_tx(
@@ -574,16 +536,9 @@ impl EvmTransactionSource {
             )
             .await
             && let Some(items) = receipts.as_array()
+            && items.len() == txs.len()
         {
-            return Ok(items
-                .iter()
-                .filter_map(|receipt| {
-                    receipt
-                        .get("transactionHash")
-                        .and_then(Value::as_str)
-                        .map(|hash| (hash.to_owned(), receipt.clone()))
-                })
-                .collect());
+            return Ok(receipts_by_hash(items));
         }
         let mut receipts = HashMap::new();
         for tx in txs {
@@ -591,42 +546,14 @@ impl EvmTransactionSource {
                 continue;
             };
             let receipt = self.rpc("eth_getTransactionReceipt", json!([hash])).await?;
-            if !receipt.is_null() {
-                receipts.insert(hash.to_owned(), receipt);
+            if receipt.is_null() {
+                return Err(PluginError::Execution(format!(
+                    "eth_getTransactionReceipt: receipt for {hash} in block {block_number} is unavailable below the safe head"
+                )));
             }
+            receipts.insert(hash.to_owned(), receipt);
         }
         Ok(receipts)
-    }
-
-    fn write_progress(
-        &self,
-        indexed_through: u64,
-        observed_head: u64,
-        safe_head: u64,
-    ) -> Result<(), PluginError> {
-        let Some(path) = &self.progress_path else {
-            return Ok(());
-        };
-        let progress = BackfillProgress {
-            indexed_through,
-            observed_head,
-            safe_head,
-            confirmations: self.confirmations,
-            caught_up: indexed_through >= safe_head,
-            updated_at_unix: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        };
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).map_err(progress_error)?;
-        let temporary = path.with_extension("json.tmp");
-        fs::write(
-            &temporary,
-            serde_json::to_vec(&progress).map_err(progress_error)?,
-        )
-        .map_err(progress_error)?;
-        fs::rename(&temporary, path).map_err(progress_error)
     }
 }
 
@@ -645,7 +572,7 @@ impl SupportsGracefulShutdown for EvmTransactionSource {
 impl SourcePlugin for EvmTransactionSource {
     async fn initialize(&self) -> Result<(), PluginError> {
         if let Some(saved) = self.state.get().await.map_err(PluginError::State)? {
-            self.next_block.store(saved.next_block, Ordering::Relaxed);
+            self.cursor.restore(saved.next_block);
         }
         Ok(())
     }
@@ -660,61 +587,42 @@ impl SourcePlugin for EvmTransactionSource {
                 .unwrap_or("0x0"),
         )?;
         let safe_head = capped_safe_head(head, self.confirmations, self.end_block);
-        let from = self.next_block.load(Ordering::Relaxed);
-        self.write_progress(from.saturating_sub(1), head, safe_head)?;
+        let from = self.cursor.begin(head, safe_head)?;
         if from > safe_head {
             self.rt.sleep(RDuration::from_millis(1_000)).await;
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
         let to = safe_head.min(from.saturating_add(self.window - 1));
-        let mut rows = Vec::new();
-        for block_number in from..=to {
-            let block = self
-                .rpc(
-                    "eth_getBlockByNumber",
-                    json!([format!("0x{block_number:x}"), true]),
-                )
-                .await?;
-            let txs = block
-                .get("transactions")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let receipts = self.receipts_by_tx(block_number, &txs).await?;
-            for (index, tx) in txs.iter().enumerate() {
-                let receipt = tx
-                    .get("hash")
-                    .and_then(Value::as_str)
-                    .and_then(|hash| receipts.get(hash));
-                rows.push(transaction_row(
-                    self.chain_id,
-                    &block,
-                    tx,
-                    receipt,
-                    index as u64,
-                )?);
-            }
-        }
-        let next_block = to.saturating_add(1);
-        self.next_block.store(next_block, Ordering::Relaxed);
-        self.write_progress(next_block.saturating_sub(1), head, safe_head)?;
+        let rows = stream::iter(block_chunks(from, to, self.batch_size))
+            .map(|chunk| async move { self.transaction_rows(&chunk).await })
+            .buffered(self.concurrency)
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        self.cursor.advance(to.saturating_add(1));
         self.metrics
             .record_count("streamling_blockchain_transactions", rows.len() as u64);
         transaction_rows_to_batch(self.schema.clone(), rows)
     }
-    async fn process_checkpoint_marker(&self, _epoch: CheckpointEpoch) -> Result<(), PluginError> {
-        Ok(())
+    async fn process_checkpoint_marker(&self, epoch: CheckpointEpoch) -> Result<(), PluginError> {
+        self.cursor.mark(&epoch)
     }
     async fn process_checkpoint_finalizer(
         &self,
-        _epoch: CheckpointEpoch,
+        epoch: CheckpointEpoch,
     ) -> Result<(), PluginError> {
+        let Some(mark) = self.cursor.finalize(&epoch)? else {
+            return Ok(());
+        };
         self.state
             .put(BlockSourceState {
-                next_block: self.next_block.load(Ordering::Relaxed),
+                next_block: mark.next_block,
             })
             .await
-            .map_err(PluginError::State)
+            .map_err(PluginError::State)?;
+        write_progress(self.progress_path.as_deref(), self.confirmations, mark)
     }
 }
 
@@ -733,7 +641,7 @@ impl SupportsGracefulShutdown for EvmEventSource {
 impl SourcePlugin for EvmEventSource {
     async fn initialize(&self) -> Result<(), PluginError> {
         if let Some(saved) = self.state.get().await.map_err(PluginError::State)? {
-            self.next_block.store(saved.next_block, Ordering::Relaxed);
+            self.cursor.restore(saved.next_block);
             *self
                 .discovered_rows
                 .lock()
@@ -769,12 +677,7 @@ impl SourcePlugin for EvmEventSource {
                 .unwrap_or("0x0"),
         )?;
         let safe_head = capped_safe_head(head, self.confirmations, self.end_block);
-        let from = self.next_block.load(Ordering::Relaxed);
-        *self
-            .latest_progress
-            .lock()
-            .map_err(|_| PluginError::Internal("progress mutex poisoned".into()))? =
-            (head, safe_head);
+        let from = self.cursor.begin(head, safe_head)?;
         if from > safe_head {
             self.rt.sleep(RDuration::from_millis(1_000)).await;
             return Ok(RecordBatch::new_empty(self.schema.clone()));
@@ -933,22 +836,23 @@ impl SourcePlugin for EvmEventSource {
                 }
             }
         }
-        let next_block = to.saturating_add(1);
-        self.next_block.store(next_block, Ordering::Relaxed);
+        self.cursor.advance(to.saturating_add(1));
         self.metrics
             .record_count("streamling_blockchain_logs", decoded.len() as u64);
         rows_to_batch(self.schema.clone(), decoded)
     }
-    async fn process_checkpoint_marker(&self, _epoch: CheckpointEpoch) -> Result<(), PluginError> {
-        Ok(())
+    async fn process_checkpoint_marker(&self, epoch: CheckpointEpoch) -> Result<(), PluginError> {
+        self.cursor.mark(&epoch)
     }
     async fn process_checkpoint_finalizer(
         &self,
-        _epoch: CheckpointEpoch,
+        epoch: CheckpointEpoch,
     ) -> Result<(), PluginError> {
-        let next_block = self.next_block.load(Ordering::Relaxed);
+        let Some(mark) = self.cursor.finalize(&epoch)? else {
+            return Ok(());
+        };
         let state = SourceState {
-            next_block,
+            next_block: mark.next_block,
             discovered_rows: self
                 .discovered_rows
                 .lock()
@@ -956,12 +860,113 @@ impl SourcePlugin for EvmEventSource {
                 .clone(),
         };
         self.state.put(state).await.map_err(PluginError::State)?;
-        let (observed_head, safe_head) = *self
-            .latest_progress
-            .lock()
-            .map_err(|_| PluginError::Internal("progress mutex poisoned".into()))?;
-        self.write_progress(next_block.saturating_sub(1), observed_head, safe_head)
+        write_progress(self.progress_path.as_deref(), self.confirmations, mark)
     }
+}
+
+/// A source's position as the sinks see it. The host can process a checkpoint marker while
+/// the batch that `generate_batch` last returned still waits to be sent, so that batch counts
+/// as sent only when the next `generate_batch` call starts. The position recorded at each
+/// marker is committed when its epoch is finalized, that is, once every sink has written it.
+struct Cursor {
+    /// First block after the last batch returned by `generate_batch`.
+    returned: AtomicU64,
+    /// First block after the last batch known to be sent downstream.
+    sent: AtomicU64,
+    /// Observed head and safe head from the latest `generate_batch` call.
+    heads: Mutex<(u64, u64)>,
+    marks: Mutex<BTreeMap<u64, Mark>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Mark {
+    next_block: u64,
+    observed_head: u64,
+    safe_head: u64,
+}
+
+impl Cursor {
+    fn new(start_block: u64) -> Self {
+        Self {
+            returned: AtomicU64::new(start_block),
+            sent: AtomicU64::new(start_block),
+            heads: Mutex::new((0, 0)),
+            marks: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn restore(&self, next_block: u64) {
+        self.returned.store(next_block, Ordering::Relaxed);
+        self.sent.store(next_block, Ordering::Relaxed);
+    }
+
+    /// Start a `generate_batch` call and return the first block it should read.
+    fn begin(&self, observed_head: u64, safe_head: u64) -> Result<u64, PluginError> {
+        let next_block = self.returned.load(Ordering::Relaxed);
+        self.sent.store(next_block, Ordering::Relaxed);
+        *lock(&self.heads)? = (observed_head, safe_head);
+        Ok(next_block)
+    }
+
+    /// Record that the batch being returned covers blocks before `next_block`.
+    fn advance(&self, next_block: u64) {
+        self.returned.store(next_block, Ordering::Relaxed);
+    }
+
+    fn mark(&self, epoch: &CheckpointEpoch) -> Result<(), PluginError> {
+        let (observed_head, safe_head) = *lock(&self.heads)?;
+        lock(&self.marks)?.insert(
+            epoch.0,
+            Mark {
+                next_block: self.sent.load(Ordering::Relaxed),
+                observed_head,
+                safe_head,
+            },
+        );
+        Ok(())
+    }
+
+    /// The position recorded at the latest marker up to `epoch`, which is now durable.
+    fn finalize(&self, epoch: &CheckpointEpoch) -> Result<Option<Mark>, PluginError> {
+        let mut marks = lock(&self.marks)?;
+        let later = marks.split_off(&epoch.0.saturating_add(1));
+        Ok(std::mem::replace(&mut *marks, later)
+            .into_values()
+            .next_back())
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, PluginError> {
+    mutex
+        .lock()
+        .map_err(|_| PluginError::Internal("source cursor mutex poisoned".into()))
+}
+
+fn write_progress(path: Option<&Path>, confirmations: u64, mark: Mark) -> Result<(), PluginError> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let indexed_through = mark.next_block.saturating_sub(1);
+    let progress = BackfillProgress {
+        indexed_through,
+        observed_head: mark.observed_head,
+        safe_head: mark.safe_head,
+        confirmations,
+        caught_up: indexed_through >= mark.safe_head,
+        updated_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(progress_error)?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(
+        &temporary,
+        serde_json::to_vec(&progress).map_err(progress_error)?,
+    )
+    .map_err(progress_error)?;
+    fs::rename(&temporary, path).map_err(progress_error)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1121,6 +1126,26 @@ struct TransactionRow {
     receipt_effective_gas_price: Option<String>,
     contract_address: Option<String>,
     logs_count: Option<u64>,
+}
+
+fn block_chunks(from: u64, to: u64, size: usize) -> Vec<Vec<u64>> {
+    (from..=to)
+        .collect::<Vec<_>>()
+        .chunks(size)
+        .map(<[u64]>::to_vec)
+        .collect()
+}
+
+fn receipts_by_hash(receipts: &[Value]) -> HashMap<String, Value> {
+    receipts
+        .iter()
+        .filter_map(|receipt| {
+            receipt
+                .get("transactionHash")
+                .and_then(Value::as_str)
+                .map(|hash| (hash.to_owned(), receipt.clone()))
+        })
+        .collect()
 }
 
 fn transaction_row(
@@ -1337,15 +1362,23 @@ fn decode_row(
     let preferred = direct
         .get(&address)
         .or_else(|| child_contracts.get(&address));
-    let descriptor = candidates
-        .iter()
-        .find(|candidate| preferred == Some(&candidate.owner))
-        .or_else(|| (candidates.len() == 1).then_some(&candidates[0]))
-        .ok_or_else(|| {
-            PluginError::Execution(format!(
+    // A known contract's log decodes only with that contract's ABI; a topic its ABI does not
+    // declare (for example an inherited `RoleGranted`) is skipped, not borrowed from another ABI.
+    let descriptor = match preferred {
+        Some(owner) => match candidates
+            .iter()
+            .find(|candidate| &candidate.owner == owner)
+        {
+            Some(descriptor) => descriptor,
+            None => return Ok(None),
+        },
+        None if candidates.len() == 1 => &candidates[0],
+        None => {
+            return Err(PluginError::Execution(format!(
                 "ambiguous event topic {topic0_text} for address {address}"
-            ))
-        })?;
+            )));
+        }
+    };
     let raw_topics = topics
         .iter()
         .filter_map(Value::as_str)
@@ -1554,6 +1587,24 @@ fn parse_option(
         })
         .unwrap_or(Ok(default))
 }
+fn parse_batch_size(options: &HashMap<String, String>) -> Result<usize, PluginInitializationError> {
+    match parse_option(options, "rpc_batch_size", DEFAULT_BATCH_SIZE)? {
+        0 => Err(PluginInitializationError::Configuration(
+            "rpc_batch_size must be greater than zero".into(),
+        )),
+        value => Ok(value as usize),
+    }
+}
+fn parse_concurrency(
+    options: &HashMap<String, String>,
+) -> Result<usize, PluginInitializationError> {
+    match parse_option(options, "concurrency", DEFAULT_BLOCK_CONCURRENCY)? {
+        0 => Err(PluginInitializationError::Configuration(
+            "concurrency must be greater than zero".into(),
+        )),
+        value => Ok(value as usize),
+    }
+}
 fn parse_optional(
     options: &HashMap<String, String>,
     key: &str,
@@ -1626,6 +1677,44 @@ fn token_json(token: &Token) -> Value {
 mod tests {
     use super::*;
     use arrow::array::UInt64Array;
+
+    #[test]
+    fn cursor_commits_only_sent_batches_of_finalized_epochs() {
+        let cursor = Cursor::new(100);
+        assert_eq!(cursor.begin(1_000, 988).unwrap(), 100);
+        cursor.advance(200);
+        // The host processes a marker while the 100..199 batch still waits to be sent.
+        cursor.mark(&CheckpointEpoch(1)).unwrap();
+        assert_eq!(cursor.begin(1_010, 998).unwrap(), 200);
+        cursor.advance(300);
+        cursor.mark(&CheckpointEpoch(2)).unwrap();
+        assert_eq!(cursor.begin(1_020, 1_008).unwrap(), 300);
+        cursor.mark(&CheckpointEpoch(3)).unwrap();
+
+        let first = cursor.finalize(&CheckpointEpoch(1)).unwrap().unwrap();
+        assert_eq!(first.next_block, 100);
+        assert_eq!((first.observed_head, first.safe_head), (1_000, 988));
+        // Finalizing a later epoch covers any earlier ones still pending.
+        let third = cursor.finalize(&CheckpointEpoch(3)).unwrap().unwrap();
+        assert_eq!(third.next_block, 300);
+        assert_eq!(cursor.finalize(&CheckpointEpoch(2)).unwrap(), None);
+    }
+
+    #[test]
+    fn restored_cursor_resumes_from_saved_block() {
+        let cursor = Cursor::new(0);
+        cursor.restore(500);
+        assert_eq!(cursor.begin(1_000, 988).unwrap(), 500);
+        cursor.mark(&CheckpointEpoch(7)).unwrap();
+        assert_eq!(
+            cursor
+                .finalize(&CheckpointEpoch(7))
+                .unwrap()
+                .unwrap()
+                .next_block,
+            500
+        );
+    }
 
     #[test]
     fn block_rows_include_chain_scoped_id() {
@@ -1807,5 +1896,41 @@ mod tests {
         .unwrap();
 
         assert_eq!(row.owner, "child_b");
+    }
+
+    #[test]
+    fn known_address_skips_topics_its_abi_does_not_declare() {
+        let event: Event = serde_json::from_value(json!({
+            "anonymous": false,
+            "inputs": [],
+            "name": "RoleGranted",
+            "type": "event"
+        }))
+        .unwrap();
+        let topic = event.signature();
+        let flow = "0x3333333333333333333333333333333333333333";
+        let log = json!({
+            "address": flow,
+            "topics": [format!("{topic:#x}")],
+            "data": "0x",
+            "blockNumber": "0x1",
+            "blockHash": "0xblock",
+            "transactionHash": "0xtx",
+            "logIndex": "0x0"
+        });
+        let direct = HashMap::from([(flow.to_owned(), "flow".to_owned())]);
+        let mine = EventDescriptor {
+            owner: "mine".into(),
+            event: event.clone(),
+        };
+        let reward = EventDescriptor {
+            owner: "reward".into(),
+            event,
+        };
+        for candidates in [vec![mine.clone()], vec![mine, reward]] {
+            let events = HashMap::from([(topic, candidates)]);
+            let row = decode_row(4663, &log, &events, &direct, &[], &HashMap::new()).unwrap();
+            assert!(row.is_none());
+        }
     }
 }

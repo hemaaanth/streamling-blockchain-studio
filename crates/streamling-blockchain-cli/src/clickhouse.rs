@@ -391,8 +391,11 @@ pub(crate) mod tests {
             end_block: None,
             confirmations: 12,
             window: 100,
+            block_concurrency: 8,
+            block_batch_size: 1,
             index_blocks: true,
             index_transactions: false,
+            skip_calldata: false,
             contracts: vec![ContractConfig {
                 alias: "token".into(),
                 address: "0x1111111111111111111111111111111111111111".into(),
