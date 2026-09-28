@@ -346,7 +346,7 @@ fn build_file(build: &Path, path: String) -> Result<BuildFile> {
 
 /// `release.json`: what data the site was built from. Never the RPC URL or credentials.
 fn manifest(root: &Path, config: &ProjectConfig, files: &[BuildFile]) -> Result<Value> {
-    let progress = status::read_progress(root)?;
+    let progress = status::read_progress(root, config)?;
     let conn = database::open(&config.absolute_database(root))?;
     let mut statement = conn.prepare(
         "SELECT contract_alias, event_name, count(*) FROM events GROUP BY contract_alias, event_name ORDER BY contract_alias, event_name",
@@ -434,9 +434,16 @@ fn env_value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
 /// Only meaningful with a project: the RPC URL, its key-bearing part, and its `rpc_url_env`
 /// override, plus every check `common_secrets` runs regardless of project.
 fn secrets(config: &ProjectConfig, env: &[(String, String)]) -> Vec<(String, String)> {
-    let mut urls = vec![config.rpc_url.clone()];
+    let mut urls = crate::rpc::split_urls(&config.rpc_url)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     if let Some(name) = &config.rpc_url_env {
-        urls.extend(env_value(env, name).map(str::to_owned));
+        urls.extend(
+            env_value(env, name)
+                .into_iter()
+                .flat_map(crate::rpc::split_urls)
+                .map(str::to_owned),
+        );
     }
     let mut secrets = Vec::new();
     for url in urls {

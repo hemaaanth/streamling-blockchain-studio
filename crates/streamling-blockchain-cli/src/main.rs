@@ -70,10 +70,19 @@ enum Commands {
         confirmations: u64,
         #[arg(long, default_value_t = 2_000)]
         window: u64,
+        /// Blocks fetched in parallel by the block and transaction sources.
+        #[arg(long, default_value_t = config::default_block_concurrency())]
+        block_concurrency: u64,
+        /// Blocks requested per JSON-RPC batch by the block and transaction sources.
+        #[arg(long, default_value_t = config::default_block_batch_size())]
+        block_batch_size: u64,
         #[arg(long)]
         index_blocks: bool,
         #[arg(long)]
         index_transactions: bool,
+        /// Store transactions without calldata; `method_id` is still recorded.
+        #[arg(long, requires = "index_transactions")]
+        skip_calldata: bool,
         #[arg(long, value_enum, default_value_t = SinkMode::Sqlite)]
         sink: SinkMode,
         #[arg(long, default_value = "events")]
@@ -100,6 +109,12 @@ enum Commands {
         confirmations: u64,
         #[arg(long, default_value_t = 2_000)]
         window: u64,
+        /// Blocks fetched in parallel by the block and transaction sources.
+        #[arg(long, default_value_t = config::default_block_concurrency())]
+        block_concurrency: u64,
+        /// Blocks requested per JSON-RPC batch by the block and transaction sources.
+        #[arg(long, default_value_t = config::default_block_batch_size())]
+        block_batch_size: u64,
         #[arg(long)]
         index_blocks: bool,
         #[arg(long)]
@@ -283,8 +298,11 @@ struct InitRequest {
     end_block: Option<u64>,
     confirmations: u64,
     window: u64,
+    block_concurrency: u64,
+    block_batch_size: u64,
     index_blocks: bool,
     index_transactions: bool,
+    skip_calldata: bool,
     sink: SinkMode,
     clickhouse_table: String,
     clickhouse_database: Option<String>,
@@ -413,8 +431,11 @@ async fn dispatch(cli: Cli, out: &mut Output) -> Result<Value> {
             end_block,
             confirmations,
             window,
+            block_concurrency,
+            block_batch_size,
             index_blocks,
             index_transactions,
+            skip_calldata,
             sink,
             clickhouse_table,
             clickhouse_compression,
@@ -456,8 +477,11 @@ async fn dispatch(cli: Cli, out: &mut Output) -> Result<Value> {
                     end_block,
                     confirmations,
                     window,
+                    block_concurrency,
+                    block_batch_size,
                     index_blocks,
                     index_transactions,
+                    skip_calldata,
                     sink,
                     clickhouse_table,
                     clickhouse_compression,
@@ -475,6 +499,8 @@ async fn dispatch(cli: Cli, out: &mut Output) -> Result<Value> {
             start_block,
             confirmations,
             window,
+            block_concurrency,
+            block_batch_size,
             index_blocks,
             index_transactions,
             sink,
@@ -491,6 +517,8 @@ async fn dispatch(cli: Cli, out: &mut Output) -> Result<Value> {
                 start_block,
                 confirmations,
                 window,
+                block_concurrency,
+                block_batch_size,
                 index_blocks,
                 index_transactions,
                 sink,
@@ -835,8 +863,11 @@ async fn init(root: &Path, out: &Output, request: InitRequest) -> Result<Value> 
         end_block,
         confirmations,
         window,
+        block_concurrency,
+        block_batch_size,
         index_blocks,
         index_transactions,
+        skip_calldata,
         sink,
         clickhouse_table,
         clickhouse_database,
@@ -910,8 +941,10 @@ async fn init(root: &Path, out: &Output, request: InitRequest) -> Result<Value> 
         chain_id,
         rpc_url: if rpc_url_env.is_some() {
             String::new()
-        } else {
+        } else if explicit_rpc.is_empty() {
             rpc_url
+        } else {
+            explicit_rpc
         },
         rpc_url_env,
         database: PathBuf::from(".streamling-blockchain/events.db"),
@@ -919,8 +952,11 @@ async fn init(root: &Path, out: &Output, request: InitRequest) -> Result<Value> 
         end_block,
         confirmations,
         window,
+        block_concurrency,
+        block_batch_size,
         index_blocks,
         index_transactions,
+        skip_calldata,
         contracts: vec![ContractConfig {
             alias: alias.clone(),
             address,
@@ -1018,6 +1054,8 @@ async fn init_robinhood(
     start_block: u64,
     confirmations: u64,
     window: u64,
+    block_concurrency: u64,
+    block_batch_size: u64,
     index_blocks: bool,
     index_transactions: bool,
     sink: SinkMode,
@@ -1037,8 +1075,15 @@ async fn init_robinhood(
     } else {
         rpc_url.clone()
     };
-    let chain_id =
-        rpc::hex_u64(&rpc::rpc(&client, &actual_rpc, "eth_chainId", serde_json::json!([])).await?)?;
+    let chain_id = rpc::hex_u64(
+        &rpc::rpc(
+            &client,
+            rpc::primary_url(&actual_rpc),
+            "eth_chainId",
+            serde_json::json!([]),
+        )
+        .await?,
+    )?;
     if chain_id != 4663 {
         bail!(CodedError::new(
             ErrorCode::Validation,
@@ -1114,8 +1159,11 @@ async fn init_robinhood(
         end_block: None,
         confirmations,
         window,
+        block_concurrency,
+        block_batch_size,
         index_blocks,
         index_transactions,
+        skip_calldata: false,
         contracts,
         discovery_rules: vec![],
         sinks,

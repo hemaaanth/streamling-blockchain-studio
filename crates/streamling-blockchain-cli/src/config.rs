@@ -22,10 +22,19 @@ pub struct ProjectConfig {
     pub confirmations: u64,
     #[serde(default = "default_window")]
     pub window: u64,
+    /// Blocks fetched in parallel by the block and transaction sources.
+    #[serde(default = "default_block_concurrency")]
+    pub block_concurrency: u64,
+    /// Blocks requested per JSON-RPC batch by the block and transaction sources.
+    #[serde(default = "default_block_batch_size")]
+    pub block_batch_size: u64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub index_blocks: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub index_transactions: bool,
+    /// Store transactions without calldata: `input` is empty, `method_id` is kept.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skip_calldata: bool,
     pub contracts: Vec<ContractConfig>,
     #[serde(default)]
     pub discovery_rules: Vec<DiscoveryRule>,
@@ -72,6 +81,12 @@ fn default_confirmations() -> u64 {
 fn default_window() -> u64 {
     2_000
 }
+pub fn default_block_concurrency() -> u64 {
+    8
+}
+pub fn default_block_batch_size() -> u64 {
+    1
+}
 fn default_sqlite_sink() -> bool {
     true
 }
@@ -112,11 +127,13 @@ impl ProjectConfig {
         Ok(())
     }
 
+    /// The first configured endpoint, for the CLI's own RPC calls.
     pub fn rpc_url_value(&self) -> Result<String> {
-        if let Some(name) = &self.rpc_url_env {
-            return std::env::var(name).with_context(|| format!("read ${name}"));
-        }
-        Ok(self.rpc_url.clone())
+        let urls = match &self.rpc_url_env {
+            Some(name) => std::env::var(name).with_context(|| format!("read ${name}"))?,
+            None => self.rpc_url.clone(),
+        };
+        Ok(crate::rpc::primary_url(&urls).to_owned())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -133,6 +150,12 @@ impl ProjectConfig {
         }
         if self.window == 0 {
             bail!("window must be greater than zero")
+        }
+        if self.block_concurrency == 0 {
+            bail!("block_concurrency must be greater than zero")
+        }
+        if self.block_batch_size == 0 {
+            bail!("block_batch_size must be greater than zero")
         }
         if let Some(end_block) = self.end_block
             && end_block < self.start_block
