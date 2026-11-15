@@ -76,6 +76,16 @@ impl EndStop {
     }
 }
 
+/// The host may create a source and drop it before running it. Such a copy must not count as
+/// unfinished, or no running source would ever be the last to finish.
+impl Drop for EndStop {
+    fn drop(&mut self) {
+        if !self.finished.swap(true, Ordering::SeqCst) {
+            self.unfinished.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Call after a checkpoint is committed and its progress is written.
 fn stop_at_end(stop: Option<&EndStop>, next_block: u64, catching_up: bool) {
     if stop.is_some_and(|stop| stop.committed(next_block, catching_up)) {
@@ -1926,6 +1936,20 @@ mod tests {
         assert!(!events.committed(101, false), "a source finishes only once");
         assert!(blocks.committed(101, false));
         assert_eq!(UNFINISHED.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_source_dropped_before_it_finishes_does_not_block_the_stop() {
+        static UNFINISHED: AtomicUsize = AtomicUsize::new(0);
+        drop(EndStop::register(100, &UNFINISHED));
+        let events = EndStop::register(100, &UNFINISHED);
+        assert!(events.committed(101, false));
+        drop(events);
+        assert_eq!(
+            UNFINISHED.load(Ordering::SeqCst),
+            0,
+            "a finished source counts once"
+        );
     }
 
     #[test]
