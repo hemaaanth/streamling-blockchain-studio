@@ -37,7 +37,7 @@ python3 scripts/init_project.py /tmp/megapot-sqlite --sink sqlite
 BASE_RPC_URL="$BASE_RPC_URL" \
   ../../target/release/streamling-blockchain \
   --project /tmp/megapot-sqlite \
-  dev --no-build --exit-when-caught-up
+  dev --no-build
 
 STREAMLING_BLOCKCHAIN_DB=/tmp/megapot-sqlite/.streamling-blockchain/events.db \
   npm run sources:sqlite
@@ -63,7 +63,7 @@ python3 scripts/init_project.py /tmp/megapot-clickhouse --sink clickhouse
 BASE_RPC_URL="$BASE_RPC_URL" \
   ../../target/release/streamling-blockchain \
   --project /tmp/megapot-clickhouse \
-  dev --no-build --exit-when-caught-up
+  dev --no-build
 
 npm run sources:clickhouse
 npm run build

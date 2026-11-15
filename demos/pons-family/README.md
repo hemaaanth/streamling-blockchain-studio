@@ -18,7 +18,7 @@ python3 demos/pons-family/scripts/init_project.py
 
 ./target/release/streamling-blockchain \
   --project .local/demos/pons-family \
-  dev --no-build --exit-when-caught-up
+  dev --no-build
 
 cd demos/pons-family
 npm ci

@@ -255,7 +255,7 @@ async fn build_site(
                 )
             )
             .next(format!(
-                "streamling-blockchain --project {} dev --exit-when-caught-up",
+                "streamling-blockchain --project {} dev",
                 root.display()
             ))
         )
@@ -1376,7 +1376,7 @@ mod tests {
             value["error"]["suggested_next"]
                 .as_str()
                 .unwrap()
-                .ends_with("dev --exit-when-caught-up")
+                .ends_with(" dev")
         );
 
         let config = root.join("streamling-blockchain.toml");
