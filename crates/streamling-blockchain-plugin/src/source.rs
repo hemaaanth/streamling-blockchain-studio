@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 use streamling_blockchain_decode::{self as decode, EventIndex};
@@ -24,6 +24,65 @@ const DEFAULT_LOG_CONCURRENCY: u64 = 4;
 const DEFAULT_WINDOW_GROWTH: u64 = 10;
 const DEFAULT_BLOCK_CONCURRENCY: u64 = 8;
 const DEFAULT_BATCH_SIZE: u64 = 1;
+
+/// Bounded sources in this library that stop the pipeline at `end_block` and have not
+/// committed it yet. The last one to finish asks Streamling to stop, so one source cannot cut
+/// another short.
+static UNFINISHED_SOURCES: AtomicUsize = AtomicUsize::new(0);
+
+/// Asks Streamling to stop once every bounded source has committed its `end_block`.
+struct EndStop {
+    end_block: u64,
+    finished: AtomicBool,
+    unfinished: &'static AtomicUsize,
+}
+
+impl EndStop {
+    /// `None` unless the source has an `end_block` and `stop_at_end_block` is true.
+    fn from_options(
+        options: &HashMap<String, String>,
+        end_block: Option<u64>,
+    ) -> Result<Option<Self>, PluginInitializationError> {
+        let stop = options
+            .get("stop_at_end_block")
+            .map(|v| {
+                v.parse().map_err(|_| {
+                    PluginInitializationError::Configuration("invalid stop_at_end_block".into())
+                })
+            })
+            .unwrap_or(Ok(false))?;
+        Ok(end_block
+            .filter(|_| stop)
+            .map(|end_block| Self::register(end_block, &UNFINISHED_SOURCES)))
+    }
+
+    fn register(end_block: u64, unfinished: &'static AtomicUsize) -> Self {
+        unfinished.fetch_add(1, Ordering::SeqCst);
+        Self {
+            end_block,
+            finished: AtomicBool::new(false),
+            unfinished,
+        }
+    }
+
+    /// Records a committed checkpoint. `next_block` is the first block not committed yet.
+    /// True only for the commit that finishes the last unfinished source.
+    fn committed(&self, next_block: u64, catching_up: bool) -> bool {
+        if catching_up || next_block <= self.end_block || self.finished.swap(true, Ordering::SeqCst)
+        {
+            return false;
+        }
+        self.unfinished.fetch_sub(1, Ordering::SeqCst) == 1
+    }
+}
+
+/// Call after a checkpoint is committed and its progress is written.
+fn stop_at_end(stop: Option<&EndStop>, next_block: u64, catching_up: bool) {
+    if stop.is_some_and(|stop| stop.committed(next_block, catching_up)) {
+        tracing::info!("every bounded source committed its end_block; asking Streamling to stop");
+        streamling_plugin::shutdown::request_shutdown();
+    }
+}
 
 /// Fetch blocks at or below the safe head, in order. A load-balanced RPC can answer `null`
 /// from a lagging node, so retry those instead of silently skipping the block.
@@ -117,6 +176,7 @@ pub struct EvmEventSource {
     address_starts: HashMap<String, u64>,
     progress_path: Option<PathBuf>,
     end_block: Option<u64>,
+    stop: Option<EndStop>,
     state: Arc<PluginStateBackend<SourceState>>,
     schema: SchemaRef,
     events: EventIndex,
@@ -234,6 +294,7 @@ impl EvmEventSource {
             max_window: AtomicU64::new(max_window),
             log_concurrency,
             end_block,
+            stop: EndStop::from_options(&options, end_block)?,
             cursor: Cursor::new(EventPosition {
                 next_block: start_block,
                 catch_up: BTreeMap::new(),
@@ -422,6 +483,7 @@ pub struct EvmBlockSource {
     cursor: Cursor<u64>,
     progress_path: Option<PathBuf>,
     end_block: Option<u64>,
+    stop: Option<EndStop>,
     chain_id: u64,
     state: Arc<PluginStateBackend<BlockSourceState>>,
     schema: SchemaRef,
@@ -470,6 +532,7 @@ impl EvmBlockSource {
             cursor: Cursor::new(parse_option(&options, "start_block", 0)?),
             progress_path: options.get("progress_path").map(PathBuf::from),
             end_block,
+            stop: EndStop::from_options(&options, end_block)?,
             state: state_factory.create(),
             schema,
             running: AtomicBool::new(true),
@@ -546,10 +609,9 @@ impl SourcePlugin for EvmBlockSource {
         let Some(mark) = self.cursor.finalize(&epoch)? else {
             return Ok(());
         };
+        let next_block = mark.position;
         self.state
-            .put(BlockSourceState {
-                next_block: mark.position,
-            })
+            .put(BlockSourceState { next_block })
             .await
             .map_err(PluginError::State)?;
         write_progress(
@@ -557,7 +619,9 @@ impl SourcePlugin for EvmBlockSource {
             self.confirmations,
             mark,
             false,
-        )
+        )?;
+        stop_at_end(self.stop.as_ref(), next_block, false);
+        Ok(())
     }
 }
 
@@ -574,6 +638,7 @@ pub struct EvmTransactionSource {
     cursor: Cursor<u64>,
     progress_path: Option<PathBuf>,
     end_block: Option<u64>,
+    stop: Option<EndStop>,
     chain_id: u64,
     state: Arc<PluginStateBackend<BlockSourceState>>,
     schema: SchemaRef,
@@ -639,6 +704,7 @@ impl EvmTransactionSource {
             cursor: Cursor::new(parse_option(&options, "start_block", 0)?),
             progress_path: options.get("progress_path").map(PathBuf::from),
             end_block,
+            stop: EndStop::from_options(&options, end_block)?,
             chain_id: parse_option(&options, "chain_id", 0)?,
             state: state_factory.create(),
             schema,
@@ -793,10 +859,9 @@ impl SourcePlugin for EvmTransactionSource {
         let Some(mark) = self.cursor.finalize(&epoch)? else {
             return Ok(());
         };
+        let next_block = mark.position;
         self.state
-            .put(BlockSourceState {
-                next_block: mark.position,
-            })
+            .put(BlockSourceState { next_block })
             .await
             .map_err(PluginError::State)?;
         write_progress(
@@ -804,7 +869,9 @@ impl SourcePlugin for EvmTransactionSource {
             self.confirmations,
             mark,
             false,
-        )
+        )?;
+        stop_at_end(self.stop.as_ref(), next_block, false);
+        Ok(())
     }
 }
 
@@ -1010,8 +1077,9 @@ impl SourcePlugin for EvmEventSource {
             safe_head,
         } = mark;
         let catching_up = !position.catch_up.is_empty();
+        let next_block = position.next_block;
         let state = SourceState {
-            next_block: position.next_block,
+            next_block,
             discovered_rows: self
                 .discovered_rows
                 .lock()
@@ -1025,12 +1093,14 @@ impl SourcePlugin for EvmEventSource {
             self.progress_path.as_deref(),
             self.confirmations,
             Mark {
-                position: position.next_block,
+                position: next_block,
                 observed_head,
                 safe_head,
             },
             catching_up,
-        )
+        )?;
+        stop_at_end(self.stop.as_ref(), next_block, catching_up);
+        Ok(())
     }
 }
 
@@ -1839,6 +1909,48 @@ fn parse_hex(text: &str) -> Result<u64, PluginError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_last_bounded_source_to_commit_its_end_block_stops_the_pipeline() {
+        static UNFINISHED: AtomicUsize = AtomicUsize::new(0);
+        let events = EndStop::register(100, &UNFINISHED);
+        let blocks = EndStop::register(100, &UNFINISHED);
+        assert!(
+            !events.committed(100, false),
+            "block 100 is not committed yet"
+        );
+        assert!(!events.committed(101, true), "a contract still catches up");
+        assert!(
+            !events.committed(101, false),
+            "the blocks source is still running"
+        );
+        assert!(!events.committed(101, false), "a source finishes only once");
+        assert!(blocks.committed(101, false));
+        assert_eq!(UNFINISHED.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn only_a_bounded_source_with_stop_at_end_block_stops() {
+        let options = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<HashMap<_, _>>()
+        };
+        let stop = options(&[("stop_at_end_block", "true")]);
+        assert!(EndStop::from_options(&stop, None).unwrap().is_none());
+        assert!(
+            EndStop::from_options(&options(&[]), Some(1))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            EndStop::from_options(&options(&[("stop_at_end_block", "false")]), Some(1))
+                .unwrap()
+                .is_none()
+        );
+        assert!(EndStop::from_options(&options(&[("stop_at_end_block", "yes")]), Some(1)).is_err());
+    }
+
     use super::*;
     use arrow::array::UInt64Array;
 

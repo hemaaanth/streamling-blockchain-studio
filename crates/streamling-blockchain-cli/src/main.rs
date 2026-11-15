@@ -607,8 +607,12 @@ async fn dispatch(cli: Cli, out: &mut Output) -> Result<Value> {
             keep_running,
             exit_poll_seconds,
         } => {
-            let bounded = ProjectConfig::load(&root)?.end_block.is_some();
-            let exit_when_caught_up = exit_when_caught_up || (bounded && !keep_running);
+            if exit_when_caught_up && ProjectConfig::load(&root)?.end_block.is_none() {
+                bail!(CodedError::new(
+                    ErrorCode::Validation,
+                    "--exit-when-caught-up requires a bounded project with end_block"
+                ))
+            }
             run_streamling(
                 &root,
                 out,
@@ -616,7 +620,7 @@ async fn dispatch(cli: Cli, out: &mut Output) -> Result<Value> {
                 plugin,
                 no_build,
                 false,
-                exit_when_caught_up,
+                keep_running,
                 std::time::Duration::from_secs(exit_poll_seconds.max(1)),
             )
             .await?;
@@ -1229,6 +1233,9 @@ async fn init_robinhood(
 
 const ERC20_TRANSFER_ABI: &str = r#"[{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"from","type":"address"},{"indexed":true,"internalType":"address","name":"to","type":"address"},{"indexed":false,"internalType":"uint256","name":"value","type":"uint256"}],"name":"Transfer","type":"event"}]"#;
 
+/// How long Streamling may take to stop by itself after every source reaches end_block.
+const END_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[allow(clippy::too_many_arguments)]
 async fn run_streamling(
     root: &Path,
@@ -1237,7 +1244,7 @@ async fn run_streamling(
     plugin: Option<PathBuf>,
     no_build: bool,
     validate: bool,
-    exit_when_caught_up: bool,
+    keep_running: bool,
     exit_poll: std::time::Duration,
 ) -> Result<()> {
     let plugin = match plugin {
@@ -1265,7 +1272,7 @@ async fn run_streamling(
     }
     let config = ProjectConfig::load(root)?;
     // The TOML is the source of truth, so edits like a moved start_block reach the runtime.
-    project::write_pipeline(root, &config)?;
+    project::write_pipeline(root, &config, !keep_running)?;
     if !validate && config.sinks.clickhouse.is_some() {
         prepare_clickhouse(&config, out).await?;
     }
@@ -1295,7 +1302,7 @@ async fn run_streamling(
     let mut child = command
         .spawn()
         .with_context(|| format!("run {}", streamling.display()))?;
-    if !exit_when_caught_up {
+    let Some(end_block) = config.end_block.filter(|_| !keep_running && !validate) else {
         let status = child
             .wait()
             .await
@@ -1304,13 +1311,9 @@ async fn run_streamling(
             bail!("Streamling exited with {status}")
         }
         return Ok(());
-    }
-    let Some(end_block) = config.end_block else {
-        bail!(CodedError::new(
-            ErrorCode::Validation,
-            "--exit-when-caught-up requires a bounded project with end_block"
-        ))
     };
+    // The source asks Streamling to stop at end_block. This poll is the fallback for a host
+    // that ignores the request.
     loop {
         tokio::select! {
             status = child.wait() => {
@@ -1322,11 +1325,18 @@ async fn run_streamling(
             }
             _ = tokio::time::sleep(exit_poll) => {
                 if status::reached_end(root, &config, end_block, started)? {
-                    tokio::time::sleep(exit_poll).await;
-                    if status::reached_end(root, &config, end_block, started)? {
-                        stop_streamling(&mut child, streamling).await?;
-                        return Ok(());
+                    tokio::select! {
+                        status = child.wait() => {
+                            let status = status.with_context(|| format!("wait for {}", streamling.display()))?;
+                            if !status.success() {
+                                bail!("Streamling exited with {status}")
+                            }
+                        }
+                        _ = tokio::time::sleep(END_STOP_GRACE) => {
+                            stop_streamling(&mut child, streamling).await?;
+                        }
                     }
+                    return Ok(());
                 }
             }
         }
@@ -1497,12 +1507,22 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    fn stop_at_end_block(root: &Path) -> String {
+        let pipeline = std::fs::read_to_string(root.join("pipeline.yaml")).unwrap();
+        let pipeline: serde_yaml::Value = serde_yaml::from_str(&pipeline).unwrap();
+        pipeline["sources"]["raw_events"]["options"]["stop_at_end_block"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
     #[tokio::test]
     async fn dev_rewrites_the_pipeline_from_the_toml() {
         let root = sqlite_project("dev-pipeline");
         let project = root.to_str().unwrap();
         let config = root.join("streamling-blockchain.toml");
         let toml = std::fs::read_to_string(&config).unwrap();
+        let toml = toml.replace("start_block = 0\n", "start_block = 0\nend_block = 50\n");
         std::fs::write(&config, format!("{toml}start_block = 42\n")).unwrap();
         let plugin = root.join("plugin.so");
         std::fs::write(&plugin, "").unwrap();
@@ -1522,6 +1542,23 @@ mod tests {
         assert_eq!(run["ok"], true, "{run}");
         let pipeline = std::fs::read_to_string(root.join("pipeline.yaml")).unwrap();
         assert!(pipeline.contains(r#""start_block":42"#), "{pipeline}");
+        assert_eq!(stop_at_end_block(&root), "true");
+
+        let run = run_json(&[
+            "--json",
+            "--project",
+            project,
+            "dev",
+            "--streamling",
+            "true",
+            "--plugin",
+            plugin.to_str().unwrap(),
+            "--no-build",
+            "--keep-running",
+        ])
+        .await;
+        assert_eq!(run["ok"], true, "{run}");
+        assert_eq!(stop_at_end_block(&root), "false");
 
         std::fs::remove_dir_all(root).unwrap();
     }

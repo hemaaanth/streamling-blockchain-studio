@@ -5,13 +5,15 @@ use sha3::{Digest, Keccak256};
 use std::path::Path;
 
 pub fn write_generated_files(root: &Path, config: &ProjectConfig) -> Result<()> {
-    write_pipeline(root, config)?;
+    write_pipeline(root, config, true)?;
     write_semantics(root, config)?;
     write_agent_files(root, config)?;
     Ok(())
 }
 
-pub fn write_pipeline(root: &Path, config: &ProjectConfig) -> Result<()> {
+/// With `stop_at_end_block`, a bounded pipeline asks Streamling to stop once every source has
+/// committed its `end_block`.
+pub fn write_pipeline(root: &Path, config: &ProjectConfig, stop_at_end_block: bool) -> Result<()> {
     let db = config
         .absolute_database(root)
         .canonicalize()
@@ -185,6 +187,7 @@ pub fn write_pipeline(root: &Path, config: &ProjectConfig) -> Result<()> {
     });
     if let Some(end_block) = config.end_block {
         source_options["end_block"] = end_block.to_string().into();
+        source_options["stop_at_end_block"] = stop_at_end_block.to_string().into();
     }
     if let Some(max_window) = config.max_window {
         source_options["max_window"] = max_window.to_string().into();
@@ -215,6 +218,7 @@ pub fn write_pipeline(root: &Path, config: &ProjectConfig) -> Result<()> {
         });
         if let Some(end_block) = config.end_block {
             block_options["end_block"] = end_block.to_string().into();
+            block_options["stop_at_end_block"] = stop_at_end_block.to_string().into();
         }
         if let Some(name) = &config.rpc_url_env {
             block_options["rpc_url_env"] = name.clone().into();
@@ -242,6 +246,7 @@ pub fn write_pipeline(root: &Path, config: &ProjectConfig) -> Result<()> {
         });
         if let Some(end_block) = config.end_block {
             transaction_options["end_block"] = end_block.to_string().into();
+            transaction_options["stop_at_end_block"] = stop_at_end_block.to_string().into();
         }
         if config.skip_calldata {
             transaction_options["store_input"] = "false".into();
@@ -893,6 +898,12 @@ mod tests {
             pipeline["sources"]["evm_transactions"]["options"]["end_block"],
             "25"
         );
+        for source in ["raw_events", "evm_blocks", "evm_transactions"] {
+            assert_eq!(
+                pipeline["sources"][source]["options"]["stop_at_end_block"],
+                "true"
+            );
+        }
         let clickhouse_schema =
             std::fs::read_to_string(root.join("clickhouse/events.sql")).unwrap();
         assert!(clickhouse_schema.contains("chain_id UInt64"));
