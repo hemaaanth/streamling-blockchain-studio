@@ -611,6 +611,7 @@ fn toml_string(text: String) -> String {
 fn event_column(field: &str) -> String {
     const RESERVED: &[&str] = &[
         "event_id",
+        "chain_id",
         "address",
         "block_number",
         "block_hash",

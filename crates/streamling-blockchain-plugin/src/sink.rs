@@ -305,7 +305,8 @@ fn write_event_rows(
             last_block = Some(block);
         }
         let delete = op.value(row) == "d";
-        // A redelivered event that matches the stored row is not a new revision.
+        // A redelivered event that matches the stored row is not a new revision. It is still
+        // rewritten below, which repairs per-event tables that were renamed or dropped.
         let unchanged = !delete
             && transaction
                 .prepare_cached(
@@ -342,9 +343,6 @@ fn write_event_rows(
                 .prepare_cached(&format!("DELETE FROM \"{table}\" WHERE event_id = ?1"))
                 .and_then(|mut statement| statement.execute([event_id.value(row)]))
                 .map_err(db_error)?;
-            continue;
-        }
-        if unchanged {
             continue;
         }
         let decoded: serde_json::Map<String, Value> = serde_json::from_str(fields.value(row))
@@ -559,6 +557,7 @@ fn sanitize(value: &str) -> String {
 fn event_column(field: &str) -> String {
     const RESERVED: &[&str] = &[
         "event_id",
+        "chain_id",
         "address",
         "block_number",
         "block_hash",
@@ -725,7 +724,7 @@ mod tests {
         let mut fields = (0..8)
             .map(|row| batch_fields(&batch, row))
             .collect::<Vec<_>>();
-        fields[0] = r#"{"from":"0xaa","value":"7"}"#.into();
+        fields[0] = r#"{"from":"0xaa","value":"7","chain_id":"99"}"#.into();
         let changed = replace_column(
             &batch,
             "fields_json",
@@ -765,8 +764,35 @@ mod tests {
             None,
             "deleted events leave the per-event table"
         );
+        let chain = |sql: &str| {
+            connection
+                .query_row(sql, [id(0)], |row| row.get::<_, String>(0))
+                .unwrap()
+        };
+        assert_eq!(
+            chain(
+                "SELECT chain_id || '/' || param_chain_id FROM token__transfer WHERE event_id = ?1"
+            ),
+            "1/99",
+            "a decoded chain_id field never overwrites the chain"
+        );
         let blocks = scalar(&connection, "SELECT count(*) FROM blocks");
         assert_eq!(blocks, 1);
+
+        connection
+            .execute_batch("DROP TABLE token__approval")
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        write_event_rows(&transaction, &changed).unwrap();
+        transaction.commit().unwrap();
+        assert_eq!(
+            scalar(&connection, "SELECT count(*) FROM token__approval"),
+            2
+        );
+        assert_eq!(
+            scalar(&connection, "SELECT count(*) FROM event_revisions"),
+            11
+        );
     }
 
     fn scalar(connection: &Connection, sql: &str) -> i64 {
