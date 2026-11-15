@@ -60,15 +60,8 @@ pub async fn wait(root: &Path, poll: Duration) -> Result<Value> {
 /// Progress of the slowest enabled source. Each source writes its file when a checkpoint
 /// commits, so this is `None` until every enabled source has committed one.
 pub fn read_progress(root: &Path, config: &ProjectConfig) -> Result<Option<BackfillProgress>> {
-    let mut files = vec![PROGRESS_FILE];
-    if config.index_blocks {
-        files.push(BLOCKS_PROGRESS_FILE);
-    }
-    if config.index_transactions {
-        files.push(TRANSACTIONS_PROGRESS_FILE);
-    }
     let mut slowest: Option<BackfillProgress> = None;
-    for file in files {
+    for file in progress_files(config) {
         let Some(progress) = read_progress_file(&root.join(file))? else {
             return Ok(None);
         };
@@ -80,6 +73,41 @@ pub fn read_progress(root: &Path, config: &ProjectConfig) -> Result<Option<Backf
         }
     }
     Ok(slowest)
+}
+
+/// True once every enabled source has committed a checkpoint after the `since_unix` second that
+/// reports it caught up through `end_block`. It reads only the progress files, so an RPC
+/// failure cannot hide completion, and progress left by an earlier run does not count.
+pub fn reached_end(
+    root: &Path,
+    config: &ProjectConfig,
+    end_block: u64,
+    since_unix: u64,
+) -> Result<bool> {
+    for file in progress_files(config) {
+        let Some(progress) = read_progress_file(&root.join(file))? else {
+            return Ok(false);
+        };
+        if !progress.caught_up
+            || progress.indexed_through < end_block
+            // Whole seconds: the last checkpoint of an earlier run can share the start second.
+            || progress.updated_at_unix <= since_unix
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn progress_files(config: &ProjectConfig) -> Vec<&'static str> {
+    let mut files = vec![PROGRESS_FILE];
+    if config.index_blocks {
+        files.push(BLOCKS_PROGRESS_FILE);
+    }
+    if config.index_transactions {
+        files.push(TRANSACTIONS_PROGRESS_FILE);
+    }
+    files
 }
 
 fn read_progress_file(path: &Path) -> Result<Option<BackfillProgress>> {
@@ -205,6 +233,42 @@ mod tests {
         assert_eq!(value["backfill"]["safe_head"], 995);
         assert_eq!(value["backfill"]["remaining_blocks"], 5);
         assert_eq!(value["backfill"]["caught_up"], false);
+    }
+
+    #[test]
+    fn reaches_end_only_with_fresh_complete_progress() {
+        let root = std::env::temp_dir().join(format!(
+            "streamling-blockchain-reached-end-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let write = |file: &str, indexed_through: u64, caught_up: bool, updated_at_unix: u64| {
+            std::fs::write(
+                root.join(file),
+                format!(
+                    r#"{{"indexed_through":{indexed_through},"observed_head":400,"safe_head":{indexed_through},"confirmations":10,"caught_up":{caught_up},"updated_at_unix":{updated_at_unix}}}"#
+                ),
+            )
+            .unwrap();
+        };
+        let mut config = config();
+        config.index_blocks = true;
+        let reached = || reached_end(&root, &config, 300, 100).unwrap();
+
+        assert!(!reached(), "no progress yet");
+        write(PROGRESS_FILE, 300, true, 101);
+        assert!(!reached(), "the blocks source has not committed");
+        write(BLOCKS_PROGRESS_FILE, 300, true, 100);
+        assert!(!reached(), "blocks progress may be from an earlier run");
+        write(BLOCKS_PROGRESS_FILE, 250, true, 101);
+        assert!(!reached(), "caught up to a safe head below end_block");
+        write(BLOCKS_PROGRESS_FILE, 300, false, 101);
+        assert!(!reached(), "a catch-up job still runs");
+        write(BLOCKS_PROGRESS_FILE, 300, true, 101);
+        assert!(reached());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

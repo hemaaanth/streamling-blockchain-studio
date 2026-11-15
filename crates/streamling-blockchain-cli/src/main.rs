@@ -159,8 +159,12 @@ enum Commands {
         plugin: Option<PathBuf>,
         #[arg(long)]
         no_build: bool,
-        #[arg(long)]
+        /// Exit once caught up. This is the default for a project with an end_block.
+        #[arg(long, conflicts_with = "keep_running")]
         exit_when_caught_up: bool,
+        /// Keep Streamling running after a bounded project reaches its end_block.
+        #[arg(long)]
+        keep_running: bool,
         #[arg(long, default_value_t = 5)]
         exit_poll_seconds: u64,
     },
@@ -600,8 +604,11 @@ async fn dispatch(cli: Cli, out: &mut Output) -> Result<Value> {
             plugin,
             no_build,
             exit_when_caught_up,
+            keep_running,
             exit_poll_seconds,
         } => {
+            let bounded = ProjectConfig::load(&root)?.end_block.is_some();
+            let exit_when_caught_up = exit_when_caught_up || (bounded && !keep_running);
             run_streamling(
                 &root,
                 out,
@@ -1280,6 +1287,11 @@ async fn run_streamling(
         .stdout(out.child_stdout())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+    // Progress written before this run must not count as reaching the end.
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let mut child = command
         .spawn()
         .with_context(|| format!("run {}", streamling.display()))?;
@@ -1293,12 +1305,12 @@ async fn run_streamling(
         }
         return Ok(());
     }
-    if config.end_block.is_none() {
+    let Some(end_block) = config.end_block else {
         bail!(CodedError::new(
             ErrorCode::Validation,
             "--exit-when-caught-up requires a bounded project with end_block"
         ))
-    }
+    };
     loop {
         tokio::select! {
             status = child.wait() => {
@@ -1309,9 +1321,9 @@ async fn run_streamling(
                 return Ok(());
             }
             _ = tokio::time::sleep(exit_poll) => {
-                if status::live(root).await?["backfill"]["caught_up"].as_bool() == Some(true) {
+                if status::reached_end(root, &config, end_block, started)? {
                     tokio::time::sleep(exit_poll).await;
-                    if status::live(root).await?["backfill"]["caught_up"].as_bool() == Some(true) {
+                    if status::reached_end(root, &config, end_block, started)? {
                         stop_streamling(&mut child, streamling).await?;
                         return Ok(());
                     }
