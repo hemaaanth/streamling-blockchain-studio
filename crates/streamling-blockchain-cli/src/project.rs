@@ -454,10 +454,11 @@ struct SemanticTable {
     name: String,
     alias: String,
     event: String,
-    signatures: Vec<String>,
-    columns: Vec<SemanticColumn>,
+    /// Each ABI definition of the event as (signature, inputs); the first is the main one.
+    variants: Vec<(String, Vec<SemanticColumn>)>,
 }
 
+#[derive(Clone, PartialEq)]
 struct SemanticColumn {
     field: String,
     kind: String,
@@ -530,22 +531,13 @@ impl SemanticTables {
                     name: table,
                     alias: alias.to_owned(),
                     event: name.to_owned(),
-                    signatures: vec![signature],
-                    columns,
+                    variants: vec![(signature, columns)],
                 });
                 continue;
             };
-            if !entry.signatures.contains(&signature) {
-                entry.signatures.push(signature);
-            }
-            for column in columns {
-                if !entry
-                    .columns
-                    .iter()
-                    .any(|known| known.field == column.field)
-                {
-                    entry.columns.push(column);
-                }
+            let variant = (signature, columns);
+            if !entry.variants.contains(&variant) {
+                entry.variants.push(variant);
             }
         }
         Ok(())
@@ -561,22 +553,40 @@ impl SemanticTables {
                     kept_description(existing, name, None)
                         .map_or_else(|| format!("{event} events emitted by {alias}"), str::to_owned)
                 ),
-                table.signatures[0],
-                topic0(&table.signatures[0]),
+                table.variants[0].0,
+                topic0(&table.variants[0].0),
             ));
-            if table.signatures.len() > 1 {
-                let overloads = table.signatures[1..]
+            // Overloads keep their own inputs, so `check` still sees a change to any one of them.
+            if table.variants.len() > 1 {
+                let overloads = table.variants[1..]
                     .iter()
-                    .map(|signature| {
+                    .map(|(signature, inputs)| {
+                        let inputs = inputs
+                            .iter()
+                            .map(|input| {
+                                format!(
+                                    "{{ source_name = {:?}, solidity_type = {:?}, indexed = {} }}",
+                                    input.source_name, input.kind, input.indexed
+                                )
+                            })
+                            .collect::<Vec<_>>();
                         format!(
-                            "{{ signature = {signature:?}, topic0 = {:?} }}",
-                            topic0(signature)
+                            "{{ signature = {signature:?}, topic0 = {:?}, inputs = [{}] }}",
+                            topic0(signature),
+                            inputs.join(", ")
                         )
                     })
                     .collect::<Vec<_>>();
                 out.push_str(&format!("overloads = [{}]\n", overloads.join(", ")));
             }
-            for column in &table.columns {
+            // Columns follow the sink: one per field name, described by its first definition.
+            let mut columns = Vec::<&SemanticColumn>::new();
+            for column in table.variants.iter().flat_map(|(_, inputs)| inputs) {
+                if !columns.iter().any(|known| known.field == column.field) {
+                    columns.push(column);
+                }
+            }
+            for column in columns {
                 let (field, kind) = (&column.field, &column.kind);
                 out.push_str(&format!(
                     "[tables.{name:?}.columns.{field:?}]\ndescription = {}\nsolidity_type = {kind:?}\nindexed = {}\nsource_name = {:?}\n",
@@ -1083,7 +1093,8 @@ mod tests {
             root.join("abis/pool_v2.json"),
             r#"[
               {"type":"event","name":"Changed","anonymous":false,"inputs":[{"name":"amount","type":"uint256","indexed":false}]},
-              {"type":"event","name":"Changed","anonymous":false,"inputs":[{"name":"owner","type":"address","indexed":true}]}
+              {"type":"event","name":"Changed","anonymous":false,"inputs":[{"name":"owner","type":"address","indexed":true}]},
+              {"type":"event","name":"Changed","anonymous":false,"inputs":[{"name":"amount","type":"address","indexed":true}]}
             ]"#,
         )
         .unwrap();
@@ -1110,7 +1121,25 @@ mod tests {
         );
         let columns = changed["columns"].as_table().unwrap();
         assert!(columns.contains_key("amount") && columns.contains_key("owner"));
+        let overload = &changed["overloads"][1]["inputs"][0];
+        assert_eq!(overload["solidity_type"].as_str(), Some("address"));
+        assert_eq!(overload["indexed"].as_bool(), Some(true));
         assert!(check_semantics(&root, &config).unwrap().is_empty());
+
+        // Only the shadowed overload changes; check must still see it.
+        let abi = std::fs::read_to_string(root.join("abis/pool_v2.json")).unwrap();
+        std::fs::write(
+            root.join("abis/pool_v2.json"),
+            abi.replace(
+                r#"{"name":"amount","type":"address","indexed":true}"#,
+                r#"{"name":"amount","type":"address","indexed":false}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            check_semantics(&root, &config).unwrap(),
+            vec!["table pool__changed does not match its ABI".to_owned()]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
