@@ -23,6 +23,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 streamling-blockchain-decode = { path = "../streamling-blockchain-decode" }
-streamling-plugin = "0.2.1"
+streamling-plugin = "0.2.4"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tracing = "0.1"

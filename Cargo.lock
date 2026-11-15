@@ -4478,7 +4478,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -5841,9 +5841,9 @@ dependencies = [
 
 [[package]]
 name = "streamling-common"
-version = "0.3.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d73e79cdc7ecdd1c33c28e641300359ede32735cfef05b5dbbfc83a5a7a92ad"
+checksum = "ec9d7256917ef54fc3c05f4a6bf04878c74f07098088f22d2813bad6450a22e1"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -5863,6 +5863,7 @@ dependencies = [
  "regex",
  "serde_json",
  "sha3 0.10.9",
+ "streamling-retry",
  "tracing",
  "tracing-subscriber",
  "uint 0.10.1",
@@ -5872,14 +5873,15 @@ dependencies = [
 
 [[package]]
 name = "streamling-config"
-version = "0.3.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c444704a23694b872c7af527befad74f23e069bdf083da7c2b9d04781f1c989"
+checksum = "6c56abb6f1aa448aed455be0543c56ab9e788d2c1b92184c9bcc998b8203eb1f"
 dependencies = [
  "anyhow",
  "async-trait",
  "config",
  "futures",
+ "humantime",
  "percent-encoding",
  "schema_registry_converter",
  "serde",
@@ -5891,9 +5893,9 @@ dependencies = [
 
 [[package]]
 name = "streamling-plugin"
-version = "0.2.1"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "889c7b1a5cb2e80f3a772c4d9d33483af30995d77ba3d5101d985f1b5621dc70"
+checksum = "cd119409f09d0f0c89006b73027c6e011ab696a814d2e8c5aef4cf77cbb40674"
 dependencies = [
  "abi_stable",
  "arrow",
@@ -5903,22 +5905,25 @@ dependencies = [
  "crossbeam-channel",
  "datafusion",
  "datafusion-ffi",
+ "futures",
  "serde",
  "serde_json",
  "streamling-common",
  "streamling-config",
  "streamling-plugin-derive",
+ "streamling-retry",
  "streamling-state",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "streamling-plugin-derive"
-version = "0.3.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "760e87a5e3613fddb78c42d878968308dc7b4e3da2614daf7ab2cc4f0cd8e790"
+checksum = "c2eb6065675ffe647ab4882f067179243990e56b9a913af5e6ee5178510cc2ad"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5926,10 +5931,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "streamling-state"
-version = "0.3.1"
+name = "streamling-retry"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ec69fba0db96a6492e34ea7e367a7290d5f4eeda6d0c7898c289eec3a8bef66"
+checksum = "981b64f69d7eade51b493951bc7f7856ec42d8460f10d70251942a2ea63cf26c"
+dependencies = [
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "streamling-state"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6debe2f451c8ffb071796f7a97aeb246120baefd105a95940f85893e2213632"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -6273,6 +6288,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
