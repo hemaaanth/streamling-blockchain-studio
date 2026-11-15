@@ -2,7 +2,7 @@ use crate::config::{ContractConfig, DiscoveryRule, ProjectConfig};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use sha3::{Digest, Keccak256};
-use std::{collections::HashSet, path::Path};
+use std::path::Path;
 
 pub fn write_generated_files(root: &Path, config: &ProjectConfig) -> Result<()> {
     write_pipeline(root, config)?;
@@ -409,28 +409,17 @@ fn render_semantics(root: &Path, config: &ProjectConfig, existing: &toml::Table)
         ));
     }
     out.push('\n');
+    let mut tables = SemanticTables::default();
     for contract in &config.contracts {
-        append_abi_semantics(
-            &mut out,
-            &contract.alias,
-            &read_abi(&root.join(&contract.abi))?,
-            existing,
-        )?;
+        tables.add_abi(&contract.alias, &read_abi(&root.join(&contract.abi))?)?;
     }
-    let mut children = HashSet::new();
-    // Several factories may share one child alias; its tables appear once.
-    for rule in config
-        .discovery_rules
-        .iter()
-        .filter(|rule| children.insert(&rule.child_contract))
-    {
-        append_abi_semantics(
-            &mut out,
+    for rule in &config.discovery_rules {
+        tables.add_abi(
             &rule.child_contract,
             &read_abi(&root.join(&rule.child_abi))?,
-            existing,
         )?;
     }
+    tables.render(&mut out, existing);
     Ok(out)
 }
 
@@ -454,91 +443,156 @@ fn kept_description<'a>(
     entry.get("description")?.as_str()
 }
 
-fn append_abi_semantics(
-    out: &mut String,
-    alias: &str,
-    abi: &Value,
-    existing: &toml::Table,
-) -> Result<()> {
-    let items = abi.as_array().context("ABI must be a JSON array")?;
-    for item in items
-        .iter()
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("event"))
-    {
-        let name = item
-            .get("name")
-            .and_then(Value::as_str)
-            .context("event missing name")?;
-        if item.get("anonymous").and_then(Value::as_bool) == Some(true) {
-            bail!("anonymous event {name} is unsupported; Streamling topic filters require topic0");
-        }
-        let table = format!(
-            "{}__{}",
-            alias.to_ascii_lowercase(),
-            name.to_ascii_lowercase()
-        );
-        let inputs = item
-            .get("inputs")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let types = inputs
+/// Semantic tables keyed like the SQLite sink's `<alias>__<event>` tables. Overloaded events and
+/// child aliases shared by several factories land in one table there, so they share one entry here.
+#[derive(Default)]
+struct SemanticTables {
+    tables: Vec<SemanticTable>,
+}
+
+struct SemanticTable {
+    name: String,
+    alias: String,
+    event: String,
+    signatures: Vec<String>,
+    columns: Vec<SemanticColumn>,
+}
+
+struct SemanticColumn {
+    field: String,
+    kind: String,
+    indexed: bool,
+    source_name: String,
+}
+
+impl SemanticTables {
+    fn add_abi(&mut self, alias: &str, abi: &Value) -> Result<()> {
+        let items = abi.as_array().context("ABI must be a JSON array")?;
+        for item in items
             .iter()
-            .map(|input| {
-                input
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_owned()
-            })
-            .collect::<Vec<_>>();
-        let signature = format!("{name}({})", types.join(","));
-        let topic0 = format!("0x{}", hex::encode(Keccak256::digest(signature.as_bytes())));
-        out.push_str(&format!(
-            "[tables.{table:?}]\ndescription = {}\ncontract = {:?}\nevent = {:?}\nsignature = {:?}\ntopic0 = {:?}\n",
-            toml_string(
-                kept_description(existing, &table, None)
-                    .map_or_else(|| format!("{name} events emitted by {alias}"), str::to_owned)
-            ),
-            alias,
-            name,
-            signature,
-            topic0
-        ));
-        let mut columns = HashSet::new();
-        for (index, input) in inputs.iter().enumerate() {
-            let raw_field = input
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("event"))
+        {
+            let name = item
                 .get("name")
                 .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("unnamed_{}", index + 1));
-            let field = event_column(&raw_field);
-            if !columns.insert(field.clone()) {
-                bail!("event {name} maps multiple ABI parameters to SQLite column {field}");
+                .context("event missing name")?;
+            if item.get("anonymous").and_then(Value::as_bool) == Some(true) {
+                bail!(
+                    "anonymous event {name} is unsupported; Streamling topic filters require topic0"
+                );
             }
-            let kind = input
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let indexed = input
-                .get("indexed")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            out.push_str(&format!(
-                "[tables.{table:?}.columns.{field:?}]\ndescription = {}\nsolidity_type = {:?}\nindexed = {indexed}\nsource_name = {:?}\n",
-                toml_string(
-                    kept_description(existing, &table, Some(&field))
-                        .map_or_else(|| format!("Solidity {kind} event parameter"), str::to_owned)
-                ),
-                kind,
-                raw_field
-            ));
+            let inputs = item
+                .get("inputs")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut columns = Vec::new();
+            for (index, input) in inputs.iter().enumerate() {
+                let source_name = input
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("unnamed_{}", index + 1));
+                let field = event_column(&source_name);
+                if columns
+                    .iter()
+                    .any(|column: &SemanticColumn| column.field == field)
+                {
+                    bail!("event {name} maps multiple ABI parameters to SQLite column {field}");
+                }
+                columns.push(SemanticColumn {
+                    field,
+                    kind: input
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_owned(),
+                    indexed: input
+                        .get("indexed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    source_name,
+                });
+            }
+            let types = columns
+                .iter()
+                .map(|column| column.kind.as_str())
+                .collect::<Vec<_>>();
+            let signature = format!("{name}({})", types.join(","));
+            let table = format!(
+                "{}__{}",
+                alias.to_ascii_lowercase(),
+                name.to_ascii_lowercase()
+            );
+            let Some(entry) = self.tables.iter_mut().find(|entry| entry.name == table) else {
+                self.tables.push(SemanticTable {
+                    name: table,
+                    alias: alias.to_owned(),
+                    event: name.to_owned(),
+                    signatures: vec![signature],
+                    columns,
+                });
+                continue;
+            };
+            if !entry.signatures.contains(&signature) {
+                entry.signatures.push(signature);
+            }
+            for column in columns {
+                if !entry
+                    .columns
+                    .iter()
+                    .any(|known| known.field == column.field)
+                {
+                    entry.columns.push(column);
+                }
+            }
         }
-        out.push('\n');
+        Ok(())
     }
-    Ok(())
+
+    fn render(&self, out: &mut String, existing: &toml::Table) {
+        let topic0 = |signature: &str| format!("0x{}", hex::encode(Keccak256::digest(signature)));
+        for table in &self.tables {
+            let (name, alias, event) = (&table.name, &table.alias, &table.event);
+            out.push_str(&format!(
+                "[tables.{name:?}]\ndescription = {}\ncontract = {alias:?}\nevent = {event:?}\nsignature = {:?}\ntopic0 = {:?}\n",
+                toml_string(
+                    kept_description(existing, name, None)
+                        .map_or_else(|| format!("{event} events emitted by {alias}"), str::to_owned)
+                ),
+                table.signatures[0],
+                topic0(&table.signatures[0]),
+            ));
+            if table.signatures.len() > 1 {
+                let overloads = table.signatures[1..]
+                    .iter()
+                    .map(|signature| {
+                        format!(
+                            "{{ signature = {signature:?}, topic0 = {:?} }}",
+                            topic0(signature)
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                out.push_str(&format!("overloads = [{}]\n", overloads.join(", ")));
+            }
+            for column in &table.columns {
+                let (field, kind) = (&column.field, &column.kind);
+                out.push_str(&format!(
+                    "[tables.{name:?}.columns.{field:?}]\ndescription = {}\nsolidity_type = {kind:?}\nindexed = {}\nsource_name = {:?}\n",
+                    toml_string(
+                        kept_description(existing, name, Some(field))
+                            .map_or_else(|| format!("Solidity {kind} event parameter"), str::to_owned)
+                    ),
+                    column.indexed,
+                    column.source_name
+                ));
+            }
+            out.push('\n');
+        }
+    }
 }
+
 /// Descriptions may hold user text, so quote them as TOML rather than with Rust's `{:?}`.
 fn toml_string(text: String) -> String {
     toml::Value::String(text).to_string()
@@ -640,7 +694,7 @@ fn install_abi(
     // The runtime and replay decode with ethers' parser, so reject what it rejects.
     serde_json::from_value::<ethers_core::abi::Abi>(abi.clone())
         .with_context(|| format!("parse ABI {}", abi_source.display()))?;
-    append_abi_semantics(&mut String::new(), "check", &abi, &toml::Table::new())?;
+    SemanticTables::default().add_abi("check", &abi)?;
     std::fs::create_dir_all(target.parent().context("ABI path has no parent")?)?;
     std::fs::copy(abi_source, target).with_context(|| format!("copy {}", abi_source.display()))?;
     config.save(root)?;
@@ -1017,6 +1071,45 @@ mod tests {
         write_semantics(&root, &config).unwrap();
         let text = std::fs::read_to_string(root.join("semantic.toml")).unwrap();
         assert_eq!(text.matches("[tables.\"pool__approval\"]").count(), 1);
+        assert!(check_semantics(&root, &config).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shared_alias_keeps_every_abi_and_overloads_share_one_table() {
+        let (root, mut config) = token_project("overloads");
+        std::fs::write(root.join("abis/pool.json"), APPROVAL_ABI).unwrap();
+        std::fs::write(
+            root.join("abis/pool_v2.json"),
+            r#"[
+              {"type":"event","name":"Changed","anonymous":false,"inputs":[{"name":"amount","type":"uint256","indexed":false}]},
+              {"type":"event","name":"Changed","anonymous":false,"inputs":[{"name":"owner","type":"address","indexed":true}]}
+            ]"#,
+        )
+        .unwrap();
+        for child_abi in ["abis/pool.json", "abis/pool_v2.json"] {
+            config.discovery_rules.push(DiscoveryRule {
+                parent_contract: "token".into(),
+                discovery_event: "Transfer".into(),
+                address_field: "to".into(),
+                child_contract: "pool".into(),
+                child_abi: PathBuf::from(child_abi),
+            });
+        }
+
+        write_semantics(&root, &config).unwrap();
+        let text = std::fs::read_to_string(root.join("semantic.toml")).unwrap();
+        let semantics: toml::Table = toml::from_str(&text).unwrap();
+        let tables = semantics["tables"].as_table().unwrap();
+        assert!(tables.contains_key("pool__approval"));
+        let changed = &tables["pool__changed"];
+        assert_eq!(changed["signature"].as_str(), Some("Changed(uint256)"));
+        assert_eq!(
+            changed["overloads"][0]["signature"].as_str(),
+            Some("Changed(address)")
+        );
+        let columns = changed["columns"].as_table().unwrap();
+        assert!(columns.contains_key("amount") && columns.contains_key("owner"));
         assert!(check_semantics(&root, &config).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
