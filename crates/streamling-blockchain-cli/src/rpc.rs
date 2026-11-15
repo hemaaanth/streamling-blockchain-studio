@@ -101,6 +101,38 @@ pub fn split_urls(urls: &str) -> impl Iterator<Item = &str> {
     urls.split(',').map(str::trim).filter(|url| !url.is_empty())
 }
 
+const ENDPOINT_ROUNDS: u32 = 3;
+
+/// Calls `method` on the endpoints in `urls`, moving to the next one after a transient
+/// failure and going round them up to three times. Other errors return at once.
+pub async fn rpc_any(client: &Client, urls: &str, method: &str, params: Value) -> Result<Value> {
+    let urls = split_urls(urls).collect::<Vec<_>>();
+    if urls.is_empty() {
+        bail!(CodedError::new(
+            ErrorCode::Validation,
+            "rpc_url lists no endpoints"
+        ))
+    }
+    let mut last = None;
+    for round in 0..ENDPOINT_ROUNDS {
+        if round > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(1 << round)).await;
+        }
+        for url in &urls {
+            match rpc(client, url, method, params.clone()).await {
+                Ok(value) => return Ok(value),
+                Err(error)
+                    if crate::output::classify(&error).0 == ErrorCode::TransientDependency =>
+                {
+                    last = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Err(last.expect("at least one endpoint was tried"))
+}
+
 /// The endpoint the CLI uses for its own single-endpoint checks.
 pub fn primary_url(urls: &str) -> &str {
     split_urls(urls).next().unwrap_or_default()

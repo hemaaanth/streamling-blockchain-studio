@@ -22,6 +22,12 @@ pub struct ProjectConfig {
     pub confirmations: u64,
     #[serde(default = "default_window")]
     pub window: u64,
+    /// The widest log window the event source may grow to; ten times `window` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_window: Option<u64>,
+    /// Log windows the event source fetches at the same time.
+    #[serde(default = "default_log_concurrency")]
+    pub log_concurrency: u64,
     /// Blocks fetched in parallel by the block and transaction sources.
     #[serde(default = "default_block_concurrency")]
     pub block_concurrency: u64,
@@ -81,6 +87,9 @@ fn default_confirmations() -> u64 {
 fn default_window() -> u64 {
     2_000
 }
+pub fn default_log_concurrency() -> u64 {
+    4
+}
 pub fn default_block_concurrency() -> u64 {
     8
 }
@@ -127,13 +136,17 @@ impl ProjectConfig {
         Ok(())
     }
 
+    /// Every configured endpoint, comma separated.
+    pub fn rpc_urls_value(&self) -> Result<String> {
+        match &self.rpc_url_env {
+            Some(name) => std::env::var(name).with_context(|| format!("read ${name}")),
+            None => Ok(self.rpc_url.clone()),
+        }
+    }
+
     /// The first configured endpoint, for the CLI's own RPC calls.
     pub fn rpc_url_value(&self) -> Result<String> {
-        let urls = match &self.rpc_url_env {
-            Some(name) => std::env::var(name).with_context(|| format!("read ${name}"))?,
-            None => self.rpc_url.clone(),
-        };
-        Ok(crate::rpc::primary_url(&urls).to_owned())
+        Ok(crate::rpc::primary_url(&self.rpc_urls_value()?).to_owned())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -150,6 +163,15 @@ impl ProjectConfig {
         }
         if self.window == 0 {
             bail!("window must be greater than zero")
+        }
+        if self
+            .max_window
+            .is_some_and(|max_window| max_window < self.window)
+        {
+            bail!("max_window must be at least window")
+        }
+        if self.log_concurrency == 0 {
+            bail!("log_concurrency must be greater than zero")
         }
         if self.block_concurrency == 0 {
             bail!("block_concurrency must be greater than zero")

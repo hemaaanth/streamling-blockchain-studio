@@ -1,5 +1,5 @@
 use crate::{
-    config::ProjectConfig,
+    config::{DiscoveryRule, ProjectConfig},
     database::{Backend, BackendKind},
     output::{CodedError, ErrorCode},
     rpc, status,
@@ -50,46 +50,212 @@ async fn diff_with(
             "--from must be less than or equal to --to"
         ))
     }
-    let rpc_url = config.rpc_url_value()?;
+    let urls = config.rpc_urls_value()?;
+    let client = rpc::client()?;
     let mut events = HashMap::new();
     let mut direct = HashMap::new();
+    let mut direct_topics = HashSet::new();
     for contract in &config.contracts {
         direct.insert(
             contract.address.to_ascii_lowercase(),
             contract.alias.clone(),
         );
-        load_events(&contract.alias, &root.join(&contract.abi), &mut events)?;
+        direct_topics.extend(load_events(
+            &contract.alias,
+            &root.join(&contract.abi),
+            &mut events,
+        )?);
     }
+    let mut child_topics = HashSet::new();
     for rule in &config.discovery_rules {
-        load_events(
+        child_topics.extend(load_events(
             &rule.child_contract,
             &root.join(&rule.child_abi),
             &mut events,
-        )?;
+        )?);
     }
-    let mut topics = events
-        .keys()
+
+    // The same two queries the event source makes: the configured contracts with their own
+    // topics, then every discovered child with the child topics.
+    let mut addresses = direct.keys().cloned().collect::<Vec<_>>();
+    addresses.sort_unstable();
+    let mut logs = Vec::new();
+    for chunk in addresses.chunks(MAX_ADDRESSES_PER_LOG_FILTER) {
+        let filter = json!({"address": chunk, "topics": [sorted_topics(&direct_topics)]});
+        logs.extend(get_logs(&client, &urls, &filter, from, to).await?);
+    }
+    let mut children = HashMap::new();
+    for rule in &config.discovery_rules {
+        for address in stored_children(backend, config.chain_id, rule, to).await? {
+            children.insert(address, rule.child_contract.clone());
+        }
+    }
+    let mut decoded = Vec::new();
+    for log in &logs {
+        if let Some(event) = decode_log(config.chain_id, log, &events, &direct, &children)? {
+            if let Some((address, child)) = discovered_child(config, &direct, log, &event) {
+                children.insert(address, child);
+            }
+            decoded.push(event);
+        }
+    }
+    if !children.is_empty() && !child_topics.is_empty() {
+        let mut child_addresses = children.keys().cloned().collect::<Vec<_>>();
+        child_addresses.sort_unstable();
+        let mut child_logs = Vec::new();
+        for chunk in child_addresses.chunks(MAX_ADDRESSES_PER_LOG_FILTER) {
+            let filter = json!({"address": chunk, "topics": [sorted_topics(&child_topics)]});
+            child_logs.extend(get_logs(&client, &urls, &filter, from, to).await?);
+        }
+        for log in &child_logs {
+            decoded.extend(decode_log(
+                config.chain_id,
+                log,
+                &events,
+                &direct,
+                &children,
+            )?);
+        }
+    }
+    let mut seen = HashSet::new();
+    decoded.retain(|event| seen.insert(event.event_id.clone()));
+    let stored = stored_events(backend, config.chain_id, from, to).await?;
+    Ok(compare(stored, from, to, decoded))
+}
+
+const MAX_ADDRESSES_PER_LOG_FILTER: usize = 500;
+
+fn sorted_topics(topics: &HashSet<H256>) -> Vec<String> {
+    let mut topics = topics
+        .iter()
         .map(|topic| format!("{topic:#x}"))
         .collect::<Vec<_>>();
     topics.sort();
-    let mut filter = json!({
-        "fromBlock": format!("0x{from:x}"),
-        "toBlock": format!("0x{to:x}"),
-        "topics": [topics]
-    });
-    if config.discovery_rules.is_empty() {
-        filter["address"] = Value::Array(direct.keys().cloned().map(Value::String).collect());
+    topics
+}
+
+/// `eth_getLogs` over `from..=to`, halving any range the provider refuses as too wide or
+/// too large.
+async fn get_logs(
+    client: &reqwest::Client,
+    urls: &str,
+    filter: &Value,
+    from: u64,
+    to: u64,
+) -> Result<Vec<Value>> {
+    let mut pending = vec![(from, to)];
+    let mut logs = Vec::new();
+    while let Some((start, end)) = pending.pop() {
+        let mut filter = filter.clone();
+        filter["fromBlock"] = format!("0x{start:x}").into();
+        filter["toBlock"] = format!("0x{end:x}").into();
+        match rpc::rpc_any(client, urls, "eth_getLogs", json!([filter])).await {
+            Ok(value) => logs.extend(value.as_array().cloned().unwrap_or_default()),
+            Err(error) if start < end && is_too_wide(&error) => {
+                let middle = start + (end - start) / 2;
+                pending.push((middle + 1, end));
+                pending.push((start, middle));
+            }
+            Err(error) => return Err(error),
+        }
     }
-    let logs = rpc_call(&rpc_url, "eth_getLogs", json!([filter])).await?;
-    let decoded = logs
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
+    Ok(logs)
+}
+
+/// Provider phrases for a log query that covers too many blocks or returns too many logs.
+fn is_too_wide(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    if text.contains("rate limit") || text.contains("too many requests") {
+        return false;
+    }
+    [
+        "range",
+        "more than",
+        "response size",
+        "too many results",
+        "timed out",
+        "timeout",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
+}
+
+/// The child address and alias a parent's discovery event names, if the event matches a rule.
+fn discovered_child(
+    config: &ProjectConfig,
+    direct: &HashMap<String, String>,
+    log: &Value,
+    event: &DecodedEvent,
+) -> Option<(String, String)> {
+    let address = log.get("address")?.as_str()?.to_ascii_lowercase();
+    let rule = config.discovery_rules.iter().find(|rule| {
+        rule.parent_contract == event.contract_alias
+            && rule.discovery_event == event.event_name
+            && direct.get(&address) == Some(&rule.parent_contract)
+    })?;
+    let data: Value = serde_json::from_str(&event.data).ok()?;
+    let address = data
+        .get(&rule.address_field)?
+        .as_str()?
+        .to_ascii_lowercase();
+    Some((address, rule.child_contract.clone()))
+}
+
+/// Child addresses the stored discovery events for `rule` name, up to block `to`.
+async fn stored_children(
+    backend: &Backend,
+    chain_id: u64,
+    rule: &DiscoveryRule,
+    to: u64,
+) -> Result<Vec<String>> {
+    let data = match backend {
+        Backend::Sqlite(conn) => {
+            let mut statement = conn.prepare(
+                "SELECT data FROM events WHERE contract_alias = ?1 AND event_name = ?2 AND block_number <= ?3",
+            )?;
+            statement
+                .query_map(
+                    params![rule.parent_contract, rule.discovery_event, to],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        }
+        Backend::ClickHouse { client, table } => {
+            let rows = client
+                .query(
+                    &format!(
+                        "SELECT fields_json FROM {} FINAL
+                         WHERE is_deleted = 0 AND chain_id = {chain_id} AND contract_alias = '{}'
+                           AND event_name = '{}' AND block_number <= {to}",
+                        client.qualified(table),
+                        sql_string(&rule.parent_contract),
+                        sql_string(&rule.discovery_event),
+                    ),
+                    usize::MAX,
+                )
+                .await?;
+            rows["rows"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|row| row["fields_json"].as_str().map(str::to_owned))
+                .collect()
+        }
+    };
+    Ok(data
         .iter()
-        .filter_map(|log| decode_log(config.chain_id, log, &events, &direct).transpose())
-        .collect::<Result<Vec<_>>>()?;
-    let stored = stored_events(backend, config.chain_id, from, to).await?;
-    Ok(compare(stored, from, to, decoded))
+        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+        .filter_map(|fields| {
+            fields
+                .get(&rule.address_field)?
+                .as_str()
+                .map(str::to_ascii_lowercase)
+        })
+        .collect())
+}
+
+fn sql_string(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
 pub async fn audit_once(
@@ -145,7 +311,15 @@ pub async fn audit_continuous(
     backend: Option<BackendKind>,
 ) -> Result<()> {
     loop {
-        let line = serde_json::to_string(&audit_once(root, window_blocks, backend).await?)?;
+        // One failed audit (an RPC outage, a busy database) is reported, not fatal.
+        let report = match audit_once(root, window_blocks, backend).await {
+            Ok(report) => report,
+            Err(error) => {
+                let (code, _) = crate::output::classify(&error);
+                json!({"ok": false, "error": format!("{error:#}"), "code": code})
+            }
+        };
+        let line = serde_json::to_string(&report)?;
         if json {
             eprintln!("{line}");
         } else {
@@ -284,29 +458,6 @@ async fn record_audit(
     Ok(())
 }
 
-async fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value> {
-    let response = rpc::client()?
-        .post(url)
-        .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
-        .send()
-        .await
-        .map_err(reqwest::Error::without_url)
-        .with_context(|| format!("call {method}"))?;
-    let payload: Value = response
-        .json()
-        .await
-        .map_err(reqwest::Error::without_url)
-        .with_context(|| format!("decode {method}"))?;
-    if let Some(error) = payload.get("error") {
-        bail!(rpc::call_error(
-            method,
-            &payload,
-            format!("{method}: {error}")
-        ))
-    }
-    Ok(payload.get("result").cloned().unwrap_or(Value::Null))
-}
-
 /// Stored events in the block range, keyed by event ID, in the shape `compare` expects.
 async fn stored_events(
     backend: &Backend,
@@ -432,12 +583,14 @@ async fn compare_optional_indexed_tables(
     if !has_blocks && !has_transactions {
         return Ok(Value::Null);
     }
-    let rpc_url = config.rpc_url_value()?;
+    let urls = config.rpc_urls_value()?;
+    let client = rpc::client()?;
     let mut chain_blocks = 0_u64;
     let mut chain_transactions = 0_u64;
     for block in from..=to {
-        let value = rpc_call(
-            &rpc_url,
+        let value = rpc::rpc_any(
+            &client,
+            &urls,
             "eth_getBlockByNumber",
             json!([format!("0x{block:x}"), false]),
         )
@@ -534,6 +687,7 @@ fn decode_log(
     log: &Value,
     events: &HashMap<H256, Vec<EventDescriptor>>,
     direct: &HashMap<String, String>,
+    children: &HashMap<String, String>,
 ) -> Result<Option<DecodedEvent>> {
     let topics = log
         .get("topics")
@@ -552,11 +706,17 @@ fn decode_log(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let preferred = direct.get(&address);
-    let descriptor = candidates
+    // Every queried log comes from a known contract, and decodes only with that contract's
+    // ABI, as in the event source.
+    let Some(owner) = direct.get(&address).or_else(|| children.get(&address)) else {
+        return Ok(None);
+    };
+    let Some(descriptor) = candidates
         .iter()
-        .find(|candidate| preferred == Some(&candidate.owner))
-        .unwrap_or(&candidates[0]);
+        .find(|candidate| &candidate.owner == owner)
+    else {
+        return Ok(None);
+    };
     let raw_topics = topics
         .iter()
         .filter_map(Value::as_str)
@@ -605,10 +765,11 @@ fn load_events(
     owner: &str,
     path: &PathBuf,
     target: &mut HashMap<H256, Vec<EventDescriptor>>,
-) -> Result<()> {
+) -> Result<Vec<H256>> {
     let abi: Abi = serde_json::from_slice(
         &std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
     )?;
+    let mut topics = Vec::new();
     for events in abi.events.values() {
         for event in events {
             if event.anonymous {
@@ -625,9 +786,10 @@ fn load_events(
                     owner: owner.to_owned(),
                     event: event.clone(),
                 });
+            topics.push(event.signature());
         }
     }
-    Ok(())
+    Ok(topics)
 }
 
 fn parse_hex(text: &str) -> Result<u64> {
@@ -769,6 +931,128 @@ mod tests {
             .execute(&format!("DROP DATABASE {database}"))
             .await
             .unwrap();
+    }
+
+    /// Runs `tests/mock_rpc.py` on a free port; the process stops when this drops.
+    struct MockRpc(std::process::Child, String);
+
+    impl Drop for MockRpc {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn start_mock_rpc(max_range: &str) -> MockRpc {
+        use std::io::BufRead;
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut child = std::process::Command::new("python3")
+            .arg(repo.join("tests/mock_rpc.py"))
+            .args(["0", max_range])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3 runs tests/mock_rpc.py");
+        let mut port = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut port)
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}", port.trim());
+        MockRpc(child, url)
+    }
+
+    #[tokio::test]
+    async fn diff_follows_discovered_children_and_splits_wide_ranges() {
+        // The mock refuses ranges over 3 blocks, so 90..=110 must be split; the factory
+        // log names a child whose log only the child query returns.
+        let rpc = start_mock_rpc("3");
+        let abi = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/transfer_abi.json");
+        let config: ProjectConfig = toml::from_str(&format!(
+            r#"
+            chain = "ethereum"
+            chain_id = 1
+            rpc_url = "{}"
+            database = "events.db"
+            start_block = 90
+            [[contracts]]
+            alias = "factory"
+            address = "0x1111111111111111111111111111111111111111"
+            abi = "{abi}"
+            [[discovery_rules]]
+            parent_contract = "factory"
+            discovery_event = "Transfer"
+            address_field = "to"
+            child_contract = "token"
+            child_abi = "{abi}"
+            "#,
+            rpc.1,
+            abi = abi.display(),
+        ))
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events (event_id TEXT PRIMARY KEY, contract_alias TEXT, event_name TEXT, block_number INTEGER, block_hash TEXT, data TEXT);",
+        )
+        .unwrap();
+        let backend = Backend::Sqlite(conn);
+
+        let first = diff_with(Path::new("."), &config, &backend, 90, 110)
+            .await
+            .unwrap();
+        assert_eq!(first["chain_events"], 2);
+        let missing = first["missing"].as_array().unwrap();
+        let owners = missing
+            .iter()
+            .map(|event| event["expected"]["contract_alias"].as_str().unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(owners, HashSet::from(["factory", "token"]));
+
+        let Backend::Sqlite(conn) = &backend else {
+            unreachable!()
+        };
+        for event in missing {
+            let expected = &event["expected"];
+            conn.execute(
+                "INSERT INTO events VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    event["event_id"].as_str(),
+                    expected["contract_alias"].as_str(),
+                    expected["event_name"].as_str(),
+                    expected["block_number"].as_u64(),
+                    expected["block_hash"].as_str(),
+                    expected["data"].as_str(),
+                ],
+            )
+            .unwrap();
+        }
+        let second = diff_with(Path::new("."), &config, &backend, 90, 110)
+            .await
+            .unwrap();
+        assert_eq!(second["ok"], true, "{second}");
+        assert_eq!(
+            stored_children(&backend, 1, &config.discovery_rules[0], 110)
+                .await
+                .unwrap(),
+            vec!["0x2222222222222222222222222222222222222222".to_owned()]
+        );
+        assert!(
+            stored_children(&backend, 1, &config.discovery_rules[0], 99)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn too_wide_errors_split_but_rate_limits_do_not() {
+        let error = |text: &str| anyhow::anyhow!(text.to_owned());
+        assert!(is_too_wide(&error(
+            "eth_getLogs failed: {\"message\":\"exceed maximum block range: 3\"}"
+        )));
+        assert!(is_too_wide(&error(
+            "query returned more than 10000 results"
+        )));
+        assert!(!is_too_wide(&error("429 Too Many Requests")));
+        assert!(!is_too_wide(&error("execution reverted")));
     }
 
     #[test]

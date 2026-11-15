@@ -10,6 +10,8 @@ TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 BLOCK_HASH = "0x" + "ab" * 32
 TX1 = "0x" + "01" * 32
 TX2 = "0x" + "02" * 32
+# Optional second argument: the widest eth_getLogs block range to accept, like many providers.
+MAX_RANGE = int(sys.argv[2]) if len(sys.argv) > 2 else None
 
 def word_address(address):
     return "0x" + "0" * 24 + address[2:]
@@ -60,6 +62,10 @@ class Handler(BaseHTTPRequestHandler):
             query = request["params"][0]
             start = int(query["fromBlock"], 16)
             end = int(query["toBlock"], 16)
+            if MAX_RANGE is not None and end - start + 1 > MAX_RANGE:
+                body = json.dumps({"jsonrpc": "2.0", "id": request.get("id"), "error": {"code": -32600, "message": f"exceed maximum block range: {MAX_RANGE}"}}).encode()
+                self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(body))); self.end_headers(); self.wfile.write(body)
+                return
             addresses = query.get("address")
             if isinstance(addresses, str):
                 addresses = [addresses]

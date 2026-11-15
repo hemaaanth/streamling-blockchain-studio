@@ -23,7 +23,9 @@ use std::{
     },
 };
 const MAX_ADDRESSES_PER_LOG_FILTER: usize = 500;
-const MAX_CONCURRENT_LOG_REQUESTS: usize = 4;
+const DEFAULT_LOG_CONCURRENCY: u64 = 4;
+/// Without `max_window`, the log window may grow to this many times the configured window.
+const DEFAULT_WINDOW_GROWTH: u64 = 10;
 const DEFAULT_BLOCK_CONCURRENCY: u64 = 8;
 const DEFAULT_BATCH_SIZE: u64 = 1;
 
@@ -107,7 +109,12 @@ pub struct EvmEventSource {
     rpc: RpcPool,
     chain_id: u64,
     confirmations: u64,
+    /// Blocks per `eth_getLogs` request. It grows after full spans and halves on failure.
     window: AtomicU64,
+    /// The largest window to try. A provider's fixed block-range limit lowers it.
+    max_window: AtomicU64,
+    /// Windows fetched at the same time; one batch spans up to this many windows.
+    log_concurrency: usize,
     cursor: Cursor,
     progress_path: Option<PathBuf>,
     end_block: Option<u64>,
@@ -146,6 +153,25 @@ impl EvmEventSource {
                 "window must be greater than zero".into(),
             ));
         }
+        let max_window = parse_option(
+            &options,
+            "max_window",
+            window.saturating_mul(DEFAULT_WINDOW_GROWTH),
+        )?;
+        if max_window < window {
+            return Err(PluginInitializationError::Configuration(
+                "max_window must be at least window".into(),
+            ));
+        }
+        let log_concurrency =
+            match parse_option(&options, "log_concurrency", DEFAULT_LOG_CONCURRENCY)? {
+                0 => {
+                    return Err(PluginInitializationError::Configuration(
+                        "log_concurrency must be greater than zero".into(),
+                    ));
+                }
+                value => value as usize,
+            };
         let spec: SourceSpec = serde_json::from_str(&required("spec")?).map_err(config_error)?;
         let mut events: HashMap<H256, Vec<EventDescriptor>> = HashMap::new();
         let mut direct_addresses = HashMap::new();
@@ -203,6 +229,8 @@ impl EvmEventSource {
             chain_id,
             confirmations,
             window: AtomicU64::new(window),
+            max_window: AtomicU64::new(max_window),
+            log_concurrency,
             end_block,
             cursor: Cursor::new(start_block),
             progress_path: options.get("progress_path").map(PathBuf::from),
@@ -221,6 +249,115 @@ impl EvmEventSource {
 
     async fn rpc(&self, method: &str, params: Value) -> Result<Value, PluginError> {
         self.rpc.request(&self.rt, method, params).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn windows(&self) -> (u64, u64) {
+        (
+            self.window.load(Ordering::Relaxed),
+            self.max_window.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Logs of the configured contracts and of their discovered children in `ranges`, with
+    /// the child registry extended by discoveries in these logs.
+    async fn fetch_logs(
+        &self,
+        ranges: &[(u64, u64)],
+    ) -> Result<(Vec<Value>, HashMap<String, String>), PluginError> {
+        let direct_addresses = self.direct_addresses.keys().cloned().collect::<Vec<_>>();
+        // Owned filters keep the request futures `Send` for `async_trait`.
+        let filters = ranges
+            .iter()
+            .map(|&(from, to)| {
+                json!({
+                    "fromBlock": format!("0x{from:x}"),
+                    "toBlock": format!("0x{to:x}"),
+                    "address": direct_addresses,
+                    "topics": [self.direct_topics]
+                })
+            })
+            .collect::<Vec<_>>();
+        let direct = stream::iter(
+            filters
+                .into_iter()
+                .map(|filter| async move { self.rpc("eth_getLogs", json!([filter])).await }),
+        )
+        .buffered(self.log_concurrency)
+        .try_collect::<Vec<_>>()
+        .await?;
+        let mut logs = direct
+            .into_iter()
+            .flat_map(|value| value.as_array().cloned().unwrap_or_default())
+            .collect::<Vec<_>>();
+
+        let mut child_contracts = self
+            .discovered_rows
+            .lock()
+            .map_err(|_| PluginError::Internal("discovery registry mutex poisoned".into()))?
+            .iter()
+            .filter_map(|saved| {
+                Some((
+                    saved.row.discovered_address.clone()?,
+                    saved.row.discovery_rule.clone()?,
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        for log in &logs {
+            if let Some(row) = decode_row(
+                self.chain_id,
+                log,
+                &self.events,
+                &self.direct_addresses,
+                &self.discovery_rules,
+                &child_contracts,
+            )? && let (Some(address), Some(rule)) = (row.discovered_address, row.discovery_rule)
+            {
+                child_contracts.insert(address, rule);
+            }
+        }
+        let mut child_addresses = child_contracts.keys().cloned().collect::<Vec<_>>();
+        child_addresses.sort_unstable();
+
+        if !child_addresses.is_empty() && !self.child_topics.is_empty() {
+            let mut filters = Vec::new();
+            for &(from, to) in ranges {
+                for addresses in child_addresses.chunks(MAX_ADDRESSES_PER_LOG_FILTER) {
+                    filters.push(json!({
+                        "fromBlock": format!("0x{from:x}"),
+                        "toBlock": format!("0x{to:x}"),
+                        "address": addresses,
+                        "topics": [self.child_topics]
+                    }));
+                }
+            }
+            let child = stream::iter(
+                filters
+                    .into_iter()
+                    .map(|filter| async move { self.rpc("eth_getLogs", json!([filter])).await }),
+            )
+            .buffered(self.log_concurrency)
+            .try_collect::<Vec<_>>()
+            .await?;
+            logs.extend(
+                child
+                    .into_iter()
+                    .flat_map(|value| value.as_array().cloned().unwrap_or_default()),
+            );
+        }
+
+        let mut seen = HashSet::new();
+        logs.retain(|log| {
+            seen.insert(
+                json!([
+                    log.get("blockHash"),
+                    log.get("logIndex"),
+                    log.get("address")
+                ])
+                .to_string(),
+            )
+        });
+        Ok((logs, child_contracts))
     }
 
     async fn block_timestamp(&self, block: u64) -> Result<u64, PluginError> {
@@ -684,100 +821,33 @@ impl SourcePlugin for EvmEventSource {
         }
         let mut current_window = self.window.load(Ordering::Relaxed).max(1);
         let (to, logs, child_contracts) = loop {
-            let to = safe_head.min(from.saturating_add(current_window - 1));
-            let direct_filter = json!({
-                "fromBlock": format!("0x{from:x}"),
-                "toBlock": format!("0x{to:x}"),
-                "address": self.direct_addresses.keys().cloned().collect::<Vec<_>>(),
-                "topics": [self.direct_topics]
-            });
-            let mut logs = match self.rpc("eth_getLogs", json!([direct_filter])).await {
-                Ok(value) => value.as_array().cloned().unwrap_or_default(),
+            let ranges = log_ranges(from, safe_head, current_window, self.log_concurrency);
+            match self.fetch_logs(&ranges).await {
+                Ok((logs, child_contracts)) => {
+                    let to = ranges.last().map_or(from, |range| range.1);
+                    // Grow only after a span the safe head did not cut short.
+                    let full = ranges.len() == self.log_concurrency
+                        && ranges
+                            .iter()
+                            .all(|(start, end)| end - start + 1 == current_window);
+                    let next = if full {
+                        grown_window(current_window, self.max_window.load(Ordering::Relaxed))
+                    } else {
+                        current_window
+                    };
+                    self.window.store(next, Ordering::Relaxed);
+                    break (to, logs, child_contracts);
+                }
                 Err(error) if current_window > 1 && is_get_logs_range_error(&error) => {
+                    if is_fixed_range_limit(&error) {
+                        self.max_window
+                            .fetch_min(current_window - 1, Ordering::Relaxed);
+                    }
                     current_window = (current_window / 2).max(1);
                     self.window.store(current_window, Ordering::Relaxed);
-                    continue;
                 }
                 Err(error) => return Err(error),
-            };
-
-            let mut child_contracts = self
-                .discovered_rows
-                .lock()
-                .map_err(|_| PluginError::Internal("discovery registry mutex poisoned".into()))?
-                .iter()
-                .filter_map(|saved| {
-                    Some((
-                        saved.row.discovered_address.clone()?,
-                        saved.row.discovery_rule.clone()?,
-                    ))
-                })
-                .collect::<HashMap<_, _>>();
-            for log in &logs {
-                if let Some(row) = decode_row(
-                    self.chain_id,
-                    log,
-                    &self.events,
-                    &self.direct_addresses,
-                    &self.discovery_rules,
-                    &child_contracts,
-                )? && let (Some(address), Some(rule)) =
-                    (row.discovered_address, row.discovery_rule)
-                {
-                    child_contracts.insert(address, rule);
-                }
             }
-            let mut child_addresses = child_contracts.keys().cloned().collect::<Vec<_>>();
-            child_addresses.sort_unstable();
-
-            if !child_addresses.is_empty() && !self.child_topics.is_empty() {
-                let address_batches = child_addresses
-                    .chunks(MAX_ADDRESSES_PER_LOG_FILTER)
-                    .map(<[String]>::to_vec)
-                    .collect::<Vec<_>>();
-                let requests = stream::iter(address_batches.into_iter().map(|addresses| {
-                    let child_filter = json!({
-                        "fromBlock": format!("0x{from:x}"),
-                        "toBlock": format!("0x{to:x}"),
-                        "address": addresses,
-                        "topics": [self.child_topics]
-                    });
-                    async move { self.rpc("eth_getLogs", json!([child_filter])).await }
-                }))
-                .buffer_unordered(MAX_CONCURRENT_LOG_REQUESTS)
-                .collect::<Vec<_>>()
-                .await;
-                let mut retry_with_smaller_window = false;
-                for result in requests {
-                    match result {
-                        Ok(value) => logs.extend(value.as_array().cloned().unwrap_or_default()),
-                        Err(error) if current_window > 1 && is_get_logs_range_error(&error) => {
-                            current_window = (current_window / 2).max(1);
-                            self.window.store(current_window, Ordering::Relaxed);
-                            retry_with_smaller_window = true;
-                            break;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                if retry_with_smaller_window {
-                    continue;
-                }
-            }
-
-            let mut seen = HashSet::new();
-            logs.retain(|log| {
-                seen.insert(
-                    json!([
-                        log.get("blockHash"),
-                        log.get("logIndex"),
-                        log.get("address")
-                    ])
-                    .to_string(),
-                )
-            });
-            self.window.store(current_window, Ordering::Relaxed);
-            break (to, logs, child_contracts);
         };
         let mut timestamps = log_block_timestamps(&logs);
         let mut rows = Vec::new();
@@ -823,12 +893,12 @@ impl SourcePlugin for EvmEventSource {
                 .discovered_rows
                 .lock()
                 .map_err(|_| PluginError::Internal("discovery registry mutex poisoned".into()))?;
+            let mut known = registry
+                .iter()
+                .map(|saved| saved.row.event_id.clone())
+                .collect::<HashSet<_>>();
             for (row, timestamp) in &decoded {
-                if row.discovered_address.is_some()
-                    && !registry
-                        .iter()
-                        .any(|saved| saved.row.event_id == row.event_id)
-                {
+                if row.discovered_address.is_some() && known.insert(row.event_id.clone()) {
                     registry.push(PersistedRow {
                         row: row.clone(),
                         timestamp: *timestamp,
@@ -1638,7 +1708,43 @@ fn is_get_logs_range_error(error: &PluginError) -> bool {
         && (text.contains("exceeded max allowed range")
             || text.contains("block range")
             || text.contains("range too large")
-            || text.contains("log query timed out"))
+            || text.contains("log query timed out")
+            || is_log_count_limit(&text))
+}
+/// Too many logs for one response. The limit moves with log density, unlike a block range.
+fn is_log_count_limit(text: &str) -> bool {
+    text.contains("response size exceeded")
+        || text.contains("returned more than")
+        || text.contains("too many results")
+}
+/// A provider's fixed block-range limit: a wider window never succeeds, so stop growing to it.
+fn is_fixed_range_limit(error: &PluginError) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    !is_log_count_limit(&text)
+        && (text.contains("exceeded max allowed range")
+            || text.contains("block range")
+            || text.contains("range too large"))
+}
+/// Up to `count` consecutive ranges of `window` blocks from `from`, none past `safe_head`.
+fn log_ranges(from: u64, safe_head: u64, window: u64, count: usize) -> Vec<(u64, u64)> {
+    let mut ranges = Vec::with_capacity(count);
+    let mut start = from;
+    while ranges.len() < count && start <= safe_head {
+        let end = safe_head.min(start.saturating_add(window - 1));
+        ranges.push((start, end));
+        if end == u64::MAX {
+            break;
+        }
+        start = end + 1;
+    }
+    ranges
+}
+/// The window after a full span succeeds: a quarter larger, at most `max_window`.
+fn grown_window(window: u64, max_window: u64) -> u64 {
+    window
+        .saturating_add((window / 4).max(1))
+        .min(max_window)
+        .max(window.min(max_window))
 }
 /// Block timestamps carried on the logs themselves. Many providers add the
 /// non-standard `blockTimestamp` field to `eth_getLogs` results.
@@ -1850,6 +1956,42 @@ mod tests {
         );
 
         assert!(is_get_logs_range_error(&error));
+        assert!(!is_fixed_range_limit(&error));
+    }
+
+    #[test]
+    fn log_count_limits_shrink_the_window_but_do_not_cap_it() {
+        let count = PluginError::Execution(
+            "eth_getLogs: Log response size exceeded. You can make eth_getLogs requests with up to a 2K block range".into(),
+        );
+        let range = PluginError::Execution(
+            "eth_getLogs: {\"code\":-32600,\"message\":\"exceed maximum block range: 50000\"}"
+                .into(),
+        );
+
+        assert!(is_get_logs_range_error(&count));
+        assert!(!is_fixed_range_limit(&count));
+        assert!(is_get_logs_range_error(&range));
+        assert!(is_fixed_range_limit(&range));
+    }
+
+    #[test]
+    fn log_ranges_split_the_span_and_stop_at_the_safe_head() {
+        assert_eq!(
+            log_ranges(100, 1_000, 100, 4),
+            [(100, 199), (200, 299), (300, 399), (400, 499)]
+        );
+        assert_eq!(log_ranges(100, 250, 100, 4), [(100, 199), (200, 250)]);
+        assert_eq!(log_ranges(u64::MAX, u64::MAX, 5, 4), [(u64::MAX, u64::MAX)]);
+    }
+
+    #[test]
+    fn window_grows_by_a_quarter_up_to_the_cap() {
+        assert_eq!(grown_window(2_000, 20_000), 2_500);
+        assert_eq!(grown_window(19_000, 20_000), 20_000);
+        assert_eq!(grown_window(1, 20_000), 2);
+        // A cap lowered below the window by a range error pulls it down.
+        assert_eq!(grown_window(4_000, 2_999), 2_999);
     }
 
     #[test]

@@ -24,11 +24,13 @@ impl Drop for Server {
     }
 }
 
-fn start_mock_rpc(repo: &Path) -> (Server, String) {
+/// `args` follow the port, for example the widest block range the mock accepts.
+fn start_mock_rpc(repo: &Path, args: &[&str]) -> (Server, String) {
     let mut server = Server(
         Command::new("python3")
             .arg(repo.join("tests/mock_rpc.py"))
             .arg("0")
+            .args(args)
             .stdout(Stdio::piped())
             .spawn()
             .expect("python3 runs tests/mock_rpc.py"),
@@ -51,14 +53,9 @@ fn state() -> PluginStateBackendFactory {
     ))
 }
 
-#[test]
-fn mock_rpc_events_reach_sqlite() {
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let (_server, rpc_url) = start_mock_rpc(&repo);
-    let db = std::env::temp_dir().join(format!("smoke-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&db);
+fn spec(repo: &Path) -> serde_json::Value {
     let abi = repo.join("tests/transfer_abi.json");
-    let spec = json!({
+    json!({
         "contracts": [{"alias": "factory", "address": PARENT, "abi_path": abi}],
         "discovery_rules": [{
             "parent_contract": "factory",
@@ -67,13 +64,63 @@ fn mock_rpc_events_reach_sqlite() {
             "child_contract": "token",
             "child_abi_path": abi,
         }],
+    })
+}
+
+fn options(pairs: &[(&str, String)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), value.clone()))
+        .collect()
+}
+
+#[test]
+fn range_limited_rpc_shrinks_then_grows_the_window() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let (_server, rpc_url) = start_mock_rpc(&repo, &["3"]);
+    let (metrics, _receiver) = crossbeam_channel::unbounded();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let source = EvmEventSource::new(
+            DirectTokioProxy::new().into_async_runtime_obj(),
+            state(),
+            PluginMetricsRecorder::new(metrics),
+            options(&[
+                ("rpc_url", rpc_url),
+                ("chain_id", "1".into()),
+                ("start_block", "90".into()),
+                ("end_block", "110".into()),
+                ("confirmations", "0".into()),
+                ("window", "8".into()),
+                ("log_concurrency", "2".into()),
+                ("spec", spec(&repo).to_string()),
+            ]),
+        )
+        .unwrap();
+        source.initialize().await.unwrap();
+        // Windows of 8 and 4 blocks fail, which caps the window at 3; 2 succeeds and grows to 3.
+        // The batches cover 90-93, 94-99, 100-105, and 106-110.
+        let mut rows = 0;
+        for _ in 0..4 {
+            rows += source.generate_batch().await.unwrap().num_rows();
+        }
+        assert_eq!(source.windows(), (3, 3));
+        assert_eq!(
+            rows, 2,
+            "the parent and child events at block 100 are both found"
+        );
     });
-    let options = |pairs: &[(&str, String)]| {
-        pairs
-            .iter()
-            .map(|(key, value)| ((*key).to_owned(), value.clone()))
-            .collect::<HashMap<_, _>>()
-    };
+}
+
+#[test]
+fn mock_rpc_events_reach_sqlite() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let (_server, rpc_url) = start_mock_rpc(&repo, &[]);
+    let db = std::env::temp_dir().join(format!("smoke-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&db);
     let (metrics, _receiver) = crossbeam_channel::unbounded();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -91,7 +138,7 @@ fn mock_rpc_events_reach_sqlite() {
                 ("start_block", "100".into()),
                 ("end_block", "100".into()),
                 ("confirmations", "0".into()),
-                ("spec", spec.to_string()),
+                ("spec", spec(&repo).to_string()),
             ]),
         )
         .unwrap();

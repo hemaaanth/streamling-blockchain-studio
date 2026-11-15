@@ -198,6 +198,8 @@ npm --prefix demos/robinhood-stock-tokens run build
 
 MCP is available over stdio with the tools `streamling_blockchain_schema`, `streamling_blockchain_query`, and `streamling_blockchain_status`. `replay` refetches a closed block range and reports missing, extra, or changed local events without mutating the database. `audit` continuously replays the latest closed window and one older sampled window, then stores summaries in `quality_replay_checks`. `rpc-doctor --apply` writes a lower working `window` when the configured `eth_getLogs` range is too wide for the RPC provider.
 
+Backfill tunes its own log window. Each batch fetches `log_concurrency` windows at once (default 4). After a full batch the window grows by a quarter, up to `max_window` (default ten times `window`). A refused or timed-out range halves the window; a provider's fixed block-range limit also lowers `max_window`, so the window stops growing back into it. `replay` and `audit` use every endpoint in `rpc_url`, halve ranges the provider refuses, and check discovered child contracts with the same address filters as backfill. A failed `audit` run prints `{"ok":false,...}` and the loop continues.
+
 ## Publish a dashboard
 
 `publish` builds a SQLite-backed demo's Evidence site from a project's database, writes `build/release.json`, checks the build, and ships it:

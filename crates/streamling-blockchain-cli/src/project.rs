@@ -173,12 +173,16 @@ fn write_pipeline(root: &Path, config: &ProjectConfig) -> Result<()> {
         "start_block": config.start_block.to_string(),
         "confirmations": config.confirmations.to_string(),
         "window": config.window.to_string(),
+        "log_concurrency": config.log_concurrency.to_string(),
         "chain_id": config.chain_id.to_string(),
         "progress_path": root.join(crate::status::PROGRESS_FILE).to_string_lossy(),
         "spec": plugin_options
     });
     if let Some(end_block) = config.end_block {
         source_options["end_block"] = end_block.to_string().into();
+    }
+    if let Some(max_window) = config.max_window {
+        source_options["max_window"] = max_window.to_string().into();
     }
     if let Some(name) = &config.rpc_url_env {
         source_options["rpc_url_env"] = name.clone().into();
@@ -742,6 +746,8 @@ mod tests {
             confirmations: 12,
             end_block: Some(25),
             window: 2_000,
+            max_window: None,
+            log_concurrency: crate::config::default_log_concurrency(),
             block_concurrency: 8,
             block_batch_size: 1,
             index_blocks: true,
@@ -942,6 +948,8 @@ mod tests {
             confirmations: 12,
             end_block: None,
             window: 2_000,
+            max_window: None,
+            log_concurrency: crate::config::default_log_concurrency(),
             block_concurrency: 8,
             block_batch_size: 1,
             index_blocks: false,

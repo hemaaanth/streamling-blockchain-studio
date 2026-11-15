@@ -166,6 +166,8 @@ mod tests {
             end_block: None,
             confirmations: 10,
             window: 100,
+            max_window: None,
+            log_concurrency: crate::config::default_log_concurrency(),
             block_concurrency: 8,
             block_batch_size: 1,
             index_blocks: false,
