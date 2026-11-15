@@ -201,6 +201,12 @@ impl ProjectConfig {
                 );
             }
             validate_alias(&rule.child_contract)?;
+            if aliases.contains(&rule.child_contract) {
+                bail!(
+                    "discovery child contract '{}' reuses a contract alias",
+                    rule.child_contract
+                );
+            }
         }
         Ok(())
     }

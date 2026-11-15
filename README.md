@@ -253,7 +253,7 @@ Each initialized project contains:
 
 - `streamling-blockchain.toml`: source configuration; may contain an RPC credential
 - `pipeline.yaml`: generated Streamling pipeline; may also contain the RPC credential
-- `semantic.toml`: generated ABI catalog for agent-safe query construction, including event signatures, topic0 values, Solidity field types, and indexed flags
+- `semantic.toml`: generated ABI catalog for agent-safe query construction, including event signatures, topic0 values, Solidity field types, and indexed flags. Edit the `description` values freely: `semantics generate`, `add-contract`, and `add-discovery` keep them. `semantics check` lists what regeneration would change and writes nothing
 - `backfill-progress.json`: observed, safe, and indexed block heights
 - `abis/`: copied contract ABIs
 - `.streamling-blockchain/events.db`: decoded events, optional `evm_blocks`, optional `evm_transactions`, and quality views/tables such as `quality_reorgs`, `quality_event_counts_by_block`, and `quality_replay_checks` when the SQLite sink is enabled

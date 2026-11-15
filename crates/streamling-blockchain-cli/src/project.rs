@@ -349,8 +349,56 @@ pub fn clickhouse_statements(
     statements
 }
 pub fn write_semantics(root: &Path, config: &ProjectConfig) -> Result<()> {
-    let mut out =
-        String::from("# Generated from the live ABI registry. Edit descriptions freely.\n");
+    let existing = read_semantics(root)?.unwrap_or_default();
+    std::fs::write(
+        root.join("semantic.toml"),
+        render_semantics(root, config, &existing)?,
+    )?;
+    Ok(())
+}
+
+/// Lists what `semantics generate` would change in semantic.toml; empty means it is current.
+pub fn check_semantics(root: &Path, config: &ProjectConfig) -> Result<Vec<String>> {
+    let Some(existing) = read_semantics(root)? else {
+        return Ok(vec!["semantic.toml is missing".into()]);
+    };
+    let expected: toml::Table = toml::from_str(&render_semantics(root, config, &existing)?)?;
+    let tables = |table: &toml::Table| table.get("tables").and_then(toml::Value::as_table).cloned();
+    let (expected, existing) = (
+        tables(&expected).unwrap_or_default(),
+        tables(&existing).unwrap_or_default(),
+    );
+    let mut problems = Vec::new();
+    for (name, value) in &expected {
+        match existing.get(name) {
+            None => problems.push(format!("missing table {name}")),
+            Some(current) if current != value => {
+                problems.push(format!("table {name} does not match its ABI"))
+            }
+            Some(_) => {}
+        }
+    }
+    for name in existing.keys().filter(|name| !expected.contains_key(*name)) {
+        problems.push(format!("table {name} has no configured ABI event"));
+    }
+    Ok(problems)
+}
+
+fn read_semantics(root: &Path) -> Result<Option<toml::Table>> {
+    let path = root.join("semantic.toml");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(
+            toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?,
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn render_semantics(root: &Path, config: &ProjectConfig, existing: &toml::Table) -> Result<String> {
+    let mut out = String::from(
+        "# Generated from the live ABI registry. Edit descriptions freely; regeneration keeps them.\n",
+    );
     if let Some(clickhouse) = &config.sinks.clickhouse {
         out.push_str(&format!(
             "# Tables below are SQLite sink tables. In ClickHouse, filter `{}` by contract_alias and event_name and read fields with JSONExtractString(fields_json, '<source_name>').\n",
@@ -359,19 +407,50 @@ pub fn write_semantics(root: &Path, config: &ProjectConfig) -> Result<()> {
     }
     out.push('\n');
     for contract in &config.contracts {
-        let abi_path = root.join(&contract.abi);
-        let abi: Value = serde_json::from_slice(&std::fs::read(&abi_path)?)?;
-        append_abi_semantics(&mut out, &contract.alias, &abi)?;
+        append_abi_semantics(
+            &mut out,
+            &contract.alias,
+            &read_abi(&root.join(&contract.abi))?,
+            existing,
+        )?;
     }
     for rule in &config.discovery_rules {
-        let abi: Value = serde_json::from_slice(&std::fs::read(root.join(&rule.child_abi))?)?;
-        append_abi_semantics(&mut out, &rule.child_contract, &abi)?;
+        append_abi_semantics(
+            &mut out,
+            &rule.child_contract,
+            &read_abi(&root.join(&rule.child_abi))?,
+            existing,
+        )?;
     }
-    std::fs::write(root.join("semantic.toml"), out)?;
-    Ok(())
+    Ok(out)
 }
 
-fn append_abi_semantics(out: &mut String, alias: &str, abi: &Value) -> Result<()> {
+fn read_abi(path: &Path) -> Result<Value> {
+    serde_json::from_slice(
+        &std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
+    )
+    .with_context(|| format!("parse ABI {}", path.display()))
+}
+
+/// The user's description for a table, or for one of its columns, from the current semantic.toml.
+fn kept_description<'a>(
+    existing: &'a toml::Table,
+    table: &str,
+    column: Option<&str>,
+) -> Option<&'a str> {
+    let mut entry = existing.get("tables")?.get(table)?;
+    if let Some(column) = column {
+        entry = entry.get("columns")?.get(column)?;
+    }
+    entry.get("description")?.as_str()
+}
+
+fn append_abi_semantics(
+    out: &mut String,
+    alias: &str,
+    abi: &Value,
+    existing: &toml::Table,
+) -> Result<()> {
     let items = abi.as_array().context("ABI must be a JSON array")?;
     for item in items
         .iter()
@@ -407,8 +486,11 @@ fn append_abi_semantics(out: &mut String, alias: &str, abi: &Value) -> Result<()
         let signature = format!("{name}({})", types.join(","));
         let topic0 = format!("0x{}", hex::encode(Keccak256::digest(signature.as_bytes())));
         out.push_str(&format!(
-            "[tables.{table:?}]\ndescription = {:?}\ncontract = {:?}\nevent = {:?}\nsignature = {:?}\ntopic0 = {:?}\n",
-            format!("{name} events emitted by {alias}"),
+            "[tables.{table:?}]\ndescription = {}\ncontract = {:?}\nevent = {:?}\nsignature = {:?}\ntopic0 = {:?}\n",
+            toml_string(
+                kept_description(existing, &table, None)
+                    .map_or_else(|| format!("{name} events emitted by {alias}"), str::to_owned)
+            ),
             alias,
             name,
             signature,
@@ -435,8 +517,11 @@ fn append_abi_semantics(out: &mut String, alias: &str, abi: &Value) -> Result<()
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             out.push_str(&format!(
-                "[tables.{table:?}.columns.{field:?}]\ndescription = {:?}\nsolidity_type = {:?}\nindexed = {indexed}\nsource_name = {:?}\n",
-                format!("Solidity {kind} event parameter"),
+                "[tables.{table:?}.columns.{field:?}]\ndescription = {}\nsolidity_type = {:?}\nindexed = {indexed}\nsource_name = {:?}\n",
+                toml_string(
+                    kept_description(existing, &table, Some(&field))
+                        .map_or_else(|| format!("Solidity {kind} event parameter"), str::to_owned)
+                ),
                 kind,
                 raw_field
             ));
@@ -445,6 +530,11 @@ fn append_abi_semantics(out: &mut String, alias: &str, abi: &Value) -> Result<()
     }
     Ok(())
 }
+/// Descriptions may hold user text, so quote them as TOML rather than with Rust's `{:?}`.
+fn toml_string(text: String) -> String {
+    toml::Value::String(text).to_string()
+}
+
 fn event_column(field: &str) -> String {
     const RESERVED: &[&str] = &[
         "event_id",
@@ -511,19 +601,40 @@ pub fn add_contract(
     root: &Path,
     mut config: ProjectConfig,
     contract: ContractConfig,
+    abi_source: &Path,
 ) -> Result<ProjectConfig> {
+    let target = root.join(&contract.abi);
     config.contracts.push(contract);
-    config.save(root)?;
-    write_generated_files(root, &config)?;
-    Ok(config)
+    install_abi(root, config, abi_source, &target)
 }
 
 pub fn add_discovery_rule(
     root: &Path,
     mut config: ProjectConfig,
     rule: DiscoveryRule,
+    abi_source: &Path,
 ) -> Result<ProjectConfig> {
+    let target = root.join(&rule.child_abi);
     config.discovery_rules.push(rule);
+    install_abi(root, config, abi_source, &target)
+}
+
+/// Validates the new config and ABI before copying, so a rejected add never replaces an existing ABI file.
+fn install_abi(
+    root: &Path,
+    config: ProjectConfig,
+    abi_source: &Path,
+    target: &Path,
+) -> Result<ProjectConfig> {
+    config.validate()?;
+    append_abi_semantics(
+        &mut String::new(),
+        "check",
+        &read_abi(abi_source)?,
+        &toml::Table::new(),
+    )?;
+    std::fs::create_dir_all(target.parent().context("ABI path has no parent")?)?;
+    std::fs::copy(abi_source, target).with_context(|| format!("copy {}", abi_source.display()))?;
     config.save(root)?;
     write_generated_files(root, &config)?;
     Ok(config)
@@ -734,6 +845,119 @@ mod tests {
         assert!(semantics.contains("topic0 = \"0xddf252ad"));
         assert!(semantics.contains("solidity_type = \"address\""));
         assert!(semantics.contains("indexed = true"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    const TRANSFER_ABI: &str = r#"[{"type":"event","name":"Transfer","inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]}]"#;
+    const APPROVAL_ABI: &str = r#"[{"type":"event","name":"Approval","inputs":[{"name":"owner","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]}]"#;
+
+    fn token_project(name: &str) -> (PathBuf, ProjectConfig) {
+        let root = std::env::temp_dir().join(format!(
+            "streamling-blockchain-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("abis")).unwrap();
+        std::fs::write(root.join("abis/token.json"), TRANSFER_ABI).unwrap();
+        let config = ProjectConfig {
+            chain: "base".into(),
+            chain_id: 8453,
+            rpc_url: "http://localhost:8545".into(),
+            rpc_url_env: None,
+            database: PathBuf::from(".streamling-blockchain/events.db"),
+            start_block: 1,
+            confirmations: 12,
+            end_block: None,
+            window: 2_000,
+            block_concurrency: 8,
+            block_batch_size: 1,
+            index_blocks: false,
+            index_transactions: false,
+            skip_calldata: false,
+            contracts: vec![ContractConfig {
+                alias: "token".into(),
+                address: "0x1111111111111111111111111111111111111111".into(),
+                abi: PathBuf::from("abis/token.json"),
+            }],
+            discovery_rules: vec![],
+            sinks: SinkConfig::default(),
+        };
+        config.save(&root).unwrap();
+        write_generated_files(&root, &config).unwrap();
+        (root, config)
+    }
+
+    #[test]
+    fn rejected_add_contract_keeps_the_existing_abi() {
+        let (root, config) = token_project("duplicate-alias");
+        let other = root.join("other.json");
+        std::fs::write(&other, APPROVAL_ABI).unwrap();
+
+        let duplicate = ContractConfig {
+            alias: "token".into(),
+            address: "0x2222222222222222222222222222222222222222".into(),
+            abi: PathBuf::from("abis/token.json"),
+        };
+        assert!(add_contract(&root, config.clone(), duplicate, &other).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("abis/token.json")).unwrap(),
+            TRANSFER_ABI
+        );
+
+        let child = DiscoveryRule {
+            parent_contract: "token".into(),
+            discovery_event: "Transfer".into(),
+            address_field: "to".into(),
+            child_contract: "token".into(),
+            child_abi: PathBuf::from("abis/token.json"),
+        };
+        assert!(add_discovery_rule(&root, config, child, &other).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("abis/token.json")).unwrap(),
+            TRANSFER_ABI
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn regeneration_keeps_descriptions_and_check_reports_drift_without_writing() {
+        let (root, config) = token_project("semantics");
+        let path = root.join("semantic.toml");
+        let edited = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace(
+                "description = \"Transfer events emitted by token\"",
+                "description = \"Token moves \\\"with quotes\\\"\"",
+            )
+            .replace(
+                "description = \"Solidity uint256 event parameter\"",
+                "description = \"Amount in base units\"",
+            );
+        std::fs::write(&path, &edited).unwrap();
+        assert!(check_semantics(&root, &config).unwrap().is_empty());
+
+        write_semantics(&root, &config).unwrap();
+        let regenerated = std::fs::read_to_string(&path).unwrap();
+        assert!(regenerated.contains("Token moves"));
+        assert!(regenerated.contains("description = \"Amount in base units\""));
+        let parsed: toml::Table = toml::from_str(&regenerated).unwrap();
+        assert_eq!(
+            parsed["tables"]["token__transfer"]["description"].as_str(),
+            Some("Token moves \"with quotes\"")
+        );
+
+        std::fs::write(root.join("abis/token.json"), APPROVAL_ABI).unwrap();
+        let problems = check_semantics(&root, &config).unwrap();
+        assert!(problems.contains(&"missing table token__approval".to_owned()));
+        assert!(problems.contains(&"table token__transfer has no configured ABI event".to_owned()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), regenerated);
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            check_semantics(&root, &config).unwrap(),
+            vec!["semantic.toml is missing".to_owned()]
+        );
+        assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

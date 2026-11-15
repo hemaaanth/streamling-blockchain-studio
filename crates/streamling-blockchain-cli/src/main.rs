@@ -537,8 +537,6 @@ async fn dispatch(cli: Cli, out: &mut Output) -> Result<Value> {
             validate_alias(&alias)?;
             let config = ProjectConfig::load(&root)?;
             let target = root.join("abis").join(format!("{alias}.json"));
-            std::fs::create_dir_all(target.parent().unwrap())?;
-            std::fs::copy(&abi, &target).with_context(|| format!("copy {}", abi.display()))?;
             project::add_contract(
                 &root,
                 config,
@@ -547,6 +545,7 @@ async fn dispatch(cli: Cli, out: &mut Output) -> Result<Value> {
                     address: address.clone(),
                     abi: PathBuf::from(format!("abis/{alias}.json")),
                 },
+                &abi,
             )?;
             out.line(format!("✓ contract added · alias {alias}"));
             Ok(json!({"alias": alias, "address": address, "abi": target}))
@@ -561,9 +560,6 @@ async fn dispatch(cli: Cli, out: &mut Output) -> Result<Value> {
             validate_alias(&child_contract)?;
             let config = ProjectConfig::load(&root)?;
             let target = root.join("abis").join(format!("{child_contract}.json"));
-            std::fs::create_dir_all(target.parent().unwrap())?;
-            std::fs::copy(&child_abi, &target)
-                .with_context(|| format!("copy {}", child_abi.display()))?;
             project::add_discovery_rule(
                 &root,
                 config,
@@ -574,6 +570,7 @@ async fn dispatch(cli: Cli, out: &mut Output) -> Result<Value> {
                     child_contract: child_contract.clone(),
                     child_abi: PathBuf::from(format!("abis/{child_contract}.json")),
                 },
+                &child_abi,
             )?;
             let table = format!("{child_contract}_contracts");
             out.line(format!("✓ discovery rule added · dynamic table {table}"));
@@ -724,11 +721,25 @@ async fn dispatch(cli: Cli, out: &mut Output) -> Result<Value> {
         }
         Commands::Semantics { command } => {
             let config = ProjectConfig::load(&root)?;
-            project::write_semantics(&root, &config)?;
-            out.line(match command {
-                SemanticsCommand::Generate => "✓ semantic.toml generated",
-                SemanticsCommand::Check => "✓ semantic.toml is valid for configured ABIs",
-            });
+            match command {
+                SemanticsCommand::Generate => {
+                    project::write_semantics(&root, &config)?;
+                    out.line("✓ semantic.toml generated");
+                }
+                SemanticsCommand::Check => {
+                    let problems = project::check_semantics(&root, &config)?;
+                    if !problems.is_empty() {
+                        bail!(
+                            CodedError::new(
+                                ErrorCode::Validation,
+                                format!("semantic.toml is out of date: {}", problems.join("; "))
+                            )
+                            .next("streamling-blockchain semantics generate")
+                        );
+                    }
+                    out.line("✓ semantic.toml is valid for configured ABIs");
+                }
+            }
             Ok(json!({"path": root.join("semantic.toml"), "valid": true}))
         }
         Commands::Abi { command } => match command {
