@@ -185,10 +185,17 @@ async fn call(
             let text = value.as_str().context("eth_call result is not a string")?;
             Ok(hex::decode(text.trim_start_matches("0x")).ok())
         }
-        // A JSON-RPC error that is not a rate limit is a revert.
-        Err(error) if classify(&error).0 == ErrorCode::Internal => Ok(None),
+        Err(error) if is_revert(&error) => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// A contract without the method reverts, or runs into an invalid opcode. Any other
+/// error, such as a rate limit a provider reports in its own words, fails the sync.
+fn is_revert(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    classify(error).0 == ErrorCode::Internal
+        && (message.contains("revert") || message.contains("invalid opcode"))
 }
 
 async fn store(backend: &Backend, chain_id: u64, tokens: &[Token]) -> Result<()> {
@@ -300,6 +307,17 @@ mod tests {
     }
 
     #[test]
+    fn only_reverts_become_null() {
+        let revert =
+            anyhow::anyhow!(r#"eth_call failed: {{"code":3,"message":"execution reverted"}}"#);
+        assert!(is_revert(&revert));
+        let limited = anyhow::anyhow!(
+            r#"eth_call failed: {{"code":-32005,"message":"rate limit exceeded"}}"#
+        );
+        assert!(!is_revert(&limited));
+    }
+
+    #[test]
     fn decodes_decimals_that_fit_a_byte() {
         let mut data = vec![0; 32];
         data[31] = 18;
@@ -345,6 +363,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((empty.symbol, empty.decimals), (None, None));
+        // The Uniswap V2 factory has no `symbol()`, so the call reverts.
+        let factory = fetch(
+            &client,
+            urls,
+            "0x5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!((factory.symbol, factory.decimals), (None, None));
     }
 
     #[tokio::test]
