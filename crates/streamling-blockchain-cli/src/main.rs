@@ -1257,6 +1257,8 @@ async fn run_streamling(
         )
     }
     let config = ProjectConfig::load(root)?;
+    // The TOML is the source of truth, so edits like a moved start_block reach the runtime.
+    project::write_pipeline(root, &config)?;
     if !validate && config.sinks.clickhouse.is_some() {
         prepare_clickhouse(&config, out).await?;
     }
@@ -1479,6 +1481,35 @@ mod tests {
         assert_eq!(bad_sql["error"]["code"], "validation");
         let write = run_json(&["--json", "--project", project, "sql", "DELETE FROM events"]).await;
         assert_eq!(write["error"]["code"], "validation");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dev_rewrites_the_pipeline_from_the_toml() {
+        let root = sqlite_project("dev-pipeline");
+        let project = root.to_str().unwrap();
+        let config = root.join("streamling-blockchain.toml");
+        let toml = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("{toml}start_block = 42\n")).unwrap();
+        let plugin = root.join("plugin.so");
+        std::fs::write(&plugin, "").unwrap();
+
+        let run = run_json(&[
+            "--json",
+            "--project",
+            project,
+            "dev",
+            "--streamling",
+            "true",
+            "--plugin",
+            plugin.to_str().unwrap(),
+            "--no-build",
+        ])
+        .await;
+        assert_eq!(run["ok"], true, "{run}");
+        let pipeline = std::fs::read_to_string(root.join("pipeline.yaml")).unwrap();
+        assert!(pipeline.contains(r#""start_block":42"#), "{pipeline}");
 
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -11,7 +11,7 @@ pub fn write_generated_files(root: &Path, config: &ProjectConfig) -> Result<()> 
     Ok(())
 }
 
-fn write_pipeline(root: &Path, config: &ProjectConfig) -> Result<()> {
+pub fn write_pipeline(root: &Path, config: &ProjectConfig) -> Result<()> {
     let db = config
         .absolute_database(root)
         .canonicalize()
