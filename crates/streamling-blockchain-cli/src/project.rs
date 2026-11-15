@@ -349,7 +349,8 @@ pub fn clickhouse_statements(
     statements
 }
 pub fn write_semantics(root: &Path, config: &ProjectConfig) -> Result<()> {
-    let existing = read_semantics(root)?.unwrap_or_default();
+    // A file that no longer parses has no descriptions worth keeping; regenerate it.
+    let existing = read_semantics(root).ok().flatten().unwrap_or_default();
     std::fs::write(
         root.join("semantic.toml"),
         render_semantics(root, config, &existing)?,
@@ -359,8 +360,10 @@ pub fn write_semantics(root: &Path, config: &ProjectConfig) -> Result<()> {
 
 /// Lists what `semantics generate` would change in semantic.toml; empty means it is current.
 pub fn check_semantics(root: &Path, config: &ProjectConfig) -> Result<Vec<String>> {
-    let Some(existing) = read_semantics(root)? else {
-        return Ok(vec!["semantic.toml is missing".into()]);
+    let existing = match read_semantics(root) {
+        Ok(Some(existing)) => existing,
+        Ok(None) => return Ok(vec!["semantic.toml is missing".into()]),
+        Err(error) => return Ok(vec![format!("{error:#}")]),
     };
     let expected: toml::Table = toml::from_str(&render_semantics(root, config, &existing)?)?;
     let tables = |table: &toml::Table| table.get("tables").and_then(toml::Value::as_table).cloned();
@@ -414,7 +417,13 @@ fn render_semantics(root: &Path, config: &ProjectConfig, existing: &toml::Table)
             existing,
         )?;
     }
-    for rule in &config.discovery_rules {
+    let mut children = HashSet::new();
+    // Several factories may share one child alias; its tables appear once.
+    for rule in config
+        .discovery_rules
+        .iter()
+        .filter(|rule| children.insert(&rule.child_contract))
+    {
         append_abi_semantics(
             &mut out,
             &rule.child_contract,
@@ -627,12 +636,11 @@ fn install_abi(
     target: &Path,
 ) -> Result<ProjectConfig> {
     config.validate()?;
-    append_abi_semantics(
-        &mut String::new(),
-        "check",
-        &read_abi(abi_source)?,
-        &toml::Table::new(),
-    )?;
+    let abi = read_abi(abi_source)?;
+    // The runtime and replay decode with ethers' parser, so reject what it rejects.
+    serde_json::from_value::<ethers_core::abi::Abi>(abi.clone())
+        .with_context(|| format!("parse ABI {}", abi_source.display()))?;
+    append_abi_semantics(&mut String::new(), "check", &abi, &toml::Table::new())?;
     std::fs::create_dir_all(target.parent().context("ABI path has no parent")?)?;
     std::fs::copy(abi_source, target).with_context(|| format!("copy {}", abi_source.display()))?;
     config.save(root)?;
@@ -958,6 +966,58 @@ mod tests {
             vec!["semantic.toml is missing".to_owned()]
         );
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn add_contract_rejects_an_abi_the_runtime_cannot_parse() {
+        let (root, config) = token_project("bad-abi-type");
+        let broken = root.join("broken.json");
+        std::fs::write(
+            &broken,
+            r#"[{"type":"event","name":"Broken","inputs":[{"name":"x","type":"notatype","indexed":false}]}]"#,
+        )
+        .unwrap();
+        let contract = ContractConfig {
+            alias: "broken".into(),
+            address: "0x2222222222222222222222222222222222222222".into(),
+            abi: PathBuf::from("abis/broken.json"),
+        };
+        assert!(add_contract(&root, config, contract, &broken).is_err());
+        assert!(!root.join("abis/broken.json").exists());
+        assert_eq!(ProjectConfig::load(&root).unwrap().contracts.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shared_child_alias_renders_once_and_broken_semantics_regenerates() {
+        let (root, mut config) = token_project("shared-child");
+        std::fs::write(root.join("abis/pool.json"), APPROVAL_ABI).unwrap();
+        config.contracts.push(ContractConfig {
+            alias: "factory_b".into(),
+            address: "0x2222222222222222222222222222222222222222".into(),
+            abi: PathBuf::from("abis/token.json"),
+        });
+        for parent in ["token", "factory_b"] {
+            config.discovery_rules.push(DiscoveryRule {
+                parent_contract: parent.into(),
+                discovery_event: "Transfer".into(),
+                address_field: "to".into(),
+                child_contract: "pool".into(),
+                child_abi: PathBuf::from("abis/pool.json"),
+            });
+        }
+        std::fs::write(
+            root.join("semantic.toml"),
+            "[tables.\"x\"]\n[tables.\"x\"]\n",
+        )
+        .unwrap();
+        assert!(check_semantics(&root, &config).unwrap()[0].contains("parse"));
+
+        write_semantics(&root, &config).unwrap();
+        let text = std::fs::read_to_string(root.join("semantic.toml")).unwrap();
+        assert_eq!(text.matches("[tables.\"pool__approval\"]").count(), 1);
+        assert!(check_semantics(&root, &config).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
