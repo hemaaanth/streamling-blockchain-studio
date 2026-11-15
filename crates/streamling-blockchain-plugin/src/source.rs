@@ -5,23 +5,19 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
 use async_trait::async_trait;
-use ethers_core::{
-    abi::{Abi, Event, RawLog, Token},
-    types::H256,
-};
 use futures::{StreamExt, TryStreamExt, stream};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    str::FromStr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
+use streamling_blockchain_decode::{self as decode, EventIndex};
 const MAX_ADDRESSES_PER_LOG_FILTER: usize = 500;
 const DEFAULT_LOG_CONCURRENCY: u64 = 4;
 /// Without `max_window`, the log window may grow to this many times the configured window.
@@ -97,12 +93,6 @@ struct SourceSpec {
     #[serde(default)]
     discovery_rules: Vec<DiscoverySpec>,
 }
-#[derive(Clone)]
-struct EventDescriptor {
-    owner: String,
-    event: Event,
-}
-
 pub struct EvmEventSource {
     rt: PluginAsyncRuntimeObj,
     metrics: PluginMetricsRecorder,
@@ -120,7 +110,7 @@ pub struct EvmEventSource {
     end_block: Option<u64>,
     state: Arc<PluginStateBackend<SourceState>>,
     schema: SchemaRef,
-    events: HashMap<H256, Vec<EventDescriptor>>,
+    events: EventIndex,
     direct_addresses: HashMap<String, String>,
     discovery_rules: Vec<DiscoverySpec>,
     direct_topics: Vec<String>,
@@ -173,7 +163,7 @@ impl EvmEventSource {
                 value => value as usize,
             };
         let spec: SourceSpec = serde_json::from_str(&required("spec")?).map_err(config_error)?;
-        let mut events: HashMap<H256, Vec<EventDescriptor>> = HashMap::new();
+        let mut events = EventIndex::new();
         let mut direct_addresses = HashMap::new();
         for contract in &spec.contracts {
             direct_addresses.insert(
@@ -1425,119 +1415,42 @@ fn add_discovery(discoveries: &mut HashMap<String, ((u64, u64), String)>, row: &
 fn decode_row(
     chain_id: u64,
     log: &Value,
-    events: &HashMap<H256, Vec<EventDescriptor>>,
+    events: &EventIndex,
     direct: &HashMap<String, String>,
     discovery_rules: &[DiscoverySpec],
     child_contracts: &HashMap<String, String>,
 ) -> Result<Option<DecodedRow>, PluginError> {
-    let topics = log
-        .get("topics")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let Some(topic0_text) = topics.first().and_then(Value::as_str) else {
-        return Ok(None);
+    let decoded = match decode::decode_log(log, events, &[direct, child_contracts]) {
+        Ok(Some(decoded)) => decoded,
+        Ok(None) => return Ok(None),
+        Err(decode::Error::Ambiguous(message)) => return Err(PluginError::Execution(message)),
+        Err(error) => return Err(internal(error)),
     };
-    let topic0 = H256::from_str(topic0_text).map_err(internal)?;
-    let Some(candidates) = events.get(&topic0) else {
-        return Ok(None);
-    };
-    let address = log
-        .get("address")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let preferred = direct
-        .get(&address)
-        .or_else(|| child_contracts.get(&address));
-    // A known contract's log decodes only with that contract's ABI; a topic its ABI does not
-    // declare (for example an inherited `RoleGranted`) is skipped, not borrowed from another ABI.
-    let descriptor = match preferred {
-        Some(owner) => match candidates
-            .iter()
-            .find(|candidate| &candidate.owner == owner)
-        {
-            Some(descriptor) => descriptor,
-            None => return Ok(None),
-        },
-        None if candidates.len() == 1 => &candidates[0],
-        None => {
-            return Err(PluginError::Execution(format!(
-                "ambiguous event topic {topic0_text} for address {address}"
-            )));
-        }
-    };
-    let raw_topics = topics
-        .iter()
-        .filter_map(Value::as_str)
-        .map(H256::from_str)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(internal)?;
-    let data = hex::decode(
-        log.get("data")
-            .and_then(Value::as_str)
-            .unwrap_or("0x")
-            .trim_start_matches("0x"),
-    )
-    .map_err(internal)?;
-    let parsed = descriptor
-        .event
-        .parse_log(RawLog {
-            topics: raw_topics,
-            data,
-        })
-        .map_err(internal)?;
-    let mut object = Map::new();
-    let mut tokens = HashMap::new();
-    for (index, param) in parsed.params.into_iter().enumerate() {
-        let name = if param.name.is_empty() {
-            format!("unnamed_{}", index + 1)
-        } else {
-            param.name
-        };
-        object.insert(name.clone(), token_json(&param.value));
-        tokens.insert(name, param.value);
-    }
+    let descriptor = decoded.descriptor;
     let discovery = discovery_rules.iter().find(|rule| {
         rule.parent_contract == descriptor.owner
             && rule.discovery_event == descriptor.event.name
-            && direct.get(&address) == Some(&rule.parent_contract)
+            && direct.get(&decoded.address) == Some(&rule.parent_contract)
     });
     let (discovered_address, discovery_rule) = match discovery {
         Some(rule) => (
-            tokens.get(&rule.address_field).and_then(token_address),
+            decoded.address_input(&rule.address_field),
             Some(rule.child_contract.clone()),
         ),
         None => (None, None),
     };
-    let block_number = parse_hex(
-        log.get("blockNumber")
-            .and_then(Value::as_str)
-            .unwrap_or("0x0"),
-    )?;
-    let log_index = parse_hex(log.get("logIndex").and_then(Value::as_str).unwrap_or("0x0"))?;
-    let block_hash = log
-        .get("blockHash")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let tx_hash = log
-        .get("transactionHash")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
     Ok(Some(DecodedRow {
-        event_id: format!("{chain_id}:{block_hash}:{log_index}"),
+        event_id: decoded.event_id(chain_id),
         chain_id,
         owner: descriptor.owner.clone(),
         event: descriptor.event.name.clone(),
-        address,
-        block_number,
-        block_hash,
-        tx_hash,
-        log_index,
-        topic0: topic0_text.to_owned(),
-        fields: Value::Object(object).to_string(),
+        fields: Value::Object(decoded.fields).to_string(),
+        address: decoded.address,
+        block_number: decoded.block_number,
+        block_hash: decoded.block_hash,
+        tx_hash: decoded.tx_hash,
+        log_index: decoded.log_index,
+        topic0: decoded.topic0,
         discovered_address,
         discovery_rule,
     }))
@@ -1594,53 +1507,27 @@ fn rows_to_batch(
 
 fn load_events(
     owner: &str,
-    path: &PathBuf,
-    target: &mut HashMap<H256, Vec<EventDescriptor>>,
+    path: &Path,
+    target: &mut EventIndex,
 ) -> Result<(), PluginInitializationError> {
-    let abi: Abi = serde_json::from_slice(&fs::read(path).map_err(|e| {
-        PluginInitializationError::Configuration(format!("read {}: {e}", path.display()).into())
-    })?)
-    .map_err(config_error)?;
-    for events in abi.events.values() {
-        for event in events {
-            if event.anonymous {
+    let events = decode::read_abi_events(path).map_err(config_error)?;
+    for event in &events {
+        let mut columns = HashSet::new();
+        for (index, input) in event.inputs.iter().enumerate() {
+            let column = event_column(&decode::field_name(index, &input.name));
+            if !columns.insert(column.clone()) {
                 return Err(PluginInitializationError::Configuration(
                     format!(
-                        "anonymous event {} in {} is unsupported; Streamling topic filters require topic0",
+                        "event {} in {} maps multiple parameters to SQLite column {column}",
                         event.name,
                         path.display()
                     )
                     .into(),
                 ));
             }
-            let mut columns = HashSet::new();
-            for (index, input) in event.inputs.iter().enumerate() {
-                let raw = if input.name.is_empty() {
-                    format!("unnamed_{}", index + 1)
-                } else {
-                    input.name.clone()
-                };
-                let column = event_column(&raw);
-                if !columns.insert(column.clone()) {
-                    return Err(PluginInitializationError::Configuration(
-                        format!(
-                            "event {} in {} maps multiple parameters to SQLite column {column}",
-                            event.name,
-                            path.display()
-                        )
-                        .into(),
-                    ));
-                }
-            }
-            target
-                .entry(event.signature())
-                .or_default()
-                .push(EventDescriptor {
-                    owner: owner.to_owned(),
-                    event: event.clone(),
-                });
         }
     }
+    decode::index_events(owner, events, target).map_err(config_error)?;
     Ok(())
 }
 fn event_column(field: &str) -> String {
@@ -1777,25 +1664,6 @@ fn log_block_timestamps(logs: &[Value]) -> HashMap<u64, u64> {
 }
 fn parse_hex(text: &str) -> Result<u64, PluginError> {
     u64::from_str_radix(text.trim_start_matches("0x"), 16).map_err(internal)
-}
-fn token_address(token: &Token) -> Option<String> {
-    if let Token::Address(value) = token {
-        Some(format!("{value:#x}"))
-    } else {
-        None
-    }
-}
-fn token_json(token: &Token) -> Value {
-    match token {
-        Token::Address(v) => format!("{v:#x}").into(),
-        Token::FixedBytes(v) | Token::Bytes(v) => format!("0x{}", hex::encode(v)).into(),
-        Token::Int(v) | Token::Uint(v) => v.to_string().into(),
-        Token::Bool(v) => (*v).into(),
-        Token::String(v) => v.clone().into(),
-        Token::Array(v) | Token::FixedArray(v) | Token::Tuple(v) => {
-            Value::Array(v.iter().map(token_json).collect())
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2049,26 +1917,20 @@ mod tests {
 
     #[test]
     fn child_address_selects_its_own_contract_descriptor() {
-        let event: Event = serde_json::from_value(json!({
+        let event: decode::Event = serde_json::from_value(json!({
             "anonymous": false,
             "inputs": [],
             "name": "Ping",
             "type": "event"
         }))
         .unwrap();
-        let topic = event.signature();
+        let topic = event.selector();
         let child_address = "0x2222222222222222222222222222222222222222";
         let events = HashMap::from([(
             topic,
             vec![
-                EventDescriptor {
-                    owner: "child_a".into(),
-                    event: event.clone(),
-                },
-                EventDescriptor {
-                    owner: "child_b".into(),
-                    event,
-                },
+                decode::EventDescriptor::new("child_a", event.clone()).unwrap(),
+                decode::EventDescriptor::new("child_b", event).unwrap(),
             ],
         )]);
         let child_contracts = HashMap::from([(child_address.to_owned(), "child_b".to_owned())]);
@@ -2096,14 +1958,14 @@ mod tests {
 
     #[test]
     fn known_address_skips_topics_its_abi_does_not_declare() {
-        let event: Event = serde_json::from_value(json!({
+        let event: decode::Event = serde_json::from_value(json!({
             "anonymous": false,
             "inputs": [],
             "name": "RoleGranted",
             "type": "event"
         }))
         .unwrap();
-        let topic = event.signature();
+        let topic = event.selector();
         let flow = "0x3333333333333333333333333333333333333333";
         let log = json!({
             "address": flow,
@@ -2115,14 +1977,8 @@ mod tests {
             "logIndex": "0x0"
         });
         let direct = HashMap::from([(flow.to_owned(), "flow".to_owned())]);
-        let mine = EventDescriptor {
-            owner: "mine".into(),
-            event: event.clone(),
-        };
-        let reward = EventDescriptor {
-            owner: "reward".into(),
-            event,
-        };
+        let mine = decode::EventDescriptor::new("mine", event.clone()).unwrap();
+        let reward = decode::EventDescriptor::new("reward", event).unwrap();
         for candidates in [vec![mine.clone()], vec![mine, reward]] {
             let events = HashMap::from([(topic, candidates)]);
             let row = decode_row(4663, &log, &events, &direct, &[], &HashMap::new()).unwrap();

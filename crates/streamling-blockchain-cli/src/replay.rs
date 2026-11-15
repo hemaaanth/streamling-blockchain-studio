@@ -5,22 +5,13 @@ use crate::{
     rpc, status,
 };
 use anyhow::{Context, Result, bail};
-use ethers_core::{
-    abi::{Abi, Event, RawLog, Token},
-    types::H256,
-};
 use rusqlite::{Connection, params};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
-    str::FromStr,
+    path::Path,
 };
-
-struct EventDescriptor {
-    owner: String,
-    event: Event,
-}
+use streamling_blockchain_decode::{self as decode, B256, EventIndex, parse_hex};
 
 struct DecodedEvent {
     event_id: String,
@@ -52,7 +43,7 @@ async fn diff_with(
     }
     let urls = config.rpc_urls_value()?;
     let client = rpc::client()?;
-    let mut events = HashMap::new();
+    let mut events = EventIndex::new();
     let mut direct = HashMap::new();
     let mut direct_topics = HashSet::new();
     for contract in &config.contracts {
@@ -120,7 +111,7 @@ async fn diff_with(
 
 const MAX_ADDRESSES_PER_LOG_FILTER: usize = 500;
 
-fn sorted_topics(topics: &HashSet<H256>) -> Vec<String> {
+fn sorted_topics(topics: &HashSet<B256>) -> Vec<String> {
     let mut topics = topics
         .iter()
         .map(|topic| format!("{topic:#x}"))
@@ -212,7 +203,7 @@ fn add_child(children: &mut Children, address: String, position: (u64, u64), chi
 
 /// The block and log index of a log.
 fn log_position(log: &Value) -> Result<(u64, u64)> {
-    let field = |name: &str| parse_hex(log.get(name).and_then(Value::as_str).unwrap_or("0x0"));
+    let field = |name: &str| parse_hex(log.get(name).and_then(Value::as_str).unwrap_or_default());
     Ok((field("blockNumber")?, field("logIndex")?))
 }
 
@@ -724,28 +715,15 @@ fn sqlite_count_rows(
 fn decode_log(
     chain_id: u64,
     log: &Value,
-    events: &HashMap<H256, Vec<EventDescriptor>>,
+    events: &EventIndex,
     direct: &HashMap<String, String>,
     children: &Children,
 ) -> Result<Option<DecodedEvent>> {
-    let topics = log
-        .get("topics")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let Some(topic0_text) = topics.first().and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let topic0 = H256::from_str(topic0_text)?;
-    let Some(candidates) = events.get(&topic0) else {
-        return Ok(None);
-    };
     let address = log
         .get("address")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let position = log_position(log)?;
     // Every queried log comes from a known contract, and decodes only with that contract's
     // ABI, as in the event source.
     let Some(owner) = direct
@@ -754,98 +732,23 @@ fn decode_log(
     else {
         return Ok(None);
     };
-    let Some(descriptor) = candidates
-        .iter()
-        .find(|candidate| &candidate.owner == owner)
-    else {
+    let owners = HashMap::from([(address, owner.clone())]);
+    let Some(decoded) = decode::decode_log(log, events, &[&owners])? else {
         return Ok(None);
     };
-    let raw_topics = topics
-        .iter()
-        .filter_map(Value::as_str)
-        .map(H256::from_str)
-        .collect::<Result<Vec<_>, _>>()?;
-    let data = hex::decode(
-        log.get("data")
-            .and_then(Value::as_str)
-            .unwrap_or("0x")
-            .trim_start_matches("0x"),
-    )?;
-    let parsed = descriptor.event.parse_log(RawLog {
-        topics: raw_topics,
-        data,
-    })?;
-    let mut object = Map::new();
-    for (index, param) in parsed.params.into_iter().enumerate() {
-        let name = if param.name.is_empty() {
-            format!("unnamed_{}", index + 1)
-        } else {
-            param.name
-        };
-        object.insert(name, token_json(&param.value));
-    }
-    let block_hash = log
-        .get("blockHash")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let (block_number, log_index) = position;
     Ok(Some(DecodedEvent {
-        event_id: format!("{chain_id}:{block_hash}:{log_index}"),
-        contract_alias: descriptor.owner.clone(),
-        event_name: descriptor.event.name.clone(),
-        block_number,
-        block_hash,
-        data: Value::Object(object).to_string(),
+        event_id: decoded.event_id(chain_id),
+        contract_alias: decoded.descriptor.owner.clone(),
+        event_name: decoded.descriptor.event.name.clone(),
+        block_number: decoded.block_number,
+        block_hash: decoded.block_hash,
+        data: Value::Object(decoded.fields).to_string(),
     }))
 }
 
-fn load_events(
-    owner: &str,
-    path: &PathBuf,
-    target: &mut HashMap<H256, Vec<EventDescriptor>>,
-) -> Result<Vec<H256>> {
-    let abi: Abi = serde_json::from_slice(
-        &std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
-    )?;
-    let mut topics = Vec::new();
-    for events in abi.events.values() {
-        for event in events {
-            if event.anonymous {
-                bail!(
-                    "anonymous event {} in {} is unsupported",
-                    event.name,
-                    path.display()
-                )
-            }
-            target
-                .entry(event.signature())
-                .or_default()
-                .push(EventDescriptor {
-                    owner: owner.to_owned(),
-                    event: event.clone(),
-                });
-            topics.push(event.signature());
-        }
-    }
-    Ok(topics)
-}
-
-fn parse_hex(text: &str) -> Result<u64> {
-    Ok(u64::from_str_radix(text.trim_start_matches("0x"), 16)?)
-}
-
-fn token_json(token: &Token) -> Value {
-    match token {
-        Token::Address(v) => format!("{v:#x}").into(),
-        Token::FixedBytes(v) | Token::Bytes(v) => format!("0x{}", hex::encode(v)).into(),
-        Token::Int(v) | Token::Uint(v) => v.to_string().into(),
-        Token::Bool(v) => (*v).into(),
-        Token::String(v) => v.clone().into(),
-        Token::Array(v) | Token::FixedArray(v) | Token::Tuple(v) => {
-            Value::Array(v.iter().map(token_json).collect())
-        }
-    }
+fn load_events(owner: &str, path: &Path, target: &mut EventIndex) -> Result<Vec<B256>> {
+    let events = decode::read_abi_events(path)?;
+    Ok(decode::index_events(owner, events, target)?)
 }
 
 #[cfg(test)]

@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/streamling-blockchain-cli", "crates/streamling-blockchain-plugin"]
+members = [
+    "crates/streamling-blockchain-cli",
+    "crates/streamling-blockchain-decode",
+    "crates/streamling-blockchain-plugin",
+]
 
 [workspace.package]
 version = "0.1.0"

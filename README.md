@@ -179,7 +179,7 @@ streamling-blockchain --project ./my-project mcp
 
 `sql`, `schema`, `replay`, `audit`, and `mcp` read the SQLite sink by default and the ClickHouse sink when SQLite is disabled. Pass `--backend sqlite` or `--backend clickhouse` to choose when both sinks are enabled. ClickHouse commands use the `STREAMLING__CLICKHOUSE_SINK__*` connection settings. Every `sql` and MCP query runs with ClickHouse's `readonly=1` setting, so the server rejects writes; this also works for users whose profile is already read-only. SQL uses the backend's dialect: `json_extract(data, '$.from')` in SQLite and `JSONExtractString(fields_json, 'from')` in ClickHouse. The per-event `<alias>__<event>` tables exist only in SQLite. On ClickHouse, `audit` stores its summaries in `<table>_quality_replay_checks`, and `--attach` is SQLite-only.
 
-Decoded `uint256`/`int256` event fields are stored as decimal strings, so a plain `ORDER BY` sorts them as text (`"9"` after `"10"`) and `CAST(... AS INTEGER)` silently breaks above `i64`. On SQLite, sort or compare them with the built-in `int_sortkey(value)` scalar function instead, as in the `sql` example above; on ClickHouse, use `toUInt256(JSONExtractString(fields_json, 'value'))` or `toInt256(...)`.
+Decoded `uint256`/`int256` event fields are stored as decimal strings, so a plain `ORDER BY` sorts them as text (`"9"` after `"10"`) and `CAST(... AS INTEGER)` silently breaks above `i64`. On SQLite, sort or compare them with the built-in `int_sortkey(value)` scalar function instead, as in the `sql` example above; on ClickHouse, use `toUInt256(JSONExtractString(fields_json, 'value'))` or `toInt256(...)`. A signed `intN` field is stored with its sign, such as `"-1"`. Projects indexed before the shared decoder stored negative values as unsigned two's complement, and stored the last value under every `unnamed_N` field of an event with several unnamed inputs; `replay` reports those events as `changed`, and a reindex fixes them.
 
 ```sh
 streamling-blockchain --project ./my-project schema --backend clickhouse
@@ -287,6 +287,7 @@ GitHub Actions runs the same checks after each push to `main` (`.github/workflow
 ## Repository layout
 
 - `crates/streamling-blockchain-cli/`: CLI, Goldsky provisioning, SQL, and MCP surfaces
+- `crates/streamling-blockchain-decode/`: EVM log decoding shared by the event source and `replay`
 - `crates/streamling-blockchain-plugin/`: native Streamling EVM source and SQLite sink
 - `demos/`: specific Evidence dashboard demos backed by Streamling-generated project databases
 - `tests/`: deterministic EVM RPC and ABI fixtures

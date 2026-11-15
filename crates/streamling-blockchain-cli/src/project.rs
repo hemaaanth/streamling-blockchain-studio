@@ -706,9 +706,11 @@ fn install_abi(
 ) -> Result<ProjectConfig> {
     config.validate()?;
     let abi = read_abi(abi_source)?;
-    // The runtime and replay decode with ethers' parser, so reject what it rejects.
-    serde_json::from_value::<ethers_core::abi::Abi>(abi.clone())
-        .with_context(|| format!("parse ABI {}", abi_source.display()))?;
+    // The runtime and replay decode with the shared decoder, so reject what it rejects.
+    streamling_blockchain_decode::parse_abi(
+        &serde_json::to_vec(&abi)?,
+        &abi_source.display().to_string(),
+    )?;
     SemanticTables::default().add_abi("check", &abi)?;
     std::fs::create_dir_all(target.parent().context("ABI path has no parent")?)?;
     std::fs::copy(abi_source, target).with_context(|| format!("copy {}", abi_source.display()))?;
