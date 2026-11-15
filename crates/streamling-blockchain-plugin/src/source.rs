@@ -306,15 +306,19 @@ impl EvmEventSource {
             .flat_map(|value| value.as_array().cloned().unwrap_or_default())
             .collect::<Vec<_>>();
 
+        // `scoped` holds what the scope discovered; `discoveries` holds every discovery.
         let mut discoveries = HashMap::new();
+        let mut scoped = HashMap::new();
         for saved in self
             .discovered_rows
             .lock()
             .map_err(|_| PluginError::Internal("discovery registry mutex poisoned".into()))?
             .iter()
-            .filter(|saved| scope.is_none_or(|scope| scope == saved.row.owner))
         {
             add_discovery(&mut discoveries, &saved.row);
+            if scope.is_none_or(|scope| scope == saved.row.owner) {
+                add_discovery(&mut scoped, &saved.row);
+            }
         }
         // Direct logs decode with their own owners, so the registry is not needed yet.
         let none = HashMap::new();
@@ -330,10 +334,14 @@ impl EvmEventSource {
             .filter(|row| !self.before_start(row))
             {
                 add_discovery(&mut discoveries, &row);
+                add_discovery(&mut scoped, &row);
             }
         }
-        let child_contracts = discoveries
+        // A catch-up reads only the children its contract discovered first. A child that
+        // another contract discovered earlier keeps that owner, as in the main pass.
+        let child_contracts = scoped
             .into_iter()
+            .filter(|(address, found)| discoveries.get(address) == Some(found))
             .map(|(address, (_, rule))| (address, rule))
             .collect::<HashMap<_, _>>();
         let mut child_addresses = child_contracts.keys().cloned().collect::<Vec<_>>();
@@ -832,8 +840,14 @@ impl SourcePlugin for EvmEventSource {
                 PluginError::Internal("discovery bootstrap mutex poisoned".into())
             })? = Some(saved.discovered_rows);
         }
+        let parents = self
+            .discovery_rules
+            .iter()
+            .map(|rule| rule.parent_contract.clone())
+            .collect::<HashSet<_>>();
         position.catch_up = plan_catch_up(
             &self.contract_starts,
+            &parents,
             covered.as_ref(),
             position.catch_up,
             position.next_block,
@@ -1174,20 +1188,30 @@ struct EventPosition {
 /// `legacy_start`.
 fn plan_catch_up(
     starts: &BTreeMap<String, u64>,
+    parents: &HashSet<String>,
     covered: Option<&BTreeMap<String, u64>>,
     mut jobs: BTreeMap<String, (u64, u64)>,
     next_block: u64,
     legacy_start: u64,
 ) -> BTreeMap<String, (u64, u64)> {
-    jobs.retain(|alias, _| starts.contains_key(alias));
+    jobs.retain(|alias, job| starts.contains_key(alias) && job.0 <= job.1);
     for (alias, &start) in starts {
         let first = match covered {
             Some(covered) => covered.get(alias).copied().unwrap_or(next_block),
             None => legacy_start,
         };
+        // The main pass reads everything from `next_block` on.
+        let first = first.min(next_block);
         if start < first {
-            // A job in progress keeps its end; blocks it already read are read again.
-            let end = jobs.get(alias).map_or(first - 1, |job| job.1);
+            // A parent reads up to the main position: a child it discovers early has
+            // events after `first` that the main pass never read. A job in progress keeps
+            // its end; blocks it already read are read again.
+            let end = if parents.contains(alias) {
+                next_block - 1
+            } else {
+                first - 1
+            };
+            let end = jobs.get(alias).map_or(end, |job| job.1);
             jobs.insert(alias.clone(), (start, end));
         }
     }
@@ -1870,7 +1894,7 @@ mod tests {
             ("removed".to_owned(), 10),
         ]);
         let jobs = BTreeMap::from([("removed".to_owned(), (20, 99))]);
-        let planned = plan_catch_up(&starts, Some(&covered), jobs, 500, 0);
+        let planned = plan_catch_up(&starts, &HashSet::new(), Some(&covered), jobs, 500, 0);
         // A new contract was never read before 500; a moved start reads up to its old start.
         assert_eq!(
             planned,
@@ -1879,6 +1903,21 @@ mod tests {
                 ("new".to_owned(), (300, 499)),
             ])
         );
+        // A parent also reads its old range again, for the children it discovers early.
+        let parents = HashSet::from(["moved".to_owned()]);
+        let starts = BTreeMap::from([("moved".to_owned(), 50)]);
+        assert_eq!(
+            plan_catch_up(&starts, &parents, Some(&covered), BTreeMap::new(), 500, 0),
+            BTreeMap::from([("moved".to_owned(), (50, 499))])
+        );
+        // A start that moves but stays at or above the main position needs no job.
+        let covered = BTreeMap::from([("moved".to_owned(), 1_000)]);
+        let starts = BTreeMap::from([("moved".to_owned(), 800)]);
+        assert!(
+            plan_catch_up(&starts, &parents, Some(&covered), BTreeMap::new(), 500, 0).is_empty()
+        );
+        let empty = BTreeMap::from([("moved".to_owned(), (800, 499))]);
+        assert!(plan_catch_up(&starts, &parents, Some(&covered), empty, 500, 0).is_empty());
     }
 
     #[test]
@@ -1887,13 +1926,20 @@ mod tests {
         let covered = BTreeMap::from([("token".to_owned(), 300)]);
         let jobs = BTreeMap::from([("token".to_owned(), (400, 499))]);
         assert_eq!(
-            plan_catch_up(&starts, Some(&covered), jobs.clone(), 500, 0),
+            plan_catch_up(
+                &starts,
+                &HashSet::new(),
+                Some(&covered),
+                jobs.clone(),
+                500,
+                0
+            ),
             BTreeMap::from([("token".to_owned(), (100, 499))])
         );
         // The start did not move, so the job resumes where it stopped.
         let starts = BTreeMap::from([("token".to_owned(), 300)]);
         assert_eq!(
-            plan_catch_up(&starts, Some(&covered), jobs, 500, 0).len(),
+            plan_catch_up(&starts, &HashSet::new(), Some(&covered), jobs, 500, 0).len(),
             1
         );
     }
@@ -1901,9 +1947,16 @@ mod tests {
     #[test]
     fn fresh_and_legacy_projects_backfill_only_starts_below_the_project_start() {
         let starts = BTreeMap::from([("early".to_owned(), 50), ("later".to_owned(), 200)]);
-        let fresh = plan_catch_up(&starts, Some(&BTreeMap::new()), BTreeMap::new(), 100, 100);
+        let fresh = plan_catch_up(
+            &starts,
+            &HashSet::new(),
+            Some(&BTreeMap::new()),
+            BTreeMap::new(),
+            100,
+            100,
+        );
         assert_eq!(fresh, BTreeMap::from([("early".to_owned(), (50, 99))]));
-        let legacy = plan_catch_up(&starts, None, BTreeMap::new(), 5_000, 100);
+        let legacy = plan_catch_up(&starts, &HashSet::new(), None, BTreeMap::new(), 5_000, 100);
         assert_eq!(legacy, BTreeMap::from([("early".to_owned(), (50, 99))]));
         let saved: SourceState =
             serde_json::from_str(r#"{"next_block":5000,"discovered_rows":[]}"#).unwrap();

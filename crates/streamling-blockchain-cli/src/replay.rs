@@ -78,19 +78,22 @@ async fn diff_with(
         let filter = json!({"address": chunk, "topics": [sorted_topics(&direct_topics)]});
         logs.extend(get_logs(&client, &urls, &filter, from, to).await?);
     }
+    // The event source skips a configured contract's logs before its start block, also
+    // when the contract is a discovered child too.
+    let before_start = |log: &Value, event: &DecodedEvent| {
+        let address = log["address"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        starts
+            .get(&address)
+            .is_some_and(|start| event.block_number < *start)
+    };
     let mut children = stored_children(backend, config).await?;
     let mut decoded = Vec::new();
     for log in &logs {
         if let Some(event) = decode_log(config.chain_id, log, &events, &direct, &children)? {
-            // The event source skips a contract's logs before its start block.
-            let address = log["address"]
-                .as_str()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if starts
-                .get(&address)
-                .is_some_and(|start| event.block_number < *start)
-            {
+            if before_start(log, &event) {
                 continue;
             }
             if let Some((address, child)) = discovered_child(config, &direct, log, &event) {
@@ -108,13 +111,10 @@ async fn diff_with(
             child_logs.extend(get_logs(&client, &urls, &filter, from, to).await?);
         }
         for log in &child_logs {
-            decoded.extend(decode_log(
-                config.chain_id,
-                log,
-                &events,
-                &direct,
-                &children,
-            )?);
+            decoded.extend(
+                decode_log(config.chain_id, log, &events, &direct, &children)?
+                    .filter(|event| !before_start(log, event)),
+            );
         }
     }
     let mut seen = HashSet::new();
