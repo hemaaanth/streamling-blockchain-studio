@@ -5793,6 +5793,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "futures",
  "hex",
  "libc",
  "reqwest",

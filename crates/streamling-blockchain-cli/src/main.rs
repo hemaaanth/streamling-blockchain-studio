@@ -10,6 +10,7 @@ mod publish;
 mod replay;
 mod rpc;
 mod status;
+mod tokens;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, error::ErrorKind};
@@ -192,6 +193,12 @@ enum Commands {
         streamling: PathBuf,
         #[arg(long)]
         plugin: Option<PathBuf>,
+    },
+    SyncTokens {
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long, value_enum)]
+        backend: Option<BackendKind>,
     },
     Replay {
         #[arg(long)]
@@ -697,6 +704,14 @@ async fn dispatch(cli: Cli, out: &mut Output) -> Result<Value> {
         Commands::Mcp { backend } => {
             mcp::run_stdio(root, backend).await?;
             Ok(Value::Null)
+        }
+        Commands::SyncTokens { refresh, backend } => {
+            let value = tokens::sync(&root, refresh, backend).await?;
+            out.line(format!(
+                "Stored metadata for {} addresses: {} with decimals, {} with a symbol",
+                value["stored"], value["with_decimals"], value["with_symbol"]
+            ));
+            Ok(value)
         }
         Commands::Replay { from, to, backend } => {
             let value = replay::diff(&root, from, to, backend).await?;
