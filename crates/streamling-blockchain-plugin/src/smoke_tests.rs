@@ -5,10 +5,9 @@ use rusqlite::Connection;
 use serde_json::json;
 use std::{
     collections::HashMap,
-    net::{TcpListener, TcpStream},
+    io::{BufRead, BufReader},
     path::Path,
-    process::{Child, Command},
-    time::Duration,
+    process::{Child, Command, Stdio},
 };
 use streamling_plugin::{
     PluginStateBackendConfig, SinkPlugin, SourcePlugin, api::PluginStateBackendFactory,
@@ -26,25 +25,22 @@ impl Drop for Server {
 }
 
 fn start_mock_rpc(repo: &Path) -> (Server, String) {
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let server = Server(
+    let mut server = Server(
         Command::new("python3")
             .arg(repo.join("tests/mock_rpc.py"))
-            .arg(port.to_string())
+            .arg("0")
+            .stdout(Stdio::piped())
             .spawn()
             .expect("python3 runs tests/mock_rpc.py"),
     );
-    for _ in 0..100 {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return (server, format!("http://127.0.0.1:{port}"));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("mock RPC did not start on port {port}");
+    // The server prints its port after it binds, so it accepts connections from here on.
+    let mut port = String::new();
+    BufReader::new(server.0.stdout.take().unwrap())
+        .read_line(&mut port)
+        .unwrap();
+    let port = port.trim();
+    assert!(!port.is_empty(), "mock RPC exited before it bound a port");
+    (server, format!("http://127.0.0.1:{port}"))
 }
 
 fn state() -> PluginStateBackendFactory {
@@ -133,7 +129,8 @@ fn mock_rpc_events_reach_sqlite() {
             format!("factory:Transfer:{PARENT}:1"),
             "token:Transfer:0x2222222222222222222222222222222222222222:2".to_owned(),
         ],
-        "the parent event and the event of the child it discovered both reach SQLite"
+        "the parent event and the event of the child it discovered both reach SQLite; \
+         the mock honors address filters, so the child event needs the child query"
     );
     let child = connection
         .query_row(

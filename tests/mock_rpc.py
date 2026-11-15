@@ -60,7 +60,19 @@ class Handler(BaseHTTPRequestHandler):
             query = request["params"][0]
             start = int(query["fromBlock"], 16)
             end = int(query["toBlock"], 16)
-            result = LOGS if start <= 100 <= end else []
+            addresses = query.get("address")
+            if isinstance(addresses, str):
+                addresses = [addresses]
+            addresses = None if addresses is None else {address.lower() for address in addresses}
+            topic0 = (query.get("topics") or [None])[0]
+            if isinstance(topic0, str):
+                topic0 = [topic0]
+            result = [
+                log for log in LOGS
+                if start <= int(log["blockNumber"], 16) <= end
+                and (addresses is None or log["address"] in addresses)
+                and (topic0 is None or log["topics"][0] in topic0)
+            ]
         else:
             self.send_error(400, f"unsupported method {method}")
             return
@@ -68,4 +80,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(body))); self.end_headers(); self.wfile.write(body)
     def log_message(self, *_): pass
 
-HTTPServer(("127.0.0.1", int(sys.argv[1]) if len(sys.argv) > 1 else 18545), Handler).serve_forever()
+# Port 0 picks a free port; the bound port is printed so a test can connect without a race.
+server = HTTPServer(("127.0.0.1", int(sys.argv[1]) if len(sys.argv) > 1 else 18545), Handler)
+print(server.server_address[1], flush=True)
+server.serve_forever()
