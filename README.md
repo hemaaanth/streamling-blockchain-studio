@@ -145,6 +145,8 @@ streamling-blockchain --project ./my-project add-discovery \
   --child-abi ./deployment.json
 ```
 
+Only the first rule for a parent event applies. The first discovery of an address owns it: if another rule discovers the same address later, its logs keep the first child alias. Projects indexed before this rule may have stored such logs under the later alias; `replay` reports them as `changed`, and a reindex fixes them.
+
 ## Query and inspect
 
 ```sh

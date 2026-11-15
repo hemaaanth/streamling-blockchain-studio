@@ -84,17 +84,12 @@ async fn diff_with(
         let filter = json!({"address": chunk, "topics": [sorted_topics(&direct_topics)]});
         logs.extend(get_logs(&client, &urls, &filter, from, to).await?);
     }
-    let mut children = HashMap::new();
-    for rule in &config.discovery_rules {
-        for address in stored_children(backend, config.chain_id, rule, to).await? {
-            children.insert(address, rule.child_contract.clone());
-        }
-    }
+    let mut children = stored_children(backend, config).await?;
     let mut decoded = Vec::new();
     for log in &logs {
         if let Some(event) = decode_log(config.chain_id, log, &events, &direct, &children)? {
             if let Some((address, child)) = discovered_child(config, &direct, log, &event) {
-                children.insert(address, child);
+                add_child(&mut children, address, log_position(log)?, child);
             }
             decoded.push(event);
         }
@@ -201,32 +196,80 @@ fn discovered_child(
     Some((address, rule.child_contract.clone()))
 }
 
-/// Child addresses the stored discovery events for `rule` name, up to block `to`.
-async fn stored_children(
+/// Child owners by lowercase address, with the (block, log index) of their discovery.
+type Children = HashMap<String, ((u64, u64), String)>;
+
+/// Keeps the earliest discovery of each child address. As in backfill, the first discovery
+/// owns a child, even if another rule rediscovers it later.
+fn add_child(children: &mut Children, address: String, position: (u64, u64), child: String) {
+    match children.get(&address) {
+        Some((first, _)) if *first <= position => {}
+        _ => {
+            children.insert(address, (position, child));
+        }
+    }
+}
+
+/// The block and log index of a log.
+fn log_position(log: &Value) -> Result<(u64, u64)> {
+    let field = |name: &str| parse_hex(log.get(name).and_then(Value::as_str).unwrap_or("0x0"));
+    Ok((field("blockNumber")?, field("logIndex")?))
+}
+
+/// Every stored discovery event, as backfill applies them: only the first rule for a parent
+/// event counts.
+async fn stored_children(backend: &Backend, config: &ProjectConfig) -> Result<Children> {
+    let mut seen = HashSet::new();
+    let mut children = Children::new();
+    for rule in &config.discovery_rules {
+        if !seen.insert((&rule.parent_contract, &rule.discovery_event)) {
+            continue;
+        }
+        for (block_number, log_index, text) in
+            discovery_rows(backend, config.chain_id, rule).await?
+        {
+            let address = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|fields| fields.get(&rule.address_field)?.as_str().map(str::to_owned));
+            if let Some(address) = address {
+                add_child(
+                    &mut children,
+                    address.to_ascii_lowercase(),
+                    (block_number, log_index),
+                    rule.child_contract.clone(),
+                );
+            }
+        }
+    }
+    Ok(children)
+}
+
+/// Block, log index, and fields of every stored discovery event for `rule`.
+async fn discovery_rows(
     backend: &Backend,
     chain_id: u64,
     rule: &DiscoveryRule,
-    to: u64,
-) -> Result<Vec<String>> {
-    let data = match backend {
+) -> Result<Vec<(u64, u64, String)>> {
+    match backend {
         Backend::Sqlite(conn) => {
             let mut statement = conn.prepare(
-                "SELECT data FROM events WHERE contract_alias = ?1 AND event_name = ?2 AND block_number <= ?3",
+                "SELECT block_number, log_index, data FROM events
+                 WHERE chain_id = ?1 AND contract_alias = ?2 AND event_name = ?3",
             )?;
-            statement
+            Ok(statement
                 .query_map(
-                    params![rule.parent_contract, rule.discovery_event, to],
-                    |row| row.get::<_, String>(0),
+                    params![chain_id, rule.parent_contract, rule.discovery_event],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )?
-                .collect::<rusqlite::Result<Vec<_>>>()?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
         }
         Backend::ClickHouse { client, table } => {
             let rows = client
                 .query(
                     &format!(
-                        "SELECT fields_json FROM {} FINAL
+                        "SELECT block_number, log_index, fields_json FROM {} FINAL
                          WHERE is_deleted = 0 AND chain_id = {chain_id} AND contract_alias = '{}'
-                           AND event_name = '{}' AND block_number <= {to}",
+                           AND event_name = '{}'",
                         client.qualified(table),
                         sql_string(&rule.parent_contract),
                         sql_string(&rule.discovery_event),
@@ -234,24 +277,20 @@ async fn stored_children(
                     usize::MAX,
                 )
                 .await?;
-            rows["rows"]
+            Ok(rows["rows"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(|row| row["fields_json"].as_str().map(str::to_owned))
-                .collect()
+                .filter_map(|row| {
+                    Some((
+                        row["block_number"].as_u64()?,
+                        row["log_index"].as_u64()?,
+                        row["fields_json"].as_str()?.to_owned(),
+                    ))
+                })
+                .collect())
         }
-    };
-    Ok(data
-        .iter()
-        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
-        .filter_map(|fields| {
-            fields
-                .get(&rule.address_field)?
-                .as_str()
-                .map(str::to_ascii_lowercase)
-        })
-        .collect())
+    }
 }
 
 fn sql_string(text: &str) -> String {
@@ -687,7 +726,7 @@ fn decode_log(
     log: &Value,
     events: &HashMap<H256, Vec<EventDescriptor>>,
     direct: &HashMap<String, String>,
-    children: &HashMap<String, String>,
+    children: &Children,
 ) -> Result<Option<DecodedEvent>> {
     let topics = log
         .get("topics")
@@ -706,9 +745,13 @@ fn decode_log(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let position = log_position(log)?;
     // Every queried log comes from a known contract, and decodes only with that contract's
     // ABI, as in the event source.
-    let Some(owner) = direct.get(&address).or_else(|| children.get(&address)) else {
+    let Some(owner) = direct
+        .get(&address)
+        .or_else(|| children.get(&address).map(|(_, child)| child))
+    else {
         return Ok(None);
     };
     let Some(descriptor) = candidates
@@ -746,16 +789,12 @@ fn decode_log(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let log_index = parse_hex(log.get("logIndex").and_then(Value::as_str).unwrap_or("0x0"))?;
+    let (block_number, log_index) = position;
     Ok(Some(DecodedEvent {
         event_id: format!("{chain_id}:{block_hash}:{log_index}"),
         contract_alias: descriptor.owner.clone(),
         event_name: descriptor.event.name.clone(),
-        block_number: parse_hex(
-            log.get("blockNumber")
-                .and_then(Value::as_str)
-                .unwrap_or("0x0"),
-        )?,
+        block_number,
         block_hash,
         data: Value::Object(object).to_string(),
     }))
@@ -990,7 +1029,7 @@ mod tests {
         .unwrap();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE events (event_id TEXT PRIMARY KEY, contract_alias TEXT, event_name TEXT, block_number INTEGER, block_hash TEXT, data TEXT);",
+            "CREATE TABLE events (event_id TEXT PRIMARY KEY, chain_id INTEGER, contract_alias TEXT, event_name TEXT, block_number INTEGER, block_hash TEXT, log_index INTEGER, data TEXT);",
         )
         .unwrap();
         let backend = Backend::Sqlite(conn);
@@ -1012,13 +1051,14 @@ mod tests {
         for event in missing {
             let expected = &event["expected"];
             conn.execute(
-                "INSERT INTO events VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO events VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     event["event_id"].as_str(),
                     expected["contract_alias"].as_str(),
                     expected["event_name"].as_str(),
                     expected["block_number"].as_u64(),
                     expected["block_hash"].as_str(),
+                    event["event_id"].as_str().unwrap().rsplit(':').next(),
                     expected["data"].as_str(),
                 ],
             )
@@ -1028,17 +1068,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second["ok"], true, "{second}");
+    }
+
+    #[tokio::test]
+    async fn stored_children_match_the_backfill_registry() {
+        let abi = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/transfer_abi.json");
+        let rule = |event: &str, field: &str, child: &str| {
+            format!(
+                "[[discovery_rules]]\nparent_contract = \"factory\"\ndiscovery_event = \"{event}\"\naddress_field = \"{field}\"\nchild_contract = \"{child}\"\nchild_abi = \"{}\"\n",
+                abi.display()
+            )
+        };
+        let config: ProjectConfig = toml::from_str(&format!(
+            "chain = \"ethereum\"\nchain_id = 1\nrpc_url = \"http://127.0.0.1:1\"\ndatabase = \"events.db\"\nstart_block = 0\n[[contracts]]\nalias = \"factory\"\naddress = \"0x1111111111111111111111111111111111111111\"\nabi = \"{}\"\n{}{}{}",
+            abi.display(),
+            rule("Approval", "spender", "vault"),
+            rule("Transfer", "to", "token"),
+            // Backfill never applies a second rule for the same parent event.
+            rule("Transfer", "from", "shadowed"),
+        ))
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events (event_id TEXT PRIMARY KEY, chain_id INTEGER, contract_alias TEXT, event_name TEXT, block_number INTEGER, block_hash TEXT, log_index INTEGER, data TEXT);
+             INSERT INTO events VALUES
+               ('1:0xb:0', 1, 'factory', 'Transfer', 500, '0xb', 0, '{\"from\":\"0xAAAA\",\"to\":\"0xBBBB\"}'),
+               ('1:0xc:0', 1, 'factory', 'Approval', 900, '0xc', 0, '{\"spender\":\"0xbbbb\"}'),
+               ('1:0xd:1', 1, 'factory', 'Transfer', 900, '0xd', 1, '{\"from\":\"0xcccc\",\"to\":\"0xdddd\"}'),
+               ('2:0xe:0', 2, 'factory', 'Transfer', 50, '0xe', 0, '{\"from\":\"0xeeee\",\"to\":\"0xffff\"}');",
+        )
+        .unwrap();
+        // Every discovery counts, wherever the replay window is, the first discovery of an
+        // address owns it, and other chains are ignored.
         assert_eq!(
-            stored_children(&backend, 1, &config.discovery_rules[0], 110)
+            stored_children(&Backend::Sqlite(conn), &config)
                 .await
                 .unwrap(),
-            vec!["0x2222222222222222222222222222222222222222".to_owned()]
-        );
-        assert!(
-            stored_children(&backend, 1, &config.discovery_rules[0], 99)
-                .await
-                .unwrap()
-                .is_empty()
+            HashMap::from([
+                ("0xbbbb".to_owned(), ((500, 0), "token".to_owned())),
+                ("0xdddd".to_owned(), ((900, 1), "token".to_owned())),
+            ])
         );
     }
 

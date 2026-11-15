@@ -291,18 +291,17 @@ impl EvmEventSource {
             .flat_map(|value| value.as_array().cloned().unwrap_or_default())
             .collect::<Vec<_>>();
 
-        let mut child_contracts = self
+        let mut discoveries = HashMap::new();
+        for saved in self
             .discovered_rows
             .lock()
             .map_err(|_| PluginError::Internal("discovery registry mutex poisoned".into()))?
             .iter()
-            .filter_map(|saved| {
-                Some((
-                    saved.row.discovered_address.clone()?,
-                    saved.row.discovery_rule.clone()?,
-                ))
-            })
-            .collect::<HashMap<_, _>>();
+        {
+            add_discovery(&mut discoveries, &saved.row);
+        }
+        // Direct logs decode with their own owners, so the registry is not needed yet.
+        let none = HashMap::new();
         for log in &logs {
             if let Some(row) = decode_row(
                 self.chain_id,
@@ -310,12 +309,15 @@ impl EvmEventSource {
                 &self.events,
                 &self.direct_addresses,
                 &self.discovery_rules,
-                &child_contracts,
-            )? && let (Some(address), Some(rule)) = (row.discovered_address, row.discovery_rule)
-            {
-                child_contracts.insert(address, rule);
+                &none,
+            )? {
+                add_discovery(&mut discoveries, &row);
             }
         }
+        let child_contracts = discoveries
+            .into_iter()
+            .map(|(address, (_, rule))| (address, rule))
+            .collect::<HashMap<_, _>>();
         let mut child_addresses = child_contracts.keys().cloned().collect::<Vec<_>>();
         child_addresses.sort_unstable();
 
@@ -1404,6 +1406,22 @@ struct DecodedRow {
     discovery_rule: Option<String>,
 }
 
+/// Keeps the earliest discovery of each child address. The first discovery owns a child, even
+/// if another rule rediscovers it later, so `replay` can rebuild the same owners from stored
+/// rows whatever the batch boundaries were.
+fn add_discovery(discoveries: &mut HashMap<String, ((u64, u64), String)>, row: &DecodedRow) {
+    let (Some(address), Some(rule)) = (&row.discovered_address, &row.discovery_rule) else {
+        return;
+    };
+    let position = (row.block_number, row.log_index);
+    match discoveries.get(address) {
+        Some((first, _)) if *first <= position => {}
+        _ => {
+            discoveries.insert(address.clone(), (position, rule.clone()));
+        }
+    }
+}
+
 fn decode_row(
     chain_id: u64,
     log: &Value,
@@ -1844,6 +1862,41 @@ mod tests {
         assert_eq!(row.block_id, "8453:123");
         assert_eq!(row.chain_id, 8453);
         assert_eq!(row.transaction_count, 2);
+    }
+
+    #[test]
+    fn the_first_discovery_owns_a_child() {
+        let row = |block_number, log_index, rule: &str| DecodedRow {
+            event_id: format!("1:0x{block_number}:{log_index}"),
+            chain_id: 1,
+            owner: "factory".into(),
+            event: "Created".into(),
+            address: "0x1111111111111111111111111111111111111111".into(),
+            block_number,
+            block_hash: format!("0x{block_number}"),
+            tx_hash: "0xtx".into(),
+            log_index,
+            topic0: "0xtopic".into(),
+            fields: "{}".into(),
+            discovered_address: Some("0xchild".into()),
+            discovery_rule: Some(rule.into()),
+        };
+        let mut discoveries = HashMap::new();
+        // Rows can arrive out of order; the earliest one still wins.
+        add_discovery(&mut discoveries, &row(200, 0, "vault"));
+        add_discovery(&mut discoveries, &row(100, 3, "token"));
+        add_discovery(&mut discoveries, &row(100, 5, "vault"));
+        add_discovery(
+            &mut discoveries,
+            &DecodedRow {
+                discovered_address: None,
+                ..row(1, 0, "other")
+            },
+        );
+        assert_eq!(
+            discoveries,
+            HashMap::from([("0xchild".to_owned(), ((100, 3), "token".to_owned()))])
+        );
     }
 
     #[test]
