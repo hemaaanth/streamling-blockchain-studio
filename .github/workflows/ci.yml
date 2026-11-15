@@ -1,0 +1,27 @@
+# Informational only: runs after a push to main and never gates one.
+# There is no pull_request trigger and no required status check, so direct pushes stay instant.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Includes the mock-RPC smoke test (python3 is preinstalled on ubuntu-latest).
+      - run: cargo test --workspace --locked

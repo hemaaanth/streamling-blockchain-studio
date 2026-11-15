@@ -276,7 +276,9 @@ cargo build --release --workspace
 
 ClickHouse integration tests run when `STREAMLING_BLOCKCHAIN_TEST_CLICKHOUSE_URL` names a disposable ClickHouse HTTP endpoint, with optional `STREAMLING_BLOCKCHAIN_TEST_CLICKHOUSE_USER` and `STREAMLING_BLOCKCHAIN_TEST_CLICKHOUSE_PASSWORD`. They create and drop their own `sbs_test_*` databases, and they skip when the URL is unset.
 
-For a behavioral smoke test, initialize against a known RPC fixture, run `dev`, wait for `status --wait`, then query the indexed events through CLI, HTTP, and MCP.
+`cargo test` includes a smoke test that runs the event source and SQLite sink against `tests/mock_rpc.py` (needs `python3`). It checks a factory event and the event of the child it discovers end to end, without the `streamling` runtime. For a full run, initialize a project against that fixture, run `dev`, wait for `status --wait`, then query the indexed events through the CLI and MCP.
+
+GitHub Actions runs the same checks after each push to `main` (`.github/workflows/ci.yml`). It is informational: it has no pull request trigger and no required status, so pushing directly to `main` is never blocked or delayed.
 
 ## Repository layout
 

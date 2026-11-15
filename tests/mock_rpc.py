@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PARENT = "0x1111111111111111111111111111111111111111"
@@ -67,4 +68,4 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(body))); self.end_headers(); self.wfile.write(body)
     def log_message(self, *_): pass
 
-HTTPServer(("127.0.0.1", 18545), Handler).serve_forever()
+HTTPServer(("127.0.0.1", int(sys.argv[1]) if len(sys.argv) > 1 else 18545), Handler).serve_forever()

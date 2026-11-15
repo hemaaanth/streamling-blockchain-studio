@@ -1,5 +1,7 @@
 mod rpc;
 mod sink;
+#[cfg(test)]
+mod smoke_tests;
 mod source;
 
 use sink::SqliteSink;
