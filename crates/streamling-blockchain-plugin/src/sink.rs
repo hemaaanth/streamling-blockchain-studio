@@ -3,13 +3,13 @@ use arrow::{
     datatypes::{DataType, SchemaRef},
 };
 use async_trait::async_trait;
-use rusqlite::{Connection, params, types::Value as SqlValue};
+use rusqlite::{Connection, ToSql, params, types::Value as SqlValue};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -22,7 +22,7 @@ const EVENTS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS events (
                 event_id TEXT PRIMARY KEY, chain_id INTEGER NOT NULL, contract_alias TEXT NOT NULL, event_name TEXT NOT NULL,
                 address TEXT NOT NULL, block_number INTEGER NOT NULL, block_hash TEXT NOT NULL,
                 block_timestamp INTEGER NOT NULL, tx_hash TEXT NOT NULL, log_index INTEGER NOT NULL,
-                topic0 TEXT NOT NULL, data TEXT NOT NULL CHECK(json_valid(data))
+                topic0 TEXT NOT NULL, data TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS events_block ON events(chain_id, block_number, log_index);
             CREATE INDEX IF NOT EXISTS events_contract_event ON events(chain_id, contract_alias, event_name);
@@ -46,7 +46,7 @@ const EVENTS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS events (
                 FROM events GROUP BY chain_id, block_number, contract_alias, event_name;";
 
 pub struct SqliteSink {
-    connection: Mutex<Connection>,
+    connection: Arc<Mutex<Connection>>,
     metrics: PluginMetricsRecorder,
     running: AtomicBool,
     table: Option<String>,
@@ -90,7 +90,7 @@ impl SqliteSink {
                 .map_err(|e| PluginInitializationError::Execution(e.to_string().into()))?;
         }
         Ok(Self {
-            connection: Mutex::new(connection),
+            connection: Arc::new(Mutex::new(connection)),
             metrics,
             running: AtomicBool::new(true),
             table,
@@ -100,85 +100,94 @@ impl SqliteSink {
 }
 
 impl SqliteSink {
-    async fn process_table_batch(
+    /// Runs `work` on the blocking pool. A large batch keeps SQLite busy for seconds, which
+    /// would otherwise stall an async worker and the tasks that share it.
+    async fn with_connection<T: Send + 'static>(
         &self,
-        table: &str,
-        batch: RecordBatch,
-    ) -> Result<(), PluginError> {
-        let primary_key = self.primary_key.as_deref().ok_or_else(|| {
-            PluginError::Execution("generic SQLite sink requires key_column".into())
-        })?;
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| PluginError::Internal("SQLite mutex poisoned".into()))?;
-        ensure_table(&connection, batch.schema_ref(), table, Some(primary_key))
-            .map_err(db_error)?;
-        let transaction = connection.transaction().map_err(db_error)?;
-        prune_replaced_transaction_blocks(&transaction, table, &batch).map_err(db_error)?;
-        let fields = batch
-            .schema()
-            .fields()
-            .iter()
-            .filter(|field| field.name().as_str() != "_gs_op")
-            .cloned()
-            .collect::<Vec<_>>();
-        let names = fields
-            .iter()
-            .map(|field| quote_identifier(field.name()))
-            .collect::<Vec<_>>();
-        let placeholders = (1..=fields.len())
-            .map(|index| format!("?{index}"))
-            .collect::<Vec<_>>();
-        let insert = format!(
-            "INSERT OR REPLACE INTO {} ({}) VALUES ({})",
-            quote_identifier(table),
-            names.join(","),
-            placeholders.join(",")
-        );
-        let delete = format!(
-            "DELETE FROM {} WHERE {} = ?1",
-            quote_identifier(table),
-            quote_identifier(primary_key)
-        );
-        let op = batch
-            .column_by_name("_gs_op")
-            .and_then(|column| column.as_any().downcast_ref::<StringArray>());
-        for row in 0..batch.num_rows() {
-            let key = value_at(
-                batch.column_by_name(primary_key).ok_or_else(|| {
-                    PluginError::Execution(format!("missing column {primary_key}"))
-                })?,
-                row,
-            )?;
-            if matches!(op, Some(op) if op.value(row) == "d") {
-                transaction
-                    .prepare_cached(&delete)
-                    .and_then(|mut statement| statement.execute([key]))
-                    .map_err(db_error)?;
-                continue;
-            }
-            let values = fields
-                .iter()
-                .map(|field| {
-                    batch
-                        .column_by_name(field.name())
-                        .ok_or_else(|| {
-                            PluginError::Execution(format!("missing column {}", field.name()))
-                        })
-                        .and_then(|column| value_at(column, row))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            transaction
-                .prepare_cached(&insert)
-                .and_then(|mut statement| statement.execute(rusqlite::params_from_iter(values)))
-                .map_err(db_error)?;
-        }
-        transaction.commit().map_err(db_error)?;
-        self.metrics
-            .record_count("streamling_blockchain_sqlite_rows", batch.num_rows() as u64);
-        Ok(())
+        work: impl FnOnce(&mut Connection) -> Result<T, PluginError> + Send + 'static,
+    ) -> Result<T, PluginError> {
+        let connection = self.connection.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = connection
+                .lock()
+                .map_err(|_| PluginError::Internal("SQLite mutex poisoned".into()))?;
+            work(&mut connection)
+        })
+        .await
+        .map_err(|error| PluginError::Internal(format!("SQLite write task failed: {error}")))?
     }
+}
+
+fn write_table_batch(
+    connection: &mut Connection,
+    table: &str,
+    primary_key: Option<&str>,
+    batch: &RecordBatch,
+) -> Result<(), PluginError> {
+    let primary_key = primary_key
+        .ok_or_else(|| PluginError::Execution("generic SQLite sink requires key_column".into()))?;
+    ensure_table(connection, batch.schema_ref(), table, Some(primary_key)).map_err(db_error)?;
+    let transaction = connection.transaction().map_err(db_error)?;
+    prune_replaced_transaction_blocks(&transaction, table, batch).map_err(db_error)?;
+    let fields = batch
+        .schema()
+        .fields()
+        .iter()
+        .filter(|field| field.name().as_str() != "_gs_op")
+        .cloned()
+        .collect::<Vec<_>>();
+    let names = fields
+        .iter()
+        .map(|field| quote_identifier(field.name()))
+        .collect::<Vec<_>>();
+    let placeholders = (1..=fields.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>();
+    let insert = format!(
+        "INSERT OR REPLACE INTO {} ({}) VALUES ({})",
+        quote_identifier(table),
+        names.join(","),
+        placeholders.join(",")
+    );
+    let delete = format!(
+        "DELETE FROM {} WHERE {} = ?1",
+        quote_identifier(table),
+        quote_identifier(primary_key)
+    );
+    let op = batch
+        .column_by_name("_gs_op")
+        .and_then(|column| column.as_any().downcast_ref::<StringArray>());
+    for row in 0..batch.num_rows() {
+        let key = value_at(
+            batch
+                .column_by_name(primary_key)
+                .ok_or_else(|| PluginError::Execution(format!("missing column {primary_key}")))?,
+            row,
+        )?;
+        if matches!(op, Some(op) if op.value(row) == "d") {
+            transaction
+                .prepare_cached(&delete)
+                .and_then(|mut statement| statement.execute([key]))
+                .map_err(db_error)?;
+            continue;
+        }
+        let values = fields
+            .iter()
+            .map(|field| {
+                batch
+                    .column_by_name(field.name())
+                    .ok_or_else(|| {
+                        PluginError::Execution(format!("missing column {}", field.name()))
+                    })
+                    .and_then(|column| value_at(column, row))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        transaction
+            .prepare_cached(&insert)
+            .and_then(|mut statement| statement.execute(rusqlite::params_from_iter(values)))
+            .map_err(db_error)?;
+    }
+    transaction.commit().map_err(db_error)
 }
 
 #[async_trait]
@@ -201,26 +210,29 @@ impl SinkPlugin for SqliteSink {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        if let Some(table) = &self.table {
-            return self.process_table_batch(table, batch).await;
-        }
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| PluginError::Internal("SQLite mutex poisoned".into()))?;
-        let transaction = connection.transaction().map_err(db_error)?;
-        write_event_rows(&transaction, &batch)?;
-        transaction.commit().map_err(db_error)?;
+        let rows = batch.num_rows() as u64;
+        let table = self.table.clone();
+        let primary_key = self.primary_key.clone();
+        self.with_connection(move |connection| match &table {
+            Some(table) => write_table_batch(connection, table, primary_key.as_deref(), &batch),
+            None => {
+                let transaction = connection.transaction().map_err(db_error)?;
+                write_event_rows(&transaction, &batch)?;
+                transaction.commit().map_err(db_error)
+            }
+        })
+        .await?;
         self.metrics
-            .record_count("streamling_blockchain_sqlite_rows", batch.num_rows() as u64);
+            .record_count("streamling_blockchain_sqlite_rows", rows);
         Ok(())
     }
     async fn process_checkpoint_marker(&self, _epoch: CheckpointEpoch) -> Result<(), PluginError> {
-        self.connection
-            .lock()
-            .map_err(|_| PluginError::Internal("SQLite mutex poisoned".into()))?
-            .execute_batch("PRAGMA wal_checkpoint(PASSIVE)")
-            .map_err(db_error)
+        self.with_connection(|connection| {
+            connection
+                .execute_batch("PRAGMA wal_checkpoint(PASSIVE)")
+                .map_err(db_error)
+        })
+        .await
     }
     async fn process_checkpoint_finalizer(
         &self,
@@ -262,6 +274,8 @@ fn write_event_rows(
     let op = text("_gs_op")?;
     // Columns of each per-event table, read once per batch.
     let mut tables = HashMap::<String, HashSet<String>>::new();
+    // The insert SQL of each per-event table and the decoded columns it was built for.
+    let mut inserts = HashMap::<String, (Vec<String>, String)>::new();
     let mut last_block = None;
     for row in 0..batch.num_rows() {
         let table = safe_table(alias.value(row), event_name.value(row));
@@ -269,7 +283,7 @@ fn write_event_rows(
             transaction.execute_batch(&format!("CREATE TABLE IF NOT EXISTS \"{table}\" (
                 event_id TEXT PRIMARY KEY, chain_id INTEGER NOT NULL, address TEXT NOT NULL, block_number INTEGER NOT NULL,
                 block_hash TEXT NOT NULL, block_timestamp INTEGER NOT NULL, tx_hash TEXT NOT NULL,
-                log_index INTEGER NOT NULL, data TEXT NOT NULL CHECK(json_valid(data))
+                log_index INTEGER NOT NULL, data TEXT NOT NULL
             ); CREATE INDEX IF NOT EXISTS \"{table}_block\" ON \"{table}\"(chain_id, block_number, log_index);" )).map_err(db_error)?;
             let columns = transaction
                 .prepare(&format!("PRAGMA table_info(\"{table}\")"))
@@ -394,36 +408,48 @@ fn write_event_rows(
             })
             .map_err(db_error)?;
         // REPLACE clears decoded columns this event does not carry, as the base insert always has.
-        let mut names = String::from(
-            "event_id,chain_id,address,block_number,block_hash,block_timestamp,tx_hash,log_index,data",
-        );
-        for (column, _) in &values {
-            names.push(',');
-            names.push_str(&quote_identifier(column));
-        }
-        let placeholders = (1..=9 + values.len())
-            .map(|index| format!("?{index}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let base: [SqlValue; 9] = [
-            event_id.value(row).to_owned().into(),
-            (block.0 as i64).into(),
-            address.value(row).to_owned().into(),
-            (block.1 as i64).into(),
-            block.2.to_owned().into(),
-            (timestamp.value(row) as i64).into(),
-            tx_hash.value(row).to_owned().into(),
-            (log_index.value(row) as i64).into(),
-            fields.value(row).to_owned().into(),
+        // Events of one table usually carry the same columns, so the SQL is built once for them.
+        let insert = match inserts.get(&table) {
+            Some((known, sql)) if known.iter().eq(values.iter().map(|(column, _)| column)) => sql,
+            _ => {
+                let mut names = String::from(
+                    "event_id,chain_id,address,block_number,block_hash,block_timestamp,tx_hash,log_index,data",
+                );
+                for (column, _) in &values {
+                    names.push(',');
+                    names.push_str(&quote_identifier(column));
+                }
+                let placeholders = (1..=9 + values.len())
+                    .map(|index| format!("?{index}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql =
+                    format!("INSERT OR REPLACE INTO \"{table}\" ({names}) VALUES ({placeholders})");
+                let columns = values.iter().map(|(column, _)| column.clone()).collect();
+                &inserts
+                    .entry(table.clone())
+                    .insert_entry((columns, sql))
+                    .into_mut()
+                    .1
+            }
+        };
+        let base: [&dyn ToSql; 9] = [
+            &event_id.value(row),
+            &block.0,
+            &address.value(row),
+            &block.1,
+            &block.2,
+            &timestamp.value(row),
+            &tx_hash.value(row),
+            &log_index.value(row),
+            &fields.value(row),
         ];
         transaction
-            .prepare_cached(&format!(
-                "INSERT OR REPLACE INTO \"{table}\" ({names}) VALUES ({placeholders})"
-            ))
+            .prepare_cached(insert)
             .and_then(|mut statement| {
                 statement.execute(rusqlite::params_from_iter(
                     base.into_iter()
-                        .chain(values.into_iter().map(|(_, value)| value)),
+                        .chain(values.iter().map(|(_, value)| value as &dyn ToSql)),
                 ))
             })
             .map_err(db_error)?;

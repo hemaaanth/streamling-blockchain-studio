@@ -389,10 +389,7 @@ impl EvmEventSource {
         .buffered(self.log_concurrency)
         .try_collect::<Vec<_>>()
         .await?;
-        let mut logs = direct
-            .into_iter()
-            .flat_map(|value| value.as_array().cloned().unwrap_or_default())
-            .collect::<Vec<_>>();
+        let mut logs = direct.into_iter().flat_map(into_logs).collect::<Vec<_>>();
 
         // `scoped` holds what the scope discovered; `discoveries` holds every discovery.
         let mut discoveries = HashMap::new();
@@ -409,20 +406,23 @@ impl EvmEventSource {
             }
         }
         // Direct logs decode with their own owners, so the registry is not needed yet.
+        // Without discovery rules no log can discover a child, so the pass is skipped.
         let none = HashMap::new();
-        for log in &logs {
-            if let Some(row) = decode_row(
-                self.chain_id,
-                log,
-                &self.events,
-                &self.direct_addresses,
-                &self.discovery_rules,
-                &none,
-            )?
-            .filter(|row| !self.before_start(row))
-            {
-                add_discovery(&mut discoveries, &row);
-                add_discovery(&mut scoped, &row);
+        if !self.discovery_rules.is_empty() {
+            for log in &logs {
+                if let Some(row) = decode_row(
+                    self.chain_id,
+                    log,
+                    &self.events,
+                    &self.direct_addresses,
+                    &self.discovery_rules,
+                    &none,
+                )?
+                .filter(|row| !self.before_start(row))
+                {
+                    add_discovery(&mut discoveries, &row);
+                    add_discovery(&mut scoped, &row);
+                }
             }
         }
         // A catch-up reads only the children its contract discovered first. A child that
@@ -455,24 +455,20 @@ impl EvmEventSource {
             .buffered(self.log_concurrency)
             .try_collect::<Vec<_>>()
             .await?;
-            logs.extend(
-                child
-                    .into_iter()
-                    .flat_map(|value| value.as_array().cloned().unwrap_or_default()),
-            );
+            logs.extend(child.into_iter().flat_map(into_logs));
+            // A child can also be a configured contract, so its logs may arrive twice.
+            let mut seen = HashSet::new();
+            logs.retain(|log| {
+                seen.insert(
+                    json!([
+                        log.get("blockHash"),
+                        log.get("logIndex"),
+                        log.get("address")
+                    ])
+                    .to_string(),
+                )
+            });
         }
-
-        let mut seen = HashSet::new();
-        logs.retain(|log| {
-            seen.insert(
-                json!([
-                    log.get("blockHash"),
-                    log.get("logIndex"),
-                    log.get("address")
-                ])
-                .to_string(),
-            )
-        });
         Ok((logs, child_contracts))
     }
 
@@ -1671,6 +1667,14 @@ struct DecodedRow {
     fields: String,
     discovered_address: Option<String>,
     discovery_rule: Option<String>,
+}
+
+/// The logs of an `eth_getLogs` result, moved out without copying.
+fn into_logs(value: Value) -> Vec<Value> {
+    match value {
+        Value::Array(logs) => logs,
+        _ => Vec::new(),
+    }
 }
 
 /// Keeps the earliest discovery of each child address. The first discovery owns a child, even
