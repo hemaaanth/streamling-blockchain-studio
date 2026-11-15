@@ -24,7 +24,12 @@ fn write_pipeline(root: &Path, config: &ProjectConfig) -> Result<()> {
                 .join(&contract.abi)
                 .canonicalize()
                 .unwrap_or_else(|_| root.join(&contract.abi));
-            json!({"alias": contract.alias, "address": contract.address, "abi_path": abi})
+            json!({
+                "alias": contract.alias,
+                "address": contract.address,
+                "abi_path": abi,
+                "start_block": contract.start_block
+            })
         })
         .collect::<Vec<_>>();
     let discovery_rules = config
@@ -759,6 +764,7 @@ mod tests {
                 alias: "token".into(),
                 address: "0x1111111111111111111111111111111111111111".into(),
                 abi: PathBuf::from("abis/token.json"),
+                start_block: None,
             }],
             discovery_rules: vec![],
             sinks: SinkConfig {
@@ -961,6 +967,7 @@ mod tests {
                 alias: "token".into(),
                 address: "0x1111111111111111111111111111111111111111".into(),
                 abi: PathBuf::from("abis/token.json"),
+                start_block: None,
             }],
             discovery_rules: vec![],
             sinks: SinkConfig::default(),
@@ -980,6 +987,7 @@ mod tests {
             alias: "token".into(),
             address: "0x2222222222222222222222222222222222222222".into(),
             abi: PathBuf::from("abis/token.json"),
+            start_block: None,
         };
         assert!(add_contract(&root, config.clone(), duplicate, &other).is_err());
         assert_eq!(
@@ -1057,6 +1065,7 @@ mod tests {
             alias: "broken".into(),
             address: "0x2222222222222222222222222222222222222222".into(),
             abi: PathBuf::from("abis/broken.json"),
+            start_block: None,
         };
         assert!(add_contract(&root, config, contract, &broken).is_err());
         assert!(!root.join("abis/broken.json").exists());
@@ -1072,6 +1081,7 @@ mod tests {
             alias: "factory_b".into(),
             address: "0x2222222222222222222222222222222222222222".into(),
             abi: PathBuf::from("abis/token.json"),
+            start_block: None,
         });
         for parent in ["token", "factory_b"] {
             config.discovery_rules.push(DiscoveryRule {

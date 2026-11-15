@@ -252,6 +252,7 @@ mod tests {
                 alias: "token".into(),
                 address: "0x1111111111111111111111111111111111111111".into(),
                 abi: PathBuf::from("abi.json"),
+                start_block: None,
             }],
             discovery_rules: vec![],
             sinks: SinkConfig {

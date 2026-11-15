@@ -202,3 +202,69 @@ fn mock_rpc_events_reach_sqlite() {
     );
     let _ = std::fs::remove_file(&db);
 }
+
+/// Rows the event source returns in `batches` batches when the factory starts at
+/// `contract_start` and the source at `source_start`. The mock's logs are at block 100.
+async fn rows_with_starts(
+    repo: &Path,
+    rpc_url: &str,
+    source_start: u64,
+    contract_start: u64,
+    batches: usize,
+) -> Vec<String> {
+    let (metrics, _receiver) = crossbeam_channel::unbounded();
+    let mut spec = spec(repo);
+    spec["contracts"][0]["start_block"] = contract_start.into();
+    let source = EvmEventSource::new(
+        DirectTokioProxy::new().into_async_runtime_obj(),
+        state(),
+        PluginMetricsRecorder::new(metrics),
+        options(&[
+            ("rpc_url", rpc_url.to_owned()),
+            ("chain_id", "1".into()),
+            ("start_block", source_start.to_string()),
+            ("end_block", "101".into()),
+            ("confirmations", "0".into()),
+            ("spec", spec.to_string()),
+        ]),
+    )
+    .unwrap();
+    source.initialize().await.unwrap();
+    let mut aliases = Vec::new();
+    for _ in 0..batches {
+        let batch = source.generate_batch().await.unwrap();
+        let column = batch
+            .column_by_name("contract_alias")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        aliases.extend(column.iter().flatten().map(str::to_owned));
+    }
+    aliases
+}
+
+#[test]
+fn contract_start_blocks_backfill_earlier_logs_and_skip_older_ones() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let (_server, rpc_url) = start_mock_rpc(&repo, &[]);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        // The factory starts before the source, so a catch-up job reads 90-100 first, with
+        // the child it discovers there; the main position then reads block 101.
+        assert_eq!(
+            rows_with_starts(&repo, &rpc_url, 101, 90, 2).await,
+            ["factory", "token"]
+        );
+        // The factory starts after block 100, so its event there is skipped and its child is
+        // never discovered.
+        assert!(
+            rows_with_starts(&repo, &rpc_url, 90, 101, 1)
+                .await
+                .is_empty()
+        );
+    });
+}

@@ -78,6 +78,9 @@ struct ContractSpec {
     alias: String,
     address: String,
     abi_path: PathBuf,
+    /// First block to index for this contract. It defaults to the source's `start_block`.
+    #[serde(default)]
+    start_block: Option<u64>,
 }
 #[derive(Clone, Deserialize)]
 struct DiscoverySpec {
@@ -105,7 +108,13 @@ pub struct EvmEventSource {
     max_window: AtomicU64,
     /// Windows fetched at the same time; one batch spans up to this many windows.
     log_concurrency: usize,
-    cursor: Cursor,
+    cursor: Cursor<EventPosition>,
+    /// The source's `start_block` option.
+    start_block: u64,
+    /// First block to index for each contract alias.
+    contract_starts: BTreeMap<String, u64>,
+    /// First block to index for each contract address.
+    address_starts: HashMap<String, u64>,
     progress_path: Option<PathBuf>,
     end_block: Option<u64>,
     state: Arc<PluginStateBackend<SourceState>>,
@@ -165,11 +174,14 @@ impl EvmEventSource {
         let spec: SourceSpec = serde_json::from_str(&required("spec")?).map_err(config_error)?;
         let mut events = EventIndex::new();
         let mut direct_addresses = HashMap::new();
+        let mut contract_starts = BTreeMap::new();
+        let mut address_starts = HashMap::new();
         for contract in &spec.contracts {
-            direct_addresses.insert(
-                contract.address.to_ascii_lowercase(),
-                contract.alias.clone(),
-            );
+            let address = contract.address.to_ascii_lowercase();
+            let start = contract.start_block.unwrap_or(start_block);
+            contract_starts.insert(contract.alias.clone(), start);
+            address_starts.insert(address.clone(), start);
+            direct_addresses.insert(address, contract.alias.clone());
             load_events(&contract.alias, &contract.abi_path, &mut events)?;
         }
         let mut direct_topics = events
@@ -222,7 +234,13 @@ impl EvmEventSource {
             max_window: AtomicU64::new(max_window),
             log_concurrency,
             end_block,
-            cursor: Cursor::new(start_block),
+            cursor: Cursor::new(EventPosition {
+                next_block: start_block,
+                catch_up: BTreeMap::new(),
+            }),
+            start_block,
+            contract_starts,
+            address_starts,
             progress_path: options.get("progress_path").map(PathBuf::from),
             state: state_factory.create(),
             schema,
@@ -250,12 +268,19 @@ impl EvmEventSource {
     }
 
     /// Logs of the configured contracts and of their discovered children in `ranges`, with
-    /// the child registry extended by discoveries in these logs.
+    /// the child registry extended by discoveries in these logs. With a `scope`, only that
+    /// contract and the children it discovered are read.
     async fn fetch_logs(
         &self,
         ranges: &[(u64, u64)],
+        scope: Option<&str>,
     ) -> Result<(Vec<Value>, HashMap<String, String>), PluginError> {
-        let direct_addresses = self.direct_addresses.keys().cloned().collect::<Vec<_>>();
+        let direct_addresses = self
+            .direct_addresses
+            .iter()
+            .filter(|(_, alias)| scope.is_none_or(|scope| scope == alias.as_str()))
+            .map(|(address, _)| address.clone())
+            .collect::<Vec<_>>();
         // Owned filters keep the request futures `Send` for `async_trait`.
         let filters = ranges
             .iter()
@@ -287,6 +312,7 @@ impl EvmEventSource {
             .lock()
             .map_err(|_| PluginError::Internal("discovery registry mutex poisoned".into()))?
             .iter()
+            .filter(|saved| scope.is_none_or(|scope| scope == saved.row.owner))
         {
             add_discovery(&mut discoveries, &saved.row);
         }
@@ -300,7 +326,9 @@ impl EvmEventSource {
                 &self.direct_addresses,
                 &self.discovery_rules,
                 &none,
-            )? {
+            )?
+            .filter(|row| !self.before_start(row))
+            {
                 add_discovery(&mut discoveries, &row);
             }
         }
@@ -352,6 +380,13 @@ impl EvmEventSource {
         Ok((logs, child_contracts))
     }
 
+    /// True for a log of a configured contract from before that contract's start block.
+    fn before_start(&self, row: &DecodedRow) -> bool {
+        self.address_starts
+            .get(&row.address)
+            .is_some_and(|start| row.block_number < *start)
+    }
+
     async fn block_timestamp(&self, block: u64) -> Result<u64, PluginError> {
         let value = self
             .rpc(
@@ -376,7 +411,7 @@ pub struct EvmBlockSource {
     window: u64,
     concurrency: usize,
     batch_size: usize,
-    cursor: Cursor,
+    cursor: Cursor<u64>,
     progress_path: Option<PathBuf>,
     end_block: Option<u64>,
     chain_id: u64,
@@ -453,7 +488,7 @@ impl SupportsGracefulShutdown for EvmBlockSource {
 impl SourcePlugin for EvmBlockSource {
     async fn initialize(&self) -> Result<(), PluginError> {
         if let Some(saved) = self.state.get().await.map_err(PluginError::State)? {
-            self.cursor.restore(saved.next_block);
+            self.cursor.restore(saved.next_block)?;
         }
         Ok(())
     }
@@ -488,7 +523,7 @@ impl SourcePlugin for EvmBlockSource {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
-        self.cursor.advance(to.saturating_add(1));
+        self.cursor.advance(to.saturating_add(1))?;
         self.metrics
             .record_count("streamling_blockchain_blocks", rows.len() as u64);
         block_rows_to_batch(self.schema.clone(), rows)
@@ -505,11 +540,16 @@ impl SourcePlugin for EvmBlockSource {
         };
         self.state
             .put(BlockSourceState {
-                next_block: mark.next_block,
+                next_block: mark.position,
             })
             .await
             .map_err(PluginError::State)?;
-        write_progress(self.progress_path.as_deref(), self.confirmations, mark)
+        write_progress(
+            self.progress_path.as_deref(),
+            self.confirmations,
+            mark,
+            false,
+        )
     }
 }
 
@@ -523,7 +563,7 @@ pub struct EvmTransactionSource {
     batch_size: usize,
     /// When false, `input` is written empty; `method_id` still holds the selector.
     store_input: bool,
-    cursor: Cursor,
+    cursor: Cursor<u64>,
     progress_path: Option<PathBuf>,
     end_block: Option<u64>,
     chain_id: u64,
@@ -701,7 +741,7 @@ impl SupportsGracefulShutdown for EvmTransactionSource {
 impl SourcePlugin for EvmTransactionSource {
     async fn initialize(&self) -> Result<(), PluginError> {
         if let Some(saved) = self.state.get().await.map_err(PluginError::State)? {
-            self.cursor.restore(saved.next_block);
+            self.cursor.restore(saved.next_block)?;
         }
         Ok(())
     }
@@ -730,7 +770,7 @@ impl SourcePlugin for EvmTransactionSource {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
-        self.cursor.advance(to.saturating_add(1));
+        self.cursor.advance(to.saturating_add(1))?;
         self.metrics
             .record_count("streamling_blockchain_transactions", rows.len() as u64);
         transaction_rows_to_batch(self.schema.clone(), rows)
@@ -747,11 +787,16 @@ impl SourcePlugin for EvmTransactionSource {
         };
         self.state
             .put(BlockSourceState {
-                next_block: mark.next_block,
+                next_block: mark.position,
             })
             .await
             .map_err(PluginError::State)?;
-        write_progress(self.progress_path.as_deref(), self.confirmations, mark)
+        write_progress(
+            self.progress_path.as_deref(),
+            self.confirmations,
+            mark,
+            false,
+        )
     }
 }
 
@@ -769,8 +814,15 @@ impl SupportsGracefulShutdown for EvmEventSource {
 #[async_trait]
 impl SourcePlugin for EvmEventSource {
     async fn initialize(&self) -> Result<(), PluginError> {
+        let mut position = lock(&self.cursor.returned)?.clone();
+        // A fresh project has indexed no contract yet.
+        let mut covered = Some(BTreeMap::new());
         if let Some(saved) = self.state.get().await.map_err(PluginError::State)? {
-            self.cursor.restore(saved.next_block);
+            position = EventPosition {
+                next_block: saved.next_block,
+                catch_up: saved.catch_up,
+            };
+            covered = saved.contract_starts;
             *self
                 .discovered_rows
                 .lock()
@@ -780,7 +832,14 @@ impl SourcePlugin for EvmEventSource {
                 PluginError::Internal("discovery bootstrap mutex poisoned".into())
             })? = Some(saved.discovered_rows);
         }
-        Ok(())
+        position.catch_up = plan_catch_up(
+            &self.contract_starts,
+            covered.as_ref(),
+            position.catch_up,
+            position.next_block,
+            self.start_block,
+        );
+        self.cursor.restore(position)
     }
     fn output_schema(&self) -> Result<SchemaRef, PluginError> {
         Ok(self.schema.clone())
@@ -806,15 +865,21 @@ impl SourcePlugin for EvmEventSource {
                 .unwrap_or("0x0"),
         )?;
         let safe_head = capped_safe_head(head, self.confirmations, self.end_block);
-        let from = self.cursor.begin(head, safe_head)?;
-        if from > safe_head {
+        let position = self.cursor.begin(head, safe_head)?;
+        // A catch-up job reads blocks below the main position, so they are already safe. The
+        // main position waits until every job is done.
+        let (scope, from, end) = match position.catch_up.first_key_value() {
+            Some((alias, &(next, end))) => (Some(alias.clone()), next, end),
+            None => (None, position.next_block, safe_head),
+        };
+        if from > end {
             self.rt.sleep(RDuration::from_millis(1_000)).await;
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
         let mut current_window = self.window.load(Ordering::Relaxed).max(1);
         let (to, logs, child_contracts) = loop {
-            let ranges = log_ranges(from, safe_head, current_window, self.log_concurrency);
-            match self.fetch_logs(&ranges).await {
+            let ranges = log_ranges(from, end, current_window, self.log_concurrency);
+            match self.fetch_logs(&ranges, scope.as_deref()).await {
                 Ok((logs, child_contracts)) => {
                     let to = ranges.last().map_or(from, |range| range.1);
                     // Grow only after a span the safe head did not cut short.
@@ -851,7 +916,9 @@ impl SourcePlugin for EvmEventSource {
                 &self.direct_addresses,
                 &self.discovery_rules,
                 &child_contracts,
-            )? {
+            )?
+            .filter(|row| !self.before_start(row))
+            {
                 rows.push(row);
             }
         }
@@ -898,7 +965,17 @@ impl SourcePlugin for EvmEventSource {
                 }
             }
         }
-        self.cursor.advance(to.saturating_add(1));
+        let mut next = position;
+        match scope {
+            Some(alias) if to >= end => {
+                next.catch_up.remove(&alias);
+            }
+            Some(alias) => {
+                next.catch_up.insert(alias, (to + 1, end));
+            }
+            None => next.next_block = to.saturating_add(1),
+        }
+        self.cursor.advance(next)?;
         self.metrics
             .record_count("streamling_blockchain_logs", decoded.len() as u64);
         rows_to_batch(self.schema.clone(), decoded)
@@ -913,16 +990,33 @@ impl SourcePlugin for EvmEventSource {
         let Some(mark) = self.cursor.finalize(&epoch)? else {
             return Ok(());
         };
+        let Mark {
+            position,
+            observed_head,
+            safe_head,
+        } = mark;
+        let catching_up = !position.catch_up.is_empty();
         let state = SourceState {
-            next_block: mark.next_block,
+            next_block: position.next_block,
             discovered_rows: self
                 .discovered_rows
                 .lock()
                 .map_err(|_| PluginError::Internal("discovery registry mutex poisoned".into()))?
                 .clone(),
+            catch_up: position.catch_up,
+            contract_starts: Some(self.contract_starts.clone()),
         };
         self.state.put(state).await.map_err(PluginError::State)?;
-        write_progress(self.progress_path.as_deref(), self.confirmations, mark)
+        write_progress(
+            self.progress_path.as_deref(),
+            self.confirmations,
+            Mark {
+                position: position.next_block,
+                observed_head,
+                safe_head,
+            },
+            catching_up,
+        )
     }
 }
 
@@ -930,57 +1024,60 @@ impl SourcePlugin for EvmEventSource {
 /// the batch that `generate_batch` last returned still waits to be sent, so that batch counts
 /// as sent only when the next `generate_batch` call starts. The position recorded at each
 /// marker is committed when its epoch is finalized, that is, once every sink has written it.
-struct Cursor {
-    /// First block after the last batch returned by `generate_batch`.
-    returned: AtomicU64,
-    /// First block after the last batch known to be sent downstream.
-    sent: AtomicU64,
+struct Cursor<P> {
+    /// Position after the last batch returned by `generate_batch`.
+    returned: Mutex<P>,
+    /// Position after the last batch known to be sent downstream.
+    sent: Mutex<P>,
     /// Observed head and safe head from the latest `generate_batch` call.
     heads: Mutex<(u64, u64)>,
-    marks: Mutex<BTreeMap<u64, Mark>>,
+    marks: Mutex<BTreeMap<u64, Mark<P>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Mark {
-    next_block: u64,
+struct Mark<P> {
+    position: P,
     observed_head: u64,
     safe_head: u64,
 }
 
-impl Cursor {
-    fn new(start_block: u64) -> Self {
+impl<P: Clone> Cursor<P> {
+    fn new(position: P) -> Self {
         Self {
-            returned: AtomicU64::new(start_block),
-            sent: AtomicU64::new(start_block),
+            returned: Mutex::new(position.clone()),
+            sent: Mutex::new(position),
             heads: Mutex::new((0, 0)),
             marks: Mutex::new(BTreeMap::new()),
         }
     }
 
-    fn restore(&self, next_block: u64) {
-        self.returned.store(next_block, Ordering::Relaxed);
-        self.sent.store(next_block, Ordering::Relaxed);
+    fn restore(&self, position: P) -> Result<(), PluginError> {
+        *lock(&self.returned)? = position.clone();
+        *lock(&self.sent)? = position;
+        Ok(())
     }
 
-    /// Start a `generate_batch` call and return the first block it should read.
-    fn begin(&self, observed_head: u64, safe_head: u64) -> Result<u64, PluginError> {
-        let next_block = self.returned.load(Ordering::Relaxed);
-        self.sent.store(next_block, Ordering::Relaxed);
+    /// Start a `generate_batch` call and return the position it should read from.
+    fn begin(&self, observed_head: u64, safe_head: u64) -> Result<P, PluginError> {
+        let position = lock(&self.returned)?.clone();
+        *lock(&self.sent)? = position.clone();
         *lock(&self.heads)? = (observed_head, safe_head);
-        Ok(next_block)
+        Ok(position)
     }
 
-    /// Record that the batch being returned covers blocks before `next_block`.
-    fn advance(&self, next_block: u64) {
-        self.returned.store(next_block, Ordering::Relaxed);
+    /// Record the position after the batch being returned.
+    fn advance(&self, position: P) -> Result<(), PluginError> {
+        *lock(&self.returned)? = position;
+        Ok(())
     }
 
     fn mark(&self, epoch: &CheckpointEpoch) -> Result<(), PluginError> {
         let (observed_head, safe_head) = *lock(&self.heads)?;
+        let position = lock(&self.sent)?.clone();
         lock(&self.marks)?.insert(
             epoch.0,
             Mark {
-                next_block: self.sent.load(Ordering::Relaxed),
+                position,
                 observed_head,
                 safe_head,
             },
@@ -989,7 +1086,7 @@ impl Cursor {
     }
 
     /// The position recorded at the latest marker up to `epoch`, which is now durable.
-    fn finalize(&self, epoch: &CheckpointEpoch) -> Result<Option<Mark>, PluginError> {
+    fn finalize(&self, epoch: &CheckpointEpoch) -> Result<Option<Mark<P>>, PluginError> {
         let mut marks = lock(&self.marks)?;
         let later = marks.split_off(&epoch.0.saturating_add(1));
         Ok(std::mem::replace(&mut *marks, later)
@@ -1004,17 +1101,23 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, PluginError
         .map_err(|_| PluginError::Internal("source cursor mutex poisoned".into()))
 }
 
-fn write_progress(path: Option<&Path>, confirmations: u64, mark: Mark) -> Result<(), PluginError> {
+/// `catching_up` is true while contracts still backfill blocks before the main position.
+fn write_progress(
+    path: Option<&Path>,
+    confirmations: u64,
+    mark: Mark<u64>,
+    catching_up: bool,
+) -> Result<(), PluginError> {
     let Some(path) = path else {
         return Ok(());
     };
-    let indexed_through = mark.next_block.saturating_sub(1);
+    let indexed_through = mark.position.saturating_sub(1);
     let progress = BackfillProgress {
         indexed_through,
         observed_head: mark.observed_head,
         safe_head: mark.safe_head,
         confirmations,
-        caught_up: indexed_through >= mark.safe_head,
+        caught_up: !catching_up && indexed_through >= mark.safe_head,
         updated_at_unix: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1045,6 +1148,50 @@ struct BackfillProgress {
 struct SourceState {
     next_block: u64,
     discovered_rows: Vec<PersistedRow>,
+    #[serde(default)]
+    catch_up: BTreeMap<String, (u64, u64)>,
+    /// The start block of each contract when the state was saved. Projects saved before
+    /// per-contract start blocks lack it.
+    #[serde(default)]
+    contract_starts: Option<BTreeMap<String, u64>>,
+}
+
+/// Where the event source reads next.
+#[derive(Clone, Debug, PartialEq)]
+struct EventPosition {
+    /// First block after the blocks indexed for every contract.
+    next_block: u64,
+    /// Blocks that contracts still backfill below `next_block`, by alias, as the next block
+    /// and the last block of each job.
+    catch_up: BTreeMap<String, (u64, u64)>,
+}
+
+/// Plans backfill jobs for contracts whose start block is below the blocks already indexed
+/// for them: a contract added to a running project, or a contract whose start block moved
+/// earlier. `covered` holds the start block of each contract at the last save. A contract
+/// missing from it is new and is indexed from `next_block` only. Projects saved before
+/// per-contract start blocks have no `covered`, and every contract counts as indexed from
+/// `legacy_start`.
+fn plan_catch_up(
+    starts: &BTreeMap<String, u64>,
+    covered: Option<&BTreeMap<String, u64>>,
+    mut jobs: BTreeMap<String, (u64, u64)>,
+    next_block: u64,
+    legacy_start: u64,
+) -> BTreeMap<String, (u64, u64)> {
+    jobs.retain(|alias, _| starts.contains_key(alias));
+    for (alias, &start) in starts {
+        let first = match covered {
+            Some(covered) => covered.get(alias).copied().unwrap_or(next_block),
+            None => legacy_start,
+        };
+        if start < first {
+            // A job in progress keeps its end; blocks it already read are read again.
+            let end = jobs.get(alias).map_or(first - 1, |job| job.1);
+            jobs.insert(alias.clone(), (start, end));
+        }
+    }
+    jobs
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1675,28 +1822,28 @@ mod tests {
     fn cursor_commits_only_sent_batches_of_finalized_epochs() {
         let cursor = Cursor::new(100);
         assert_eq!(cursor.begin(1_000, 988).unwrap(), 100);
-        cursor.advance(200);
+        cursor.advance(200).unwrap();
         // The host processes a marker while the 100..199 batch still waits to be sent.
         cursor.mark(&CheckpointEpoch(1)).unwrap();
         assert_eq!(cursor.begin(1_010, 998).unwrap(), 200);
-        cursor.advance(300);
+        cursor.advance(300).unwrap();
         cursor.mark(&CheckpointEpoch(2)).unwrap();
         assert_eq!(cursor.begin(1_020, 1_008).unwrap(), 300);
         cursor.mark(&CheckpointEpoch(3)).unwrap();
 
         let first = cursor.finalize(&CheckpointEpoch(1)).unwrap().unwrap();
-        assert_eq!(first.next_block, 100);
+        assert_eq!(first.position, 100);
         assert_eq!((first.observed_head, first.safe_head), (1_000, 988));
         // Finalizing a later epoch covers any earlier ones still pending.
         let third = cursor.finalize(&CheckpointEpoch(3)).unwrap().unwrap();
-        assert_eq!(third.next_block, 300);
+        assert_eq!(third.position, 300);
         assert_eq!(cursor.finalize(&CheckpointEpoch(2)).unwrap(), None);
     }
 
     #[test]
     fn restored_cursor_resumes_from_saved_block() {
         let cursor = Cursor::new(0);
-        cursor.restore(500);
+        cursor.restore(500).unwrap();
         assert_eq!(cursor.begin(1_000, 988).unwrap(), 500);
         cursor.mark(&CheckpointEpoch(7)).unwrap();
         assert_eq!(
@@ -1704,9 +1851,63 @@ mod tests {
                 .finalize(&CheckpointEpoch(7))
                 .unwrap()
                 .unwrap()
-                .next_block,
+                .position,
             500
         );
+    }
+
+    #[test]
+    fn catch_up_backfills_new_contracts_and_earlier_starts() {
+        let starts = BTreeMap::from([
+            ("old".to_owned(), 100),
+            ("moved".to_owned(), 50),
+            ("new".to_owned(), 300),
+            ("late".to_owned(), 900),
+        ]);
+        let covered = BTreeMap::from([
+            ("old".to_owned(), 100),
+            ("moved".to_owned(), 100),
+            ("removed".to_owned(), 10),
+        ]);
+        let jobs = BTreeMap::from([("removed".to_owned(), (20, 99))]);
+        let planned = plan_catch_up(&starts, Some(&covered), jobs, 500, 0);
+        // A new contract was never read before 500; a moved start reads up to its old start.
+        assert_eq!(
+            planned,
+            BTreeMap::from([
+                ("moved".to_owned(), (50, 99)),
+                ("new".to_owned(), (300, 499)),
+            ])
+        );
+    }
+
+    #[test]
+    fn catch_up_keeps_the_end_of_a_job_in_progress() {
+        let starts = BTreeMap::from([("token".to_owned(), 100)]);
+        let covered = BTreeMap::from([("token".to_owned(), 300)]);
+        let jobs = BTreeMap::from([("token".to_owned(), (400, 499))]);
+        assert_eq!(
+            plan_catch_up(&starts, Some(&covered), jobs.clone(), 500, 0),
+            BTreeMap::from([("token".to_owned(), (100, 499))])
+        );
+        // The start did not move, so the job resumes where it stopped.
+        let starts = BTreeMap::from([("token".to_owned(), 300)]);
+        assert_eq!(
+            plan_catch_up(&starts, Some(&covered), jobs, 500, 0).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn fresh_and_legacy_projects_backfill_only_starts_below_the_project_start() {
+        let starts = BTreeMap::from([("early".to_owned(), 50), ("later".to_owned(), 200)]);
+        let fresh = plan_catch_up(&starts, Some(&BTreeMap::new()), BTreeMap::new(), 100, 100);
+        assert_eq!(fresh, BTreeMap::from([("early".to_owned(), (50, 99))]));
+        let legacy = plan_catch_up(&starts, None, BTreeMap::new(), 5_000, 100);
+        assert_eq!(legacy, BTreeMap::from([("early".to_owned(), (50, 99))]));
+        let saved: SourceState =
+            serde_json::from_str(r#"{"next_block":5000,"discovered_rows":[]}"#).unwrap();
+        assert!(saved.catch_up.is_empty() && saved.contract_starts.is_none());
     }
 
     #[test]

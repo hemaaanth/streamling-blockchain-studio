@@ -131,8 +131,11 @@ Add more fixed contracts to the same pipeline:
 streamling-blockchain --project ./my-project add-contract \
   0x2222222222222222222222222222222222222222 \
   --alias helper \
-  --abi ./helper.json
+  --abi ./helper.json \
+  --start-block 18000000
 ```
+
+Each contract starts at its own `start_block` in `streamling-blockchain.toml`, or at the project's `start_block` without one. Logs of a contract before its start are skipped, and children it discovered there are not tracked. On the next `dev` run, a contract added to a running project, or one whose `start_block` moved earlier, backfills the blocks below the current position first. Only that contract and its discovered children are read, and the other contracts wait until it is done; `backfill-progress.json` reports `caught_up: false` meanwhile. Moving a `start_block` later skips new logs only: rows already stored stay until a reindex. Projects indexed before per-contract start blocks count every contract as indexed from the project's `start_block`.
 
 Add contracts discovered from an indexed parent event:
 

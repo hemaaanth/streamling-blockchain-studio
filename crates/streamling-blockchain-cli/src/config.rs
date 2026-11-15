@@ -53,6 +53,9 @@ pub struct ContractConfig {
     pub alias: String,
     pub address: String,
     pub abi: PathBuf,
+    /// First block to index for this contract. It defaults to the project's `start_block`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_block: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

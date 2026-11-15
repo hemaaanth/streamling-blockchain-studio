@@ -134,6 +134,10 @@ enum Commands {
         alias: String,
         #[arg(long)]
         abi: PathBuf,
+        /// First block to index for this contract. Blocks before the project's current
+        /// position are backfilled on the next `dev` run.
+        #[arg(long)]
+        start_block: Option<u64>,
     },
     AddDiscovery {
         #[arg(long)]
@@ -532,6 +536,7 @@ async fn dispatch(cli: Cli, out: &mut Output) -> Result<Value> {
             address,
             alias,
             abi,
+            start_block,
         } => {
             validate_address(&address)?;
             validate_alias(&alias)?;
@@ -544,6 +549,7 @@ async fn dispatch(cli: Cli, out: &mut Output) -> Result<Value> {
                     alias: alias.clone(),
                     address: address.clone(),
                     abi: PathBuf::from(format!("abis/{alias}.json")),
+                    start_block,
                 },
                 &abi,
             )?;
@@ -974,6 +980,7 @@ async fn init(root: &Path, out: &Output, request: InitRequest) -> Result<Value> 
             alias: alias.clone(),
             address,
             abi: PathBuf::from(format!("abis/{alias}.json")),
+            start_block: None,
         }],
         discovery_rules: vec![],
         sinks,
@@ -1138,6 +1145,7 @@ async fn init_robinhood(
                     alias,
                     address: address.to_owned(),
                     abi: PathBuf::from("abis/erc20.json"),
+                    start_block: None,
                 });
             }
         }

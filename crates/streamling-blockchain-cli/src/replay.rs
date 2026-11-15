@@ -45,12 +45,15 @@ async fn diff_with(
     let client = rpc::client()?;
     let mut events = EventIndex::new();
     let mut direct = HashMap::new();
+    let mut starts = HashMap::new();
     let mut direct_topics = HashSet::new();
     for contract in &config.contracts {
-        direct.insert(
-            contract.address.to_ascii_lowercase(),
-            contract.alias.clone(),
+        let address = contract.address.to_ascii_lowercase();
+        starts.insert(
+            address.clone(),
+            contract.start_block.unwrap_or(config.start_block),
         );
+        direct.insert(address, contract.alias.clone());
         direct_topics.extend(load_events(
             &contract.alias,
             &root.join(&contract.abi),
@@ -79,6 +82,17 @@ async fn diff_with(
     let mut decoded = Vec::new();
     for log in &logs {
         if let Some(event) = decode_log(config.chain_id, log, &events, &direct, &children)? {
+            // The event source skips a contract's logs before its start block.
+            let address = log["address"]
+                .as_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if starts
+                .get(&address)
+                .is_some_and(|start| event.block_number < *start)
+            {
+                continue;
+            }
             if let Some((address, child)) = discovered_child(config, &direct, log, &event) {
                 add_child(&mut children, address, log_position(log)?, child);
             }

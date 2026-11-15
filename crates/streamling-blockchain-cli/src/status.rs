@@ -105,9 +105,10 @@ fn payload(
         config.end_block.map_or(safe, |end| safe.min(end))
     });
     let indexed_through = progress.map(|item| item.indexed_through);
-    let caught_up = indexed_through
+    // The source reports `caught_up: false` while a contract still backfills earlier blocks.
+    let caught_up = progress
         .zip(safe_head)
-        .map(|(indexed, safe)| indexed >= safe);
+        .map(|(item, safe)| item.caught_up && item.indexed_through >= safe);
     let remaining_blocks = indexed_through
         .zip(safe_head)
         .map(|(indexed, safe)| safe.saturating_sub(indexed));
@@ -177,6 +178,7 @@ mod tests {
                 alias: "token".into(),
                 address: "0x1111111111111111111111111111111111111111".into(),
                 abi: PathBuf::from("abi.json"),
+                start_block: None,
             }],
             discovery_rules: vec![],
             sinks: SinkConfig::default(),
