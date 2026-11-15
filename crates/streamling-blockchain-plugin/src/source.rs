@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
 };
 use streamling_blockchain_decode::{self as decode, EventIndex};
@@ -25,15 +25,21 @@ const DEFAULT_WINDOW_GROWTH: u64 = 10;
 const DEFAULT_BLOCK_CONCURRENCY: u64 = 8;
 const DEFAULT_BATCH_SIZE: u64 = 1;
 
-/// Bounded sources in this library that stop the pipeline at `end_block` and have not
+/// Started bounded sources in this library that stop the pipeline at `end_block` and have not
 /// committed it yet. The last one to finish asks Streamling to stop, so one source cannot cut
 /// another short.
 static UNFINISHED_SOURCES: AtomicUsize = AtomicUsize::new(0);
 
-/// Asks Streamling to stop once every bounded source has committed its `end_block`.
+/// `EndStop` states. Only a started source counts as unfinished, so a copy the host creates
+/// but never runs, or drops, cannot hold the stop back.
+const NOT_STARTED: u8 = 0;
+const RUNNING: u8 = 1;
+const FINISHED: u8 = 2;
+
+/// Asks Streamling to stop once every started bounded source has committed its `end_block`.
 struct EndStop {
     end_block: u64,
-    finished: AtomicBool,
+    state: AtomicU8,
     unfinished: &'static AtomicUsize,
 }
 
@@ -53,34 +59,45 @@ impl EndStop {
             .unwrap_or(Ok(false))?;
         Ok(end_block
             .filter(|_| stop)
-            .map(|end_block| Self::register(end_block, &UNFINISHED_SOURCES)))
+            .map(|end_block| Self::new(end_block, &UNFINISHED_SOURCES)))
     }
 
-    fn register(end_block: u64, unfinished: &'static AtomicUsize) -> Self {
-        unfinished.fetch_add(1, Ordering::SeqCst);
+    fn new(end_block: u64, unfinished: &'static AtomicUsize) -> Self {
         Self {
             end_block,
-            finished: AtomicBool::new(false),
+            state: AtomicU8::new(NOT_STARTED),
             unfinished,
         }
+    }
+
+    /// Call when the host initializes the source. A second call has no effect.
+    fn start(&self) {
+        if self.advance(NOT_STARTED, RUNNING) {
+            self.unfinished.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn advance(&self, from: u8, to: u8) -> bool {
+        self.state
+            .compare_exchange(from, to, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
     }
 
     /// Records a committed checkpoint. `next_block` is the first block not committed yet.
     /// True only for the commit that finishes the last unfinished source.
     fn committed(&self, next_block: u64, catching_up: bool) -> bool {
-        if catching_up || next_block <= self.end_block || self.finished.swap(true, Ordering::SeqCst)
-        {
+        if catching_up || next_block <= self.end_block || !self.advance(RUNNING, FINISHED) {
             return false;
         }
         self.unfinished.fetch_sub(1, Ordering::SeqCst) == 1
     }
 }
 
-/// The host may create a source and drop it before running it. Such a copy must not count as
-/// unfinished, or no running source would ever be the last to finish.
+/// A source dropped before it finishes must not stay unfinished, or no running source would
+/// ever be the last to finish.
 impl Drop for EndStop {
     fn drop(&mut self) {
-        if !self.finished.swap(true, Ordering::SeqCst) {
+        if self.state.swap(FINISHED, Ordering::SeqCst) == RUNNING {
             self.unfinished.fetch_sub(1, Ordering::SeqCst);
         }
     }
@@ -568,6 +585,9 @@ impl SupportsGracefulShutdown for EvmBlockSource {
 #[async_trait]
 impl SourcePlugin for EvmBlockSource {
     async fn initialize(&self) -> Result<(), PluginError> {
+        if let Some(stop) = &self.stop {
+            stop.start();
+        }
         if let Some(saved) = self.state.get().await.map_err(PluginError::State)? {
             self.cursor.restore(saved.next_block)?;
         }
@@ -824,6 +844,9 @@ impl SupportsGracefulShutdown for EvmTransactionSource {
 #[async_trait]
 impl SourcePlugin for EvmTransactionSource {
     async fn initialize(&self) -> Result<(), PluginError> {
+        if let Some(stop) = &self.stop {
+            stop.start();
+        }
         if let Some(saved) = self.state.get().await.map_err(PluginError::State)? {
             self.cursor.restore(saved.next_block)?;
         }
@@ -899,6 +922,9 @@ impl SupportsGracefulShutdown for EvmEventSource {
 #[async_trait]
 impl SourcePlugin for EvmEventSource {
     async fn initialize(&self) -> Result<(), PluginError> {
+        if let Some(stop) = &self.stop {
+            stop.start();
+        }
         let mut position = lock(&self.cursor.returned)?.clone();
         // A fresh project has indexed no contract yet.
         let mut covered = Some(BTreeMap::new());
@@ -1919,11 +1945,18 @@ fn parse_hex(text: &str) -> Result<u64, PluginError> {
 
 #[cfg(test)]
 mod tests {
+    fn started(end_block: u64, unfinished: &'static AtomicUsize) -> EndStop {
+        let stop = EndStop::new(end_block, unfinished);
+        stop.start();
+        stop
+    }
+
     #[test]
     fn the_last_bounded_source_to_commit_its_end_block_stops_the_pipeline() {
         static UNFINISHED: AtomicUsize = AtomicUsize::new(0);
-        let events = EndStop::register(100, &UNFINISHED);
-        let blocks = EndStop::register(100, &UNFINISHED);
+        let events = started(100, &UNFINISHED);
+        let blocks = started(100, &UNFINISHED);
+        blocks.start();
         assert!(
             !events.committed(100, false),
             "block 100 is not committed yet"
@@ -1941,8 +1974,8 @@ mod tests {
     #[test]
     fn a_source_dropped_before_it_finishes_does_not_block_the_stop() {
         static UNFINISHED: AtomicUsize = AtomicUsize::new(0);
-        drop(EndStop::register(100, &UNFINISHED));
-        let events = EndStop::register(100, &UNFINISHED);
+        drop(started(100, &UNFINISHED));
+        let events = started(100, &UNFINISHED);
         assert!(events.committed(101, false));
         drop(events);
         assert_eq!(
@@ -1950,6 +1983,14 @@ mod tests {
             0,
             "a finished source counts once"
         );
+    }
+
+    #[test]
+    fn a_source_the_host_never_starts_does_not_block_the_stop() {
+        static UNFINISHED: AtomicUsize = AtomicUsize::new(0);
+        let _idle = EndStop::new(100, &UNFINISHED);
+        let events = started(100, &UNFINISHED);
+        assert!(events.committed(101, false));
     }
 
     #[test]
